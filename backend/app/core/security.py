@@ -1,21 +1,22 @@
+import os
 from cryptography.fernet import Fernet
-from app.core.config import get_settings
 import bcrypt
 
 class EncryptionManager:
     """Handles encryption/decryption of sensitive data"""
     
     def __init__(self):
-        settings = get_settings()
-        # Use a consistent key from settings
-        import base64
-        key = settings.ENCRYPTION_KEY.encode()
-        # Ensure it's a valid Fernet key (32 bytes, base64 encoded)
-        if len(key) < 32:
-            key = (key + b'0' * 32)[:32]
-        # Convert to valid base64 Fernet key
-        fernet_key = base64.urlsafe_b64encode(key)
-        self.cipher = Fernet(fernet_key)
+        key = os.getenv("FERNET_KEY")
+
+        if not key:
+            raise RuntimeError("FERNET_KEY is missing in environment variables")
+
+        try:
+            if isinstance(key, str):
+                key = key.encode()
+            self.cipher = Fernet(key)
+        except Exception as e:
+            raise RuntimeError("Invalid FERNET_KEY format") from e
     
     def encrypt_credentials(self, plaintext: str) -> str:
         """Encrypt sensitive credentials"""
