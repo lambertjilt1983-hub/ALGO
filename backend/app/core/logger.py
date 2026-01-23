@@ -1,5 +1,6 @@
 import logging
 import json
+import os
 from datetime import datetime
 from typing import Any, Dict
 
@@ -12,6 +13,7 @@ class TradingLogger:
     
     def _setup_logger(self):
         """Configure logger with file and console handlers"""
+        os.makedirs("logs", exist_ok=True)
         handler = logging.FileHandler("logs/trading.log")
         console_handler = logging.StreamHandler()
         
