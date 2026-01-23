@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Zerodha Authentication - Redirecting...</title>
+    <script>
+        // Get request_token from URL
+        const urlParams = new URLSearchParams(window.location.search);
+        const requestToken = urlParams.get('request_token');
+        const status = urlParams.get('status');
+        
+        if (status === 'success' && requestToken) {
+            // Redirect to port 3000 with the request token
+            window.location.href = `http://localhost:3000/?status=success&request_token=${requestToken}`;
+        } else {
+            // Redirect to port 3000 anyway
+            window.location.href = 'http://localhost:3000';
+        }
+    </script>
+</head>
+<body>
+    <p>Redirecting to AlgoTrade dashboard...</p>
+</body>
+</html>

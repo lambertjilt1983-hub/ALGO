@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Zerodha Authentication</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .container {
+            background: white;
+            padding: 40px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+    <script>
+        window.onload = function() {
+            // Get parameters from URL
+            const urlParams = new URLSearchParams(window.location.search);
+            const requestToken = urlParams.get('request_token');
+            const status = urlParams.get('status');
+            
+            console.log('Zerodha redirect detected');
+            console.log('Status:', status);
+            console.log('Request Token:', requestToken);
+            
+            // Always redirect to port 3000 with the parameters
+            // The Dashboard will handle the token exchange
+            if (status === 'success' && requestToken) {
+                console.log('Redirecting to main app with request token...');
+                window.location.href = `http://localhost:3000/?status=success&request_token=${requestToken}`;
+            } else {
+                console.log('No valid token, redirecting to main app...');
+                window.location.href = 'http://localhost:3000';
+            }
+        };
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h2>🔐 Zerodha Authentication</h2>
+        <div class="spinner"></div>
+        <p id="message">Redirecting to AlgoTrade...</p>
+    </div>
+</body>
+</html>
