@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from app.auth.service import AuthService, BrokerAuthService
-from app.models.schemas import UserCreate, UserLogin, TokenResponse, UserResponse
+from app.models.schemas import UserCreate, UserLogin, TokenResponse, UserResponse, OtpVerify
 from app.models.auth import User
 from app.core.database import get_db
 
@@ -17,6 +17,13 @@ async def register(user_data: UserCreate, db: Session = Depends(get_db)):
 async def login(user_data: UserLogin, db: Session = Depends(get_db)):
     """Login user and get tokens"""
     tokens = AuthService.login_user(user_data, db)
+    return tokens
+
+
+@router.post("/verify-otp", response_model=TokenResponse)
+async def verify_otp(payload: OtpVerify, db: Session = Depends(get_db)):
+    """Verify OTP for MFA and return tokens"""
+    tokens = AuthService.verify_otp(payload, db)
     return tokens
 
 @router.post("/refresh")
@@ -51,3 +58,18 @@ async def get_current_user(db: Session = Depends(get_db), token = Depends(AuthSe
         return user
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+
+
+def _require_admin(current_user: User) -> User:
+    if not current_user.is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+    return current_user
+
+
+@router.get("/admin/users", response_model=list[UserResponse])
+async def list_users(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(AuthService.get_current_user),
+):
+    _require_admin(current_user)
+    return db.query(User).all()

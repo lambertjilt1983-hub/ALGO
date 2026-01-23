@@ -6,9 +6,12 @@ import './App.css';
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [isLogin, setIsLogin] = useState(true);
+   const [pendingOtpUser, setPendingOtpUser] = useState('');
   const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
+  const [mobile, setMobile] = useState('');
   const [password, setPassword] = useState('');
+  const [otp, setOtp] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -55,7 +58,7 @@ export default function App() {
         payload = { username, password };
       } else {
         endpoint = config.endpoints.auth.register;
-        payload = { username, email, password };
+        payload = { username, email, mobile, password };
       }
 
       console.log('Sending login request:', { endpoint, payload });
@@ -81,14 +84,46 @@ export default function App() {
             setIsLoggedIn(true);
           }, 100);
         } else {
-          alert('✓ Registration successful! You can now login.');
-          setUsername('');
-          setEmail('');
-          setPassword('');
-          setIsLogin(true);
+          alert('✓ Registration successful! Enter the OTP sent to your email/mobile.');
+          setPendingOtpUser(username);
+          setOtp('');
+          setIsLogin(false);
+          setSubmitting(false);
+          return;
         }
+      } else if (response.status === 403 && data.detail && data.detail.toLowerCase().includes('otp')) {
+        setPendingOtpUser(username);
+        setOtp('');
+        setError('Enter the OTP sent to your email/mobile to continue.');
+        setSubmitting(false);
+        return;
       } else {
         setError(data.detail || 'Operation failed. Please try again.');
+      }
+    } catch (err) {
+      setError('Connection error: ' + err.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleOtpSubmit = async (e) => {
+    e.preventDefault();
+    setError('');
+    setSubmitting(true);
+    try {
+      const response = await config.authFetch(config.endpoints.auth.verifyOtp || '/auth/verify-otp', {
+        method: 'POST',
+        body: JSON.stringify({ username: pendingOtpUser || username, otp }),
+      });
+
+      const data = await response.json();
+      if (response.ok) {
+        localStorage.setItem('access_token', data.access_token);
+        localStorage.setItem('refresh_token', data.refresh_token);
+        setIsLoggedIn(true);
+      } else {
+        setError(data.detail || 'Invalid OTP');
       }
     } catch (err) {
       setError('Connection error: ' + err.message);
@@ -182,22 +217,24 @@ export default function App() {
           )}
 
           {/* Form */}
-          <form onSubmit={handleSubmit}>
-            <h2 style={{ textAlign: 'center', marginBottom: '1.5rem', color: '#1f2937' }}>
-              {isLogin ? 'Welcome Back' : 'Create Account'}
-            </h2>
-
-            {!isLogin && (
-              <div style={{ marginBottom: '1rem' }}>
+          {pendingOtpUser ? (
+            <form onSubmit={handleOtpSubmit}>
+              <h2 style={{ textAlign: 'center', marginBottom: '1.5rem', color: '#1f2937' }}>
+                Verify OTP
+              </h2>
+              <p style={{ textAlign: 'center', marginBottom: '1rem', color: '#4b5563' }}>
+                Enter the 6-digit code sent to your email and mobile.
+              </p>
+              <div style={{ marginBottom: '1.5rem' }}>
                 <label style={{ display: 'block', marginBottom: '0.5rem', color: '#374151', fontWeight: '500' }}>
-                  Email
+                  OTP
                 </label>
                 <input
-                  type="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="Enter your email"
-                  required={!isLogin}
+                  type="text"
+                  value={otp}
+                  onChange={(e) => setOtp(e.target.value)}
+                  placeholder="Enter OTP"
+                  required
                   style={{
                     width: '100%',
                     padding: '0.75rem',
@@ -208,69 +245,139 @@ export default function App() {
                   }}
                 />
               </div>
-            )}
-
-            <div style={{ marginBottom: '1rem' }}>
-              <label style={{ display: 'block', marginBottom: '0.5rem', color: '#374151', fontWeight: '500' }}>
-                Username
-              </label>
-              <input
-                type="text"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="Enter username"
-                required
+              <button
+                type="submit"
+                disabled={submitting}
                 style={{
                   width: '100%',
                   padding: '0.75rem',
-                  border: '1px solid #d1d5db',
+                  backgroundColor: submitting ? '#9ca3af' : '#1e40af',
+                  color: 'white',
+                  border: 'none',
                   borderRadius: '0.375rem',
                   fontSize: '1rem',
-                  boxSizing: 'border-box'
+                  fontWeight: 'bold',
+                  cursor: submitting ? 'not-allowed' : 'pointer',
+                  transition: 'background-color 0.3s'
                 }}
-              />
-            </div>
+              >
+                {submitting ? 'Verifying...' : 'Verify & Continue'}
+              </button>
+            </form>
+          ) : (
+            <form onSubmit={handleSubmit}>
+              <h2 style={{ textAlign: 'center', marginBottom: '1.5rem', color: '#1f2937' }}>
+                {isLogin ? 'Welcome Back' : 'Create Account'}
+              </h2>
 
-            <div style={{ marginBottom: '1.5rem' }}>
-              <label style={{ display: 'block', marginBottom: '0.5rem', color: '#374151', fontWeight: '500' }}>
-                Password
-              </label>
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="Enter password"
-                required
+              {!isLogin && (
+                <div style={{ marginBottom: '1rem' }}>
+                  <label style={{ display: 'block', marginBottom: '0.5rem', color: '#374151', fontWeight: '500' }}>
+                    Email
+                  </label>
+                  <input
+                    type="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="Enter your email"
+                    required={!isLogin}
+                    style={{
+                      width: '100%',
+                      padding: '0.75rem',
+                      border: '1px solid #d1d5db',
+                      borderRadius: '0.375rem',
+                      fontSize: '1rem',
+                      boxSizing: 'border-box'
+                    }}
+                  />
+                </div>
+              )}
+
+              {!isLogin && (
+                <div style={{ marginBottom: '1rem' }}>
+                  <label style={{ display: 'block', marginBottom: '0.5rem', color: '#374151', fontWeight: '500' }}>
+                    Mobile
+                  </label>
+                  <input
+                    type="tel"
+                    value={mobile}
+                    onChange={(e) => setMobile(e.target.value)}
+                    placeholder="Enter mobile number"
+                    required={!isLogin}
+                    style={{
+                      width: '100%',
+                      padding: '0.75rem',
+                      border: '1px solid #d1d5db',
+                      borderRadius: '0.375rem',
+                      fontSize: '1rem',
+                      boxSizing: 'border-box'
+                    }}
+                  />
+                </div>
+              )}
+
+              <div style={{ marginBottom: '1rem' }}>
+                <label style={{ display: 'block', marginBottom: '0.5rem', color: '#374151', fontWeight: '500' }}>
+                  Username
+                </label>
+                <input
+                  type="text"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  placeholder="Enter username"
+                  required
+                  style={{
+                    width: '100%',
+                    padding: '0.75rem',
+                    border: '1px solid #d1d5db',
+                    borderRadius: '0.375rem',
+                    fontSize: '1rem',
+                    boxSizing: 'border-box'
+                  }}
+                />
+              </div>
+
+              <div style={{ marginBottom: '1.5rem' }}>
+                <label style={{ display: 'block', marginBottom: '0.5rem', color: '#374151', fontWeight: '500' }}>
+                  Password
+                </label>
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Enter password"
+                  required
+                  style={{
+                    width: '100%',
+                    padding: '0.75rem',
+                    border: '1px solid #d1d5db',
+                    borderRadius: '0.375rem',
+                    fontSize: '1rem',
+                    boxSizing: 'border-box'
+                  }}
+                />
+              </div>
+
+              <button
+                type="submit"
+                disabled={submitting}
                 style={{
                   width: '100%',
                   padding: '0.75rem',
-                  border: '1px solid #d1d5db',
+                  backgroundColor: submitting ? '#9ca3af' : '#1e40af',
+                  color: 'white',
+                  border: 'none',
                   borderRadius: '0.375rem',
                   fontSize: '1rem',
-                  boxSizing: 'border-box'
+                  fontWeight: 'bold',
+                  cursor: submitting ? 'not-allowed' : 'pointer',
+                  transition: 'background-color 0.3s'
                 }}
-              />
-            </div>
-
-            <button
-              type="submit"
-              disabled={submitting}
-              style={{
-                width: '100%',
-                padding: '0.75rem',
-                backgroundColor: submitting ? '#9ca3af' : '#1e40af',
-                color: 'white',
-                border: 'none',
-                borderRadius: '0.375rem',
-                fontSize: '1rem',
-                fontWeight: 'bold',
-                cursor: submitting ? 'not-allowed' : 'pointer',
-                transition: 'background-color 0.3s'
-              }}
-            >
-              {submitting ? 'Loading...' : (isLogin ? 'Login' : 'Register')}
-            </button>
-          </form>
+              >
+                {submitting ? 'Loading...' : (isLogin ? 'Login' : 'Register')}
+              </button>
+            </form>
+          )}
 
           {/* Footer Text */}
           <p style={{ textAlign: 'center', marginTop: '1.5rem', color: '#6b7280', fontSize: '0.875rem' }}>

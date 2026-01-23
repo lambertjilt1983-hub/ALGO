@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Boolean
+from sqlalchemy import Column, Integer, String, DateTime, Date, Boolean
 from sqlalchemy.dialects.postgresql import UUID
 from datetime import datetime
 import uuid
@@ -11,8 +11,15 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
     email = Column(String, unique=True, index=True)
+    mobile = Column(String, unique=True, index=True, nullable=True)
     hashed_password = Column(String)
     is_active = Column(Boolean, default=True)
+    is_admin = Column(Boolean, default=False)
+    is_email_verified = Column(Boolean, default=False)
+    is_mobile_verified = Column(Boolean, default=False)
+    otp_code = Column(String, nullable=True)
+    otp_expires_at = Column(DateTime, nullable=True)
+    last_otp_sent_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

@@ -6,17 +6,27 @@ from datetime import datetime
 class UserCreate(BaseModel):
     username: str
     email: EmailStr
+    mobile: str
     password: str
 
 class UserLogin(BaseModel):
     username: str
     password: str
 
+
+class OtpVerify(BaseModel):
+    username: str
+    otp: str
+
 class UserResponse(BaseModel):
     id: int
     username: str
     email: str
+    mobile: Optional[str] = None
     is_active: bool
+    is_admin: bool = False
+    is_email_verified: bool = False
+    is_mobile_verified: bool = False
     created_at: datetime
 
 class TokenResponse(BaseModel):

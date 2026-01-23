@@ -38,6 +38,7 @@ export const config = {
     auth: {
       register: '/auth/register',
       login: '/auth/login',
+      verifyOtp: '/auth/verify-otp',
       refresh: '/auth/refresh',
       me: '/auth/me',
     },
@@ -81,8 +82,16 @@ export const config = {
       execute: '/autotrade/execute',
       activeTrades: '/autotrade/trades/active',
       tradeHistory: '/autotrade/trades/history',
+      report: '/autotrade/report',
       liveIndices: '/autotrade/market/indices',
       monitor: '/autotrade/monitor',
+    },
+
+    // Admin
+    admin: {
+      overview: '/admin/overview',
+      updateUser: (id) => `/admin/users/${id}`,
+      deleteUser: (id) => `/admin/users/${id}`,
     },
   },
   

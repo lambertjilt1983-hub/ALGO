@@ -1,10 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routes import auth, broker, orders, strategies, market_intelligence, auto_trading_simple, test_market, token_refresh
-from app.core.database import Base, engine
+from app.routes import auth, broker, orders, strategies, market_intelligence, auto_trading_simple, test_market, token_refresh, admin
+from app.core.database import Base, engine, SessionLocal
 from app.core.config import get_settings
 from app.core.background_tasks import start_background_tasks, stop_background_tasks
 from app import brokers  # Import brokers to trigger registration
+from app.auth.service import AuthService
 
 # Create tables
 try:
@@ -41,12 +42,17 @@ app.include_router(test_market.router)  # Test endpoint with real data
 app.include_router(market_intelligence.router)
 app.include_router(auto_trading_simple.router)  # Using simplified version
 app.include_router(token_refresh.router)  # Token refresh and validation endpoints
+app.include_router(admin.router)  # Admin-only utilities
 
 # Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
     """Initialize background tasks on startup"""
-    pass
+    db = SessionLocal()
+    try:
+        AuthService.ensure_default_admin(db)
+    finally:
+        db.close()
 
 @app.on_event("shutdown")
 async def shutdown_event():

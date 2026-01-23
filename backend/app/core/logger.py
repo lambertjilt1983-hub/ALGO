@@ -38,4 +38,13 @@ class TradingLogger:
         """Log API calls"""
         self.logger.info(f"API_CALL: Broker={broker}, Endpoint={endpoint}, Status={status}")
 
+    def log_info(self, message: str, context: Dict[str, Any] = None):
+        """Generic info logging with optional context."""
+        context = context or {}
+        try:
+            ctx = json.dumps(context)
+        except Exception:
+            ctx = str(context)
+        self.logger.info(f"INFO: {message} | Context: {ctx}")
+
 logger = TradingLogger()

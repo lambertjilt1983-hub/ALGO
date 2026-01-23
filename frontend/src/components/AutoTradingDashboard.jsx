@@ -8,19 +8,22 @@ const AutoTradingDashboard = () => {
   const [stats, setStats] = useState(null);
   const [activeTrades, setActiveTrades] = useState([]);
   const [tradeHistory, setTradeHistory] = useState([]);
+  const [reportSummary, setReportSummary] = useState(null);
   const [analysis, setAnalysis] = useState(null);
   const [executing, setExecuting] = useState(false);
   const [livePrice, setLivePrice] = useState(null);
+  const [activeTab, setActiveTab] = useState('trading');
+  const [historySearch, setHistorySearch] = useState('');
 
   const fetchData = async () => {
     const token = localStorage.getItem('access_token');
     if (!token) return;
 
     try {
-      const [statusRes, activeRes, historyRes] = await Promise.all([
+      const [statusRes, activeRes, reportRes] = await Promise.all([
         config.authFetch(config.endpoints.autoTrade.status),
         config.authFetch(config.endpoints.autoTrade.activeTrades),
-        config.authFetch(config.getUrl(config.endpoints.autoTrade.tradeHistory, { limit: 50 }))
+        config.authFetch(config.getUrl(config.endpoints.autoTrade.report, { limit: 500 }))
       ]);
 
       let statusPayload = null;
@@ -43,10 +46,11 @@ const AutoTradingDashboard = () => {
       }
 
       let historyData = [];
-      if (historyRes.ok) {
-        const data = await historyRes.json();
+      if (reportRes.ok) {
+        const data = await reportRes.json();
         historyData = data.trades || [];
         setTradeHistory(historyData);
+        setReportSummary(data.summary || null);
       }
 
       const totalTrades = historyData.length;
@@ -146,6 +150,35 @@ const AutoTradingDashboard = () => {
   };
 
   const executeAutoTrade = async () => {
+    const rec = analysis?.recommendation;
+    if (!rec) {
+      alert('Run Analyze first so we have a recommendation with prices.');
+      return;
+    }
+
+    const entryPrice = Number(rec.entry_price ?? livePrice ?? rec.underlying_price ?? 0);
+    if (!entryPrice || Number.isNaN(entryPrice)) {
+      alert('Missing entry price from analysis; cannot execute.');
+      return;
+    }
+
+    const tradeParams = {
+      symbol: rec.symbol || 'NIFTY',
+      price: entryPrice,
+      target: rec.target ?? undefined,
+      stop_loss: rec.stop_loss ?? undefined,
+      support: rec.support ?? undefined,
+      resistance: rec.resistance ?? undefined,
+      quantity: rec.quantity ?? 1,
+      side: rec.action || rec.side || 'BUY',
+      balance: stats?.portfolio_cap ?? 50000,
+      broker_id: 1,
+    };
+
+    const sanitizedParams = Object.fromEntries(
+      Object.entries(tradeParams).filter(([, value]) => value !== undefined && value !== null && value !== '')
+    );
+
     if (!isDemoMode) {
       const confirmed = window.confirm(
         '⚠️ LIVE TRADING ALERT!\n\n' +
@@ -160,11 +193,7 @@ const AutoTradingDashboard = () => {
     
     try {
       const response = await config.authFetch(
-        config.getUrl(config.endpoints.autoTrade.execute, { 
-          symbol: 'NIFTY', 
-          balance: 100000, 
-          broker_id: 1 
-        }),
+        config.getUrl(config.endpoints.autoTrade.execute, sanitizedParams),
         { method: 'POST' }
       );
 
@@ -218,6 +247,56 @@ const AutoTradingDashboard = () => {
       </div>
     );
   }
+
+  const todayLabel = new Date().toDateString();
+  const todayIso = new Date().toISOString().slice(0, 10);
+  const tradesToday = tradeHistory.filter((trade) => {
+    const ts = trade.exit_time || trade.entry_time || trade.timestamp;
+    if (!ts) return false;
+    return new Date(ts).toDateString() === todayLabel;
+  });
+
+  const sampleTodayTrades = [
+    {
+      id: 'SAMPLE-1',
+      symbol: 'NIFTY 27FEB 22500 CE',
+      action: 'BUY',
+      entry_price: 112.5,
+      exit_price: 114.8,
+      pnl: 2.3,
+      pnl_percentage: 2.04,
+      status: 'CLOSED',
+      entry_time: todayIso,
+      exit_time: todayIso,
+      quantity: 50,
+    },
+    {
+      id: 'SAMPLE-2',
+      symbol: 'BANKNIFTY 27FEB 48500 PE',
+      action: 'SELL',
+      entry_price: 152.0,
+      exit_price: 149.5,
+      pnl: 2.5,
+      pnl_percentage: 1.64,
+      status: 'CLOSED',
+      entry_time: todayIso,
+      exit_time: todayIso,
+      quantity: 15,
+    },
+  ];
+
+  const sumPnl = (trades) => trades.reduce((acc, t) => acc + Number(t.profit_loss ?? t.pnl ?? 0), 0);
+  const sumWins = (trades) => trades.filter((t) => Number(t.profit_loss ?? t.pnl ?? 0) > 0).length;
+  const overallPnl = reportSummary?.total_pnl ?? sumPnl(tradeHistory);
+  const todayPnlFromSummary = reportSummary?.by_date?.find((d) => d.date === todayIso)?.pnl;
+  const filteredHistory = tradeHistory.filter((t) => {
+    const q = historySearch.trim().toLowerCase();
+    if (!q) return true;
+    return [t.symbol, t.index, t.action, t.status, t.strategy]
+      .filter(Boolean)
+      .some((field) => String(field).toLowerCase().includes(q));
+  });
+  const todayTableRows = tradesToday.length > 0 ? tradesToday : sampleTodayTrades;
 
   return (
     <div style={{
@@ -328,6 +407,41 @@ const AutoTradingDashboard = () => {
         </div>
       </div>
 
+      {/* Tabs */}
+      <div style={{ display: 'flex', gap: '12px', marginBottom: '20px' }}>
+        <button
+          onClick={() => setActiveTab('trading')}
+          style={{
+            padding: '10px 16px',
+            borderRadius: '10px',
+            border: 'none',
+            fontWeight: '700',
+            background: activeTab === 'trading' ? '#2b6cb0' : '#e2e8f0',
+            color: activeTab === 'trading' ? 'white' : '#2d3748',
+            cursor: 'pointer'
+          }}
+        >
+          🚀 Trading
+        </button>
+        <button
+          onClick={() => setActiveTab('report')}
+          style={{
+            padding: '10px 16px',
+            borderRadius: '10px',
+            border: 'none',
+            fontWeight: '700',
+            background: activeTab === 'report' ? '#2b6cb0' : '#e2e8f0',
+            color: activeTab === 'report' ? 'white' : '#2d3748',
+            cursor: 'pointer'
+          }}
+        >
+          📊 Reports
+        </button>
+      </div>
+
+      {activeTab === 'trading' && (
+        <>
+
       {/* Statistics Dashboard */}
       {stats && (
         <div style={{
@@ -340,7 +454,8 @@ const AutoTradingDashboard = () => {
             padding: '20px',
             background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
             borderRadius: '12px',
-            color: 'white'
+            color: 'white',
+            textAlign: 'center'
           }}>
             <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Total Trades</div>
             <div style={{ fontSize: '32px', fontWeight: 'bold' }}>{stats.total_trades}</div>
@@ -349,7 +464,8 @@ const AutoTradingDashboard = () => {
             padding: '20px',
             background: 'linear-gradient(135deg, #48bb78 0%, #38a169 100%)',
             borderRadius: '12px',
-            color: 'white'
+            color: 'white',
+            textAlign: 'center'
           }}>
             <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Win Rate</div>
             <div style={{ fontSize: '32px', fontWeight: 'bold' }}>{(stats.win_rate || 0).toFixed(2)}%</div>
@@ -358,7 +474,8 @@ const AutoTradingDashboard = () => {
             padding: '20px',
             background: 'linear-gradient(135deg, #4299e1 0%, #3182ce 100%)',
             borderRadius: '12px',
-            color: 'white'
+            color: 'white',
+            textAlign: 'center'
           }}>
             <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Daily P&L</div>
             <div style={{
@@ -373,7 +490,8 @@ const AutoTradingDashboard = () => {
             padding: '20px',
             background: 'linear-gradient(135deg, #ed8936 0%, #dd6b20 100%)',
             borderRadius: '12px',
-            color: 'white'
+            color: 'white',
+            textAlign: 'center'
           }}>
             <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Active Trades</div>
             <div style={{ fontSize: '32px', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -387,7 +505,8 @@ const AutoTradingDashboard = () => {
             padding: '20px',
             background: 'linear-gradient(135deg, #9f7aea 0%, #805ad5 100%)',
             borderRadius: '12px',
-            color: 'white'
+            color: 'white',
+            textAlign: 'center'
           }}>
             <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Target / Trade</div>
             <div style={{ fontSize: '32px', fontWeight: 'bold' }}>{stats.target_points_per_trade || 25}pts</div>
@@ -398,7 +517,8 @@ const AutoTradingDashboard = () => {
               padding: '20px',
               background: 'linear-gradient(135deg, #319795 0%, #2c7a7b 100%)',
               borderRadius: '12px',
-              color: 'white'
+              color: 'white',
+              textAlign: 'center'
             }}>
               <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Capital In Use</div>
               <div style={{ fontSize: '24px', fontWeight: 'bold' }}>₹{(stats.capital_in_use || 0).toLocaleString()}</div>
@@ -654,35 +774,41 @@ const AutoTradingDashboard = () => {
                 </tr>
               </thead>
               <tbody>
-                {activeTrades.map((trade, idx) => (
-                  <tr key={idx} style={{ borderBottom: '1px solid #e2e8f0' }}>
-                    <td style={{ padding: '12px' }}>#{trade.id}</td>
-                    <td style={{ padding: '12px', fontWeight: '600' }}>{trade.symbol}</td>
-                    <td style={{ padding: '12px' }}>
-                      <span style={{
-                        padding: '4px 8px',
-                        borderRadius: '4px',
-                        background: trade.action === 'BUY' ? '#c6f6d5' : '#fed7d7',
-                        color: trade.action === 'BUY' ? '#22543d' : '#742a2a',
-                        fontSize: '12px',
-                        fontWeight: 'bold'
-                      }}>
-                        {trade.action}
-                      </span>
-                    </td>
-                    <td style={{ padding: '12px', textAlign: 'right' }}>₹{trade.entry_price.toFixed(2)}</td>
-                    <td style={{ padding: '12px', textAlign: 'right', color: '#48bb78', fontWeight: '600' }}>
-                      ₹{trade.target.toFixed(2)}
-                    </td>
-                    <td style={{ padding: '12px', textAlign: 'right', color: '#f56565', fontWeight: '600' }}>
-                      ₹{trade.stop_loss.toFixed(2)}
-                    </td>
-                    <td style={{ padding: '12px', fontSize: '12px', color: '#718096' }}>{trade.strategy}</td>
-                    <td style={{ padding: '12px', fontSize: '12px', color: '#718096' }}>
-                      {new Date(trade.entry_time).toLocaleTimeString()}
-                    </td>
-                  </tr>
-                ))}
+                {activeTrades.map((trade, idx) => {
+                  const entry = Number(trade.entry_price || trade.price || trade.underlying_price || 0);
+                  const target = Number(trade.target || trade.exit_price || entry);
+                  const stop = Number(trade.stop_loss || entry);
+                  const action = trade.action || trade.side || 'BUY';
+                  return (
+                    <tr key={idx} style={{ borderBottom: '1px solid #e2e8f0' }}>
+                      <td style={{ padding: '12px' }}>#{trade.id}</td>
+                      <td style={{ padding: '12px', fontWeight: '600' }}>{trade.symbol || trade.index || '—'}</td>
+                      <td style={{ padding: '12px' }}>
+                        <span style={{
+                          padding: '4px 8px',
+                          borderRadius: '4px',
+                          background: action === 'BUY' ? '#c6f6d5' : '#fed7d7',
+                          color: action === 'BUY' ? '#22543d' : '#742a2a',
+                          fontSize: '12px',
+                          fontWeight: 'bold'
+                        }}>
+                          {action}
+                        </span>
+                      </td>
+                      <td style={{ padding: '12px', textAlign: 'right' }}>₹{entry.toFixed(2)}</td>
+                      <td style={{ padding: '12px', textAlign: 'right', color: '#48bb78', fontWeight: '600' }}>
+                        ₹{target.toFixed(2)}
+                      </td>
+                      <td style={{ padding: '12px', textAlign: 'right', color: '#f56565', fontWeight: '600' }}>
+                        ₹{stop.toFixed(2)}
+                      </td>
+                      <td style={{ padding: '12px', fontSize: '12px', color: '#718096' }}>{trade.strategy || trade.strategy_name || 'LIVE_TREND_FOLLOW'}</td>
+                      <td style={{ padding: '12px', fontSize: '12px', color: '#718096' }}>
+                        {trade.entry_time ? new Date(trade.entry_time).toLocaleTimeString() : '—'}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -720,57 +846,64 @@ const AutoTradingDashboard = () => {
                 </tr>
               </thead>
               <tbody>
-                {tradeHistory.map((trade, idx) => (
-                  <tr key={idx} style={{ borderBottom: '1px solid #e2e8f0' }}>
-                    <td style={{ padding: '10px' }}>#{trade.id}</td>
-                    <td style={{ padding: '10px', fontWeight: '600' }}>{trade.symbol}</td>
-                    <td style={{ padding: '10px' }}>
-                      <span style={{
-                        padding: '2px 6px',
-                        borderRadius: '3px',
-                        background: trade.action === 'BUY' ? '#c6f6d5' : '#fed7d7',
-                        color: trade.action === 'BUY' ? '#22543d' : '#742a2a',
-                        fontSize: '11px',
-                        fontWeight: 'bold'
+                {tradeHistory.map((trade, idx) => {
+                  const entry = Number(trade.entry_price || trade.price || 0);
+                  const exit = trade.exit_price != null ? Number(trade.exit_price) : null;
+                  const pnl = Number(trade.profit_loss ?? trade.pnl ?? 0);
+                  const pnlPct = Number(trade.profit_percentage ?? trade.pnl_percent ?? 0);
+                  const action = trade.action || trade.side || 'BUY';
+                  return (
+                    <tr key={idx} style={{ borderBottom: '1px solid #e2e8f0' }}>
+                      <td style={{ padding: '10px' }}>#{trade.id}</td>
+                      <td style={{ padding: '10px', fontWeight: '600' }}>{trade.symbol || trade.index || '—'}</td>
+                      <td style={{ padding: '10px' }}>
+                        <span style={{
+                          padding: '2px 6px',
+                          borderRadius: '3px',
+                          background: action === 'BUY' ? '#c6f6d5' : '#fed7d7',
+                          color: action === 'BUY' ? '#22543d' : '#742a2a',
+                          fontSize: '11px',
+                          fontWeight: 'bold'
+                        }}>
+                          {action}
+                        </span>
+                      </td>
+                      <td style={{ padding: '10px', textAlign: 'right' }}>₹{entry.toFixed(2)}</td>
+                      <td style={{ padding: '10px', textAlign: 'right' }}>₹{exit !== null ? exit.toFixed(2) : '-'}</td>
+                      <td style={{
+                        padding: '10px',
+                        textAlign: 'right',
+                        fontWeight: '700',
+                        color: pnl >= 0 ? '#48bb78' : '#f56565'
                       }}>
-                        {trade.action}
-                      </span>
-                    </td>
-                    <td style={{ padding: '10px', textAlign: 'right' }}>₹{trade.entry_price.toFixed(2)}</td>
-                    <td style={{ padding: '10px', textAlign: 'right' }}>₹{trade.exit_price?.toFixed(2) || '-'}</td>
-                    <td style={{
-                      padding: '10px',
-                      textAlign: 'right',
-                      fontWeight: '700',
-                      color: trade.profit_loss >= 0 ? '#48bb78' : '#f56565'
-                    }}>
-                      {trade.profit_loss >= 0 ? '+' : ''}₹{trade.profit_loss.toLocaleString()}
-                    </td>
-                    <td style={{
-                      padding: '10px',
-                      textAlign: 'right',
-                      fontWeight: '600',
-                      color: trade.profit_percentage >= 0 ? '#48bb78' : '#f56565'
-                    }}>
-                      {trade.profit_percentage >= 0 ? '+' : ''}{trade.profit_percentage.toFixed(2)}%
-                    </td>
-                    <td style={{ padding: '10px' }}>
-                      <span style={{
-                        padding: '2px 6px',
-                        borderRadius: '3px',
-                        background: trade.status === 'CLOSED' ? '#bee3f8' : '#feebc8',
-                        color: trade.status === 'CLOSED' ? '#2c5282' : '#7c2d12',
-                        fontSize: '11px',
-                        fontWeight: 'bold'
+                        {pnl >= 0 ? '+' : ''}₹{pnl.toLocaleString()}
+                      </td>
+                      <td style={{
+                        padding: '10px',
+                        textAlign: 'right',
+                        fontWeight: '600',
+                        color: pnlPct >= 0 ? '#48bb78' : '#f56565'
                       }}>
-                        {trade.status}
-                      </span>
-                    </td>
-                    <td style={{ padding: '10px', fontSize: '11px', color: '#718096' }}>
-                      {trade.exit_time ? new Date(trade.exit_time).toLocaleString() : '-'}
-                    </td>
-                  </tr>
-                ))}
+                        {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%
+                      </td>
+                      <td style={{ padding: '10px' }}>
+                        <span style={{
+                          padding: '2px 6px',
+                          borderRadius: '3px',
+                          background: trade.status === 'CLOSED' ? '#bee3f8' : '#feebc8',
+                          color: trade.status === 'CLOSED' ? '#2c5282' : '#7c2d12',
+                          fontSize: '11px',
+                          fontWeight: 'bold'
+                        }}>
+                          {trade.status || 'CLOSED'}
+                        </span>
+                      </td>
+                      <td style={{ padding: '10px', fontSize: '11px', color: '#718096' }}>
+                        {trade.exit_time ? new Date(trade.exit_time).toLocaleString() : '-'}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -927,6 +1060,196 @@ const AutoTradingDashboard = () => {
           <p style={{ margin: '16px 0 0 0', fontSize: '13px', color: '#718096', fontStyle: 'italic' }}>
             💡 These are simulated trades using real market data. Enable auto-trading to execute real trades (in selected mode).
           </p>
+        </div>
+      )}
+      </>
+      )}
+
+      {activeTab === 'report' && (
+        <div style={{
+          background: 'white',
+          borderRadius: '12px',
+          padding: '20px',
+          border: '1px solid #e2e8f0'
+        }}>
+          <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', marginBottom: '16px' }}>
+            <div style={{ padding: '16px', background: '#1a202c', color: 'white', borderRadius: '10px', minWidth: '180px' }}>
+              <div style={{ fontSize: '12px', opacity: 0.8 }}>Today P&L</div>
+              <div style={{ fontSize: '26px', fontWeight: '700', color: (todayPnlFromSummary ?? sumPnl(tradesToday)) >= 0 ? '#c6f6d5' : '#fed7d7' }}>
+                ₹{(todayPnlFromSummary ?? sumPnl(tradesToday)).toLocaleString()}
+              </div>
+            </div>
+            <div style={{ padding: '16px', background: '#2b6cb0', color: 'white', borderRadius: '10px', minWidth: '180px' }}>
+              <div style={{ fontSize: '12px', opacity: 0.9 }}>Today Trades</div>
+              <div style={{ fontSize: '26px', fontWeight: '700' }}>{tradesToday.length}</div>
+            </div>
+            <div style={{ padding: '16px', background: '#2f855a', color: 'white', borderRadius: '10px', minWidth: '180px' }}>
+              <div style={{ fontSize: '12px', opacity: 0.9 }}>Today Win / Loss</div>
+              <div style={{ fontSize: '16px', fontWeight: '700' }}>{sumWins(tradesToday)} / {tradesToday.length - sumWins(tradesToday)}</div>
+            </div>
+            <div style={{ padding: '16px', background: '#4a5568', color: 'white', borderRadius: '10px', minWidth: '180px' }}>
+              <div style={{ fontSize: '12px', opacity: 0.9 }}>Overall P&L</div>
+              <div style={{ fontSize: '26px', fontWeight: '700', color: overallPnl >= 0 ? '#c6f6d5' : '#fed7d7' }}>
+                ₹{overallPnl.toLocaleString()}
+              </div>
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+            <h4 style={{ margin: 0, color: '#2d3748' }}>Trade Report (search & history)</h4>
+            <input
+              type="text"
+              placeholder="Search symbol / action / status"
+              value={historySearch}
+              onChange={(e) => setHistorySearch(e.target.value)}
+              style={{
+                padding: '10px 12px',
+                borderRadius: '8px',
+                border: '1px solid #cbd5e0',
+                minWidth: '240px'
+              }}
+            />
+          </div>
+
+          <div style={{ marginBottom: '12px' }}>
+            <h5 style={{ margin: '0 0 8px 0', color: '#2d3748' }}>Today Trades</h5>
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+                <thead style={{ background: '#f7fafc', borderBottom: '2px solid #e2e8f0' }}>
+                  <tr>
+                    <th style={{ padding: '8px', textAlign: 'left' }}>ID</th>
+                    <th style={{ padding: '8px', textAlign: 'left' }}>Symbol</th>
+                    <th style={{ padding: '8px', textAlign: 'left' }}>Action</th>
+                    <th style={{ padding: '8px', textAlign: 'right' }}>Entry</th>
+                    <th style={{ padding: '8px', textAlign: 'right' }}>Exit</th>
+                    <th style={{ padding: '8px', textAlign: 'right' }}>P&L</th>
+                    <th style={{ padding: '8px', textAlign: 'left' }}>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {todayTableRows.map((t, idx) => {
+                    const entry = Number(t.entry_price || t.price || 0);
+                    const exit = t.exit_price != null ? Number(t.exit_price) : null;
+                    const pnl = Number(t.pnl ?? t.profit_loss ?? 0);
+                    const action = t.action || t.side || 'BUY';
+                    return (
+                      <tr key={idx} style={{ borderBottom: '1px solid #e2e8f0' }}>
+                        <td style={{ padding: '8px' }}>{t.id}</td>
+                        <td style={{ padding: '8px', fontWeight: '600' }}>{t.symbol || t.index || '—'}</td>
+                        <td style={{ padding: '8px' }}>
+                          <span style={{
+                            padding: '2px 6px',
+                            borderRadius: '3px',
+                            background: action === 'BUY' ? '#c6f6d5' : '#fed7d7',
+                            color: action === 'BUY' ? '#22543d' : '#742a2a',
+                            fontSize: '11px',
+                            fontWeight: 'bold'
+                          }}>
+                            {action}
+                          </span>
+                        </td>
+                        <td style={{ padding: '8px', textAlign: 'right' }}>₹{entry.toFixed(2)}</td>
+                        <td style={{ padding: '8px', textAlign: 'right' }}>₹{exit !== null ? exit.toFixed(2) : '-'}</td>
+                        <td style={{ padding: '8px', textAlign: 'right', fontWeight: '700', color: pnl >= 0 ? '#48bb78' : '#f56565' }}>
+                          {pnl >= 0 ? '+' : ''}₹{pnl.toLocaleString()}
+                        </td>
+                        <td style={{ padding: '8px', fontSize: '11px', color: '#718096' }}>{t.status || 'CLOSED'}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            {tradesToday.length === 0 && (
+              <div style={{ marginTop: '8px', fontSize: '12px', color: '#718096' }}>
+                Showing sample rows. Real trades will appear here once captured today.
+              </div>
+            )}
+          </div>
+
+          {filteredHistory.length === 0 ? (
+            <div style={{ padding: '24px', textAlign: 'center', color: '#718096', border: '1px dashed #e2e8f0', borderRadius: '10px' }}>
+              No trades found for the current filters.
+            </div>
+          ) : (
+            <div style={{ overflowX: 'auto', maxHeight: '480px', overflowY: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+                <thead style={{ position: 'sticky', top: 0, background: '#f7fafc', zIndex: 1 }}>
+                  <tr style={{ borderBottom: '2px solid #e2e8f0' }}>
+                    <th style={{ padding: '10px', textAlign: 'left' }}>ID</th>
+                    <th style={{ padding: '10px', textAlign: 'left' }}>Symbol</th>
+                    <th style={{ padding: '10px', textAlign: 'left' }}>Action</th>
+                    <th style={{ padding: '10px', textAlign: 'right' }}>Entry</th>
+                    <th style={{ padding: '10px', textAlign: 'right' }}>Exit</th>
+                    <th style={{ padding: '10px', textAlign: 'right' }}>P&L</th>
+                    <th style={{ padding: '10px', textAlign: 'right' }}>%</th>
+                    <th style={{ padding: '10px', textAlign: 'left' }}>Status</th>
+                    <th style={{ padding: '10px', textAlign: 'left' }}>Date</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredHistory.map((trade, idx) => {
+                    const entry = Number(trade.entry_price || trade.price || 0);
+                    const exit = trade.exit_price != null ? Number(trade.exit_price) : null;
+                    const pnl = Number(trade.profit_loss ?? trade.pnl ?? 0);
+                    const pnlPct = Number(trade.profit_percentage ?? trade.pnl_percent ?? 0);
+                    const action = trade.action || trade.side || 'BUY';
+                    return (
+                      <tr key={idx} style={{ borderBottom: '1px solid #e2e8f0' }}>
+                        <td style={{ padding: '10px' }}>#{trade.id}</td>
+                        <td style={{ padding: '10px', fontWeight: '600' }}>{trade.symbol || trade.index || '—'}</td>
+                        <td style={{ padding: '10px' }}>
+                          <span style={{
+                            padding: '2px 6px',
+                            borderRadius: '3px',
+                            background: action === 'BUY' ? '#c6f6d5' : '#fed7d7',
+                            color: action === 'BUY' ? '#22543d' : '#742a2a',
+                            fontSize: '11px',
+                            fontWeight: 'bold'
+                          }}>
+                            {action}
+                          </span>
+                        </td>
+                        <td style={{ padding: '10px', textAlign: 'right' }}>₹{entry.toFixed(2)}</td>
+                        <td style={{ padding: '10px', textAlign: 'right' }}>₹{exit !== null ? exit.toFixed(2) : '-'}</td>
+                        <td style={{
+                          padding: '10px',
+                          textAlign: 'right',
+                          fontWeight: '700',
+                          color: pnl >= 0 ? '#48bb78' : '#f56565'
+                        }}>
+                          {pnl >= 0 ? '+' : ''}₹{pnl.toLocaleString()}
+                        </td>
+                        <td style={{
+                          padding: '10px',
+                          textAlign: 'right',
+                          fontWeight: '600',
+                          color: pnlPct >= 0 ? '#48bb78' : '#f56565'
+                        }}>
+                          {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%
+                        </td>
+                        <td style={{ padding: '10px' }}>
+                          <span style={{
+                            padding: '2px 6px',
+                            borderRadius: '3px',
+                            background: trade.status === 'CLOSED' ? '#bee3f8' : '#feebc8',
+                            color: trade.status === 'CLOSED' ? '#2c5282' : '#7c2d12',
+                            fontSize: '11px',
+                            fontWeight: 'bold'
+                          }}>
+                            {trade.status || 'CLOSED'}
+                          </span>
+                        </td>
+                        <td style={{ padding: '10px', fontSize: '11px', color: '#718096' }}>
+                          {trade.exit_time ? new Date(trade.exit_time).toLocaleDateString() : (trade.entry_time ? new Date(trade.entry_time).toLocaleDateString() : '-')}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       )}
     </div>

@@ -3,6 +3,7 @@ Token Refresh Routes
 Endpoints for checking token status and triggering refresh operations
 """
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.auth.service import AuthService
@@ -11,6 +12,10 @@ from app.core.token_manager import token_manager
 from app.core.logger import logger
 
 router = APIRouter(prefix="/api/tokens", tags=["tokens"])
+
+
+class RefreshRequest(BaseModel):
+    request_token: str | None = None
 
 @router.get("/status/{broker_id}")
 async def get_token_status(
@@ -60,6 +65,7 @@ async def get_token_status(
 @router.post("/refresh/{broker_id}")
 async def attempt_token_refresh(
     broker_id: int,
+    body: RefreshRequest | None = None,
     db: Session = Depends(get_db),
     token: str = Depends(AuthService.verify_bearer_token)
 ):
@@ -81,7 +87,7 @@ async def attempt_token_refresh(
             raise HTTPException(status_code=404, detail="Broker credential not found")
         
         # Attempt refresh - for Zerodha, this will indicate re-auth is needed
-        refresh_result = token_manager.refresh_zerodha_token(broker_id, db)
+        refresh_result = token_manager.refresh_zerodha_token(broker_id, db, request_token=body.request_token if body else None)
         
         logger.log_info("Token refresh attempted", {
             "broker_id": broker_id,

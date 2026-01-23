@@ -3,12 +3,18 @@ News and Market Trend Analysis Module
 Fetches real-time news, analyzes sentiment, and detects market trends
 """
 
+import os
 import requests
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from itertools import chain
+from kiteconnect import KiteConnect
+from app.core.database import SessionLocal
+from app.models.auth import BrokerCredential
+from app.core.security import encryption_manager
+from app.core.config import get_settings
 
 class NewsAnalyzer:
     """Fetch and analyze market news with sentiment analysis"""
@@ -167,7 +173,8 @@ class MarketTrendAnalyzer:
     """Analyze market trends using technical indicators"""
     
     def __init__(self):
-        self.indices = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'SENSEX']
+        # Exclude SENSEX from default rotation to avoid Yahoo 401 blocks; add explicitly if needed via Zerodha.
+        self.indices = ['NIFTY', 'BANKNIFTY', 'FINNIFTY']
         # Primary Yahoo Finance symbols for key indices
         self.quote_symbols = {
             'NIFTY': '^NSEI',
@@ -183,6 +190,10 @@ class MarketTrendAnalyzer:
             'SENSEX': {'^BSESN', '^SENSEX'}
         }
         self.request_timeout = 6
+        settings = get_settings()
+        # Zerodha credentials can be provided via environment or .env to source quotes directly from Kite.
+        self.kite_api_key = os.getenv('ZERODHA_API_KEY') or settings.ZERODHA_API_KEY or None
+        self.kite_access_token = os.getenv('ZERODHA_ACCESS_TOKEN') or None
     
     async def get_market_trends(self) -> Dict[str, Any]:
         """Get current market trends for major indices"""
@@ -212,17 +223,188 @@ class MarketTrendAnalyzer:
             return 'Bearish'
 
     def _fetch_live_quotes(self) -> Dict[str, Dict[str, Any]]:
-        """Fetch live index quotes from Yahoo Finance"""
+        """Fetch live index quotes with Zerodha preferred; fallback to Moneycontrol then Yahoo."""
+        market_data: Dict[str, Dict[str, Any]] = {}
+
+        zerodha_rows = self._fetch_zerodha_quotes()
+        if zerodha_rows:
+            market_data.update(zerodha_rows)
+
+        # NSE direct feed (cookie-primed) to avoid Yahoo 401 blocks and Moneycontrol gaps.
+        missing_indices = [idx for idx in self.indices if idx not in market_data]
+        if missing_indices:
+            nse_rows = self._fetch_nse_indices(missing_indices)
+            market_data.update(nse_rows)
+
+        # Next try Moneycontrol price feed for anything missing.
+        missing_indices = [idx for idx in self.indices if idx not in market_data]
+        if missing_indices:
+            mc_rows = self._fetch_moneycontrol_quotes(missing_indices)
+            market_data.update(mc_rows)
+
+        # Finally fall back to Yahoo.
+        missing_indices = [idx for idx in self.indices if idx not in market_data]
+        if missing_indices:
+            yahoo_rows = self._fetch_yahoo_quotes(missing_indices)
+            market_data.update(yahoo_rows)
+
+        return market_data
+
+    def _fetch_zerodha_quotes(self) -> Dict[str, Dict[str, Any]]:
+        """Fetch live quotes from Zerodha Kite if API key + access token are set."""
+        # Always re-hydrate in case tokens rotated.
+        self._hydrate_tokens_from_db()
+        if not self.kite_api_key or not self.kite_access_token:
+            return {}
+
+        mapping = {
+            'NIFTY': 'NSE:NIFTY 50',
+            'BANKNIFTY': 'NSE:NIFTY BANK',
+            'FINNIFTY': 'NSE:FINNIFTY',
+            'SENSEX': 'BSE:SENSEX',
+        }
+
+        try:
+            kite = KiteConnect(api_key=self.kite_api_key)
+            kite.set_access_token(self.kite_access_token)
+            instruments = [sym for sym in mapping.values() if sym]
+            quotes = kite.ltp(instruments)
+        except Exception as exc:
+            err = str(exc)
+            print(f"[MarketIntelligence] Zerodha quote fetch failed: {err}")
+            return {}
+
+        rows: Dict[str, Dict[str, Any]] = {}
+        for idx, ins in mapping.items():
+            data = quotes.get(ins)
+            if not data:
+                continue
+            last_price = data.get('last_price')
+            ohlc = data.get('ohlc') or {}
+            prev_close = ohlc.get('close')
+            if last_price is None or prev_close in (None, 0):
+                continue
+            change = last_price - prev_close
+            change_percent = (change / prev_close) * 100 if prev_close else 0.0
+            rows[idx] = {
+                'current': round(last_price, 2),
+                'change': round(change, 2),
+                'change_percent': round(change_percent, 2),
+                'trend': self._trend_direction(change_percent),
+                'strength': self._trend_strength(abs(change_percent)),
+                'support': round(last_price * 0.985, 2),
+                'resistance': round(last_price * 1.015, 2),
+                'volume': 'Average',
+                'rsi': self._approximate_rsi(change_percent),
+                'macd': 'Bullish' if change_percent > 0 else 'Bearish' if change_percent < 0 else 'Flat'
+            }
+
+        return rows
+
+    def _hydrate_tokens_from_db(self) -> None:
+        """Load Zerodha api_key/access_token from broker_credentials when env vars are absent."""
+        try:
+            db = SessionLocal()
+            cred = (
+                db.query(BrokerCredential)
+                .filter(BrokerCredential.broker_name == 'zerodha', BrokerCredential.is_active == True)
+                .order_by(BrokerCredential.id.desc())
+                .first()
+            )
+            if not cred:
+                return
+
+            def _dec(val: str | None) -> str | None:
+                if not val:
+                    return None
+                try:
+                    return encryption_manager.decrypt_credentials(val)
+                except Exception:
+                    return val  # fall back to stored value (may already be plaintext)
+
+            api_key = _dec(getattr(cred, 'api_key', None))
+            access = _dec(getattr(cred, 'access_token', None))
+
+            if api_key and not self.kite_api_key:
+                self.kite_api_key = api_key
+            if access and not self.kite_access_token:
+                self.kite_access_token = access
+        except Exception as exc:
+            print(f"[MarketIntelligence] Failed to load Zerodha tokens from DB: {exc}")
+        finally:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+    def _fetch_nse_indices(self, indices_to_fetch: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Fetch live index quotes from NSE public API (requires cookie priming)."""
+        # Map our symbols to NSE index names.
+        nse_index_map = {
+            'NIFTY': 'NIFTY 50',
+            'BANKNIFTY': 'NIFTY BANK',
+            'FINNIFTY': 'NIFTY FINANCIAL SERVICES',
+            # SENSEX not available on NSE; will stay missing and fall back.
+        }
+
+        target_names = {sym: nse_index_map.get(sym) for sym in indices_to_fetch if nse_index_map.get(sym)}
+        if not target_names:
+            return {}
+
+        session = requests.Session()
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Referer': 'https://www.nseindia.com/',
+        }
+
+        try:
+            session.get('https://www.nseindia.com', headers=headers, timeout=self.request_timeout)
+            resp = session.get('https://www.nseindia.com/api/allIndices', headers=headers, timeout=self.request_timeout)
+            resp.raise_for_status()
+            data = resp.json().get('data') or []
+        except Exception as exc:
+            print(f"[MarketIntelligence] NSE index fetch failed: {exc}")
+            return {}
+
+        market_data: Dict[str, Dict[str, Any]] = {}
+        for sym, nse_name in target_names.items():
+            row = next((item for item in data if item.get('index') == nse_name), None)
+            if not row:
+                continue
+            last = row.get('last')
+            prev = row.get('previousClose')
+            if last is None or prev in (None, 0):
+                continue
+            change = last - prev
+            change_percent = (change / prev) * 100 if prev else 0.0
+            market_data[sym] = {
+                'current': round(last, 2),
+                'change': round(change, 2),
+                'change_percent': round(change_percent, 2),
+                'trend': self._trend_direction(change_percent),
+                'strength': self._trend_strength(abs(change_percent)),
+                'support': round(last * 0.985, 2),
+                'resistance': round(last * 1.015, 2),
+                'volume': 'Average',
+                'rsi': self._approximate_rsi(change_percent),
+                'macd': 'Bullish' if change_percent > 0 else 'Bearish' if change_percent < 0 else 'Flat',
+            }
+
+        return market_data
+
+    def _fetch_yahoo_quotes(self, indices_to_fetch: List[str]) -> Dict[str, Dict[str, Any]]:
         session = requests.Session()
         session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json'
+            'Accept': 'application/json',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Origin': 'https://query1.finance.yahoo.com',
+            'Referer': 'https://finance.yahoo.com/'
         })
 
         market_data: Dict[str, Dict[str, Any]] = {}
-
-        # Batch fetch first
-        symbols = ','.join(self.quote_symbols.values())
+        symbols = ','.join(self.quote_symbols[idx] for idx in indices_to_fetch if idx in self.quote_symbols)
         url = 'https://query1.finance.yahoo.com/v7/finance/quote'
 
         try:
@@ -230,16 +412,17 @@ class MarketTrendAnalyzer:
             response.raise_for_status()
             results = response.json().get('quoteResponse', {}).get('result', [])
         except Exception as exc:
-            print(f"[MarketIntelligence] Live quote fetch failed (batch): {exc}")
-            results = []
+            err = str(exc)
+            print(f"[MarketIntelligence] Live quote fetch failed (batch): {err}")
+            # Yahoo often returns 401 for server IPs; bail early to avoid noisy retries.
+            return market_data
 
         for quote in results:
             parsed = self._quote_to_market_row(quote)
             if parsed:
                 market_data[parsed['index']] = parsed['row']
 
-        # Per-symbol fallback for anything missing
-        missing_indices = [idx for idx in self.indices if idx not in market_data]
+        missing_indices = [idx for idx in indices_to_fetch if idx not in market_data]
         if missing_indices:
             for idx in missing_indices:
                 for symbol in self._symbols_for_index(idx):
@@ -247,6 +430,59 @@ class MarketTrendAnalyzer:
                     if chart_row:
                         market_data[idx] = chart_row
                         break
+
+        return market_data
+
+    def _fetch_moneycontrol_quotes(self, indices_to_fetch: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Fetch quotes from Moneycontrol price feed as a secondary live source."""
+        mc_map = {
+            'NIFTY': 'in%3BNSX',
+            'BANKNIFTY': 'in%3BANKNIFTY',
+            'FINNIFTY': 'in%3BFINNIFTY',
+            'SENSEX': 'in%3BSENSEX',
+        }
+
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Referer': 'https://www.moneycontrol.com/',
+            'Origin': 'https://www.moneycontrol.com'
+        })
+
+        market_data: Dict[str, Dict[str, Any]] = {}
+        for idx in indices_to_fetch:
+            code = mc_map.get(idx)
+            if not code:
+                continue
+            url = f"https://priceapi.moneycontrol.com/pricefeed/notapplicable/inidicesindia/{code}"
+            try:
+                resp = session.get(url, timeout=self.request_timeout)
+                resp.raise_for_status()
+                payload = resp.json()
+                data = payload.get('data') if isinstance(payload, dict) else None
+                if not isinstance(data, dict):
+                    continue
+                price = float(data.get('pricecurrent') or 0)
+                prev = float(data.get('priceprevclose') or 0)
+                if price <= 0 or prev <= 0:
+                    continue
+                change = price - prev
+                change_percent = (change / prev) * 100 if prev else 0.0
+                market_data[idx] = {
+                    'current': round(price, 2),
+                    'change': round(change, 2),
+                    'change_percent': round(change_percent, 2),
+                    'trend': self._trend_direction(change_percent),
+                    'strength': self._trend_strength(abs(change_percent)),
+                    'support': round(price * 0.985, 2),
+                    'resistance': round(price * 1.015, 2),
+                    'volume': 'Average',
+                    'rsi': self._approximate_rsi(change_percent),
+                    'macd': 'Bullish' if change_percent > 0 else 'Bearish' if change_percent < 0 else 'Flat'
+                }
+            except Exception as exc:
+                print(f"[MarketIntelligence] Moneycontrol fetch failed for {idx}: {exc}")
 
         return market_data
 

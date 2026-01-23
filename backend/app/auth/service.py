@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import secrets
 from typing import Optional
 from jose import JWTError, jwt
 from fastapi import Depends, HTTPException, status
@@ -7,15 +8,24 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.security import encryption_manager
-from app.core.database import get_db
+from app.core.database import get_db, SessionLocal
 from app.models.auth import User, BrokerCredential
-from app.models.schemas import UserCreate, UserLogin, TokenResponse
+from app.models.schemas import UserCreate, UserLogin, TokenResponse, OtpVerify
 
 settings = get_settings()
 security = HTTPBearer()
 
 class AuthService:
     """Authentication and JWT token management"""
+
+    @staticmethod
+    def _generate_otp() -> str:
+        return f"{secrets.randbelow(900000) + 100000}"
+
+    @staticmethod
+    def _send_otp(user: User, otp: str) -> None:
+        # Placeholder for SMS/Email integrations; logged for now.
+        print(f"[OTP] Send to email {user.email} and mobile {user.mobile}: {otp}")
     
     @staticmethod
     def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -53,7 +63,7 @@ class AuthService:
         """Register new user"""
         # Check if user exists
         existing_user = db.query(User).filter(
-            (User.email == user_data.email) | (User.username == user_data.username)
+            (User.email == user_data.email) | (User.username == user_data.username) | (User.mobile == user_data.mobile)
         ).first()
         
         if existing_user:
@@ -64,14 +74,25 @@ class AuthService:
         
         # Hash password and create user
         hashed_password = encryption_manager.hash_password(user_data.password)
+        otp = AuthService._generate_otp()
+        expires_at = datetime.utcnow() + timedelta(minutes=10)
+
         db_user = User(
             username=user_data.username,
             email=user_data.email,
-            hashed_password=hashed_password
+            mobile=user_data.mobile,
+            hashed_password=hashed_password,
+            is_email_verified=False,
+            is_mobile_verified=False,
+            is_admin=False,
+            otp_code=otp,
+            otp_expires_at=expires_at,
+            last_otp_sent_at=datetime.utcnow(),
         )
         db.add(db_user)
         db.commit()
         db.refresh(db_user)
+        AuthService._send_otp(db_user, otp)
         return db_user
     
     @staticmethod
@@ -84,10 +105,51 @@ class AuthService:
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid credentials"
             )
-        
+
+        # Admin is allowed to sign in without OTP friction
+        if user.is_admin and (not user.is_email_verified or not user.is_mobile_verified):
+            user.is_email_verified = True
+            user.is_mobile_verified = True
+            db.commit()
+            db.refresh(user)
+
+        if not (user.is_email_verified and user.is_mobile_verified):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="OTP verification required")
+
         access_token = AuthService.create_access_token({"sub": str(user.id)})
         refresh_token = AuthService.create_refresh_token(user.id)
         
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer"
+        }
+
+    @staticmethod
+    def verify_otp(payload: OtpVerify, db: Session) -> dict:
+        user = db.query(User).filter((User.username == payload.username) | (User.email == payload.username)).first()
+        if not user:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+        if not user.otp_code or not user.otp_expires_at:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No OTP pending")
+
+        if datetime.utcnow() > user.otp_expires_at:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OTP expired")
+
+        if str(payload.otp).strip() != str(user.otp_code).strip():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OTP")
+
+        user.is_email_verified = True
+        user.is_mobile_verified = True
+        user.otp_code = None
+        user.otp_expires_at = None
+        db.commit()
+        db.refresh(user)
+
+        access_token = AuthService.create_access_token({"sub": str(user.id)})
+        refresh_token = AuthService.create_refresh_token(user.id)
+
         return {
             "access_token": access_token,
             "refresh_token": refresh_token,
@@ -119,6 +181,55 @@ class AuthService:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
         
         return user
+
+    @staticmethod
+    def ensure_default_admin(db: Optional[Session] = None) -> Optional[User]:
+        """Ensure a default admin account exists with OTP bypass."""
+        local_db = db or SessionLocal()
+        try:
+            admin = local_db.query(User).filter(User.username == "admin").first()
+
+            if not admin:
+                admin_password = encryption_manager.hash_password("admin123")
+                admin = User(
+                    username="admin",
+                    email="admin@system.local",
+                    mobile=None,
+                    hashed_password=admin_password,
+                    is_active=True,
+                    is_admin=True,
+                    is_email_verified=True,
+                    is_mobile_verified=True,
+                )
+                local_db.add(admin)
+                local_db.commit()
+                local_db.refresh(admin)
+                return admin
+
+            # Keep existing admin aligned with required flags
+            updated = False
+            if not admin.is_admin:
+                admin.is_admin = True
+                updated = True
+            if not admin.is_active:
+                admin.is_active = True
+                updated = True
+            if not (admin.is_email_verified and admin.is_mobile_verified):
+                admin.is_email_verified = True
+                admin.is_mobile_verified = True
+                updated = True
+            if not encryption_manager.verify_password("admin123", admin.hashed_password):
+                admin.hashed_password = encryption_manager.hash_password("admin123")
+                updated = True
+
+            if updated:
+                local_db.commit()
+                local_db.refresh(admin)
+
+            return admin
+        finally:
+            if db is None:
+                local_db.close()
 
 class BrokerAuthService:
     """Manage broker-specific authentication and credentials"""

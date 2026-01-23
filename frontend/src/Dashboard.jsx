@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import config from './config/api';
 import AutoTradingDashboard from './components/AutoTradingDashboard';
+import AdminPanel from './components/AdminPanel';
 
 function Dashboard() {
   const [user, setUser] = useState(null);
@@ -567,6 +568,12 @@ function Dashboard() {
             )}
           </div>
         </div>
+
+        {user.is_admin && (
+          <div style={{ marginBottom: '32px' }}>
+            <AdminPanel user={user} />
+          </div>
+        )}
 
         {/* Action Cards */}
         <div style={{

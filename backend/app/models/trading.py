@@ -1,4 +1,5 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, ForeignKey, JSON
+from sqlalchemy import Column, Integer, String, Float, DateTime, Date, Boolean, ForeignKey, JSON
+from sqlalchemy.sql import func
 from datetime import datetime
 from app.core.database import Base
 
@@ -66,3 +67,23 @@ class BacktestResult(Base):
     total_trades = Column(Integer)
     results_data = Column(JSON)  # Detailed results
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class TradeReport(Base):
+    """Persistent log of closed trades for reporting."""
+    __tablename__ = "trade_reports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String, index=True)
+    side = Column(String, index=True)
+    quantity = Column(Float)
+    entry_price = Column(Float)
+    exit_price = Column(Float)
+    pnl = Column(Float)
+    pnl_percentage = Column(Float)
+    strategy = Column(String, nullable=True)
+    status = Column(String, default="CLOSED")
+    entry_time = Column(DateTime, nullable=True)
+    exit_time = Column(DateTime, default=datetime.utcnow, index=True)
+    trading_date = Column(Date, default=func.current_date(), index=True)
+    meta = Column(JSON, nullable=True)
