@@ -1,4 +1,10 @@
 {
-  "build": "npm install && npm run build",
-  "start": "npx serve -s dist -l $PORT"
+  "build": {
+    "builder": "npm",
+    "args": ["install"]
+  },
+  "start": {
+    "builder": "npx",
+    "args": ["serve", "-s", "dist", "-l", "$PORT"]
+  }
 }
