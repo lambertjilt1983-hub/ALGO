@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     # Frontend URLs (for OAuth redirects)
     FRONTEND_URL: str = "http://localhost:3000"
     FRONTEND_ALT_URL: str = "http://localhost:5173"  # Fallback for old Vite port
+
+    # CORS
+    ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:3001,http://localhost:8080,http://localhost:5173,https://algo-trade-frontend.up.railway.app"
     
     class Config:
         env_file = ".env"
