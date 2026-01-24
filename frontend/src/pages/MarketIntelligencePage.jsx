@@ -13,7 +13,7 @@ const MarketIntelligencePage = () => {
   const [autoRefresh, setAutoRefresh] = useState(true);
 
   const fetchMarketData = async () => {
-    const token = localStorage.getItem('token');
+    const token = localStorage.getItem('access_token');
     if (!token) {
       setError('Please login to view market intelligence');
       setLoading(false);

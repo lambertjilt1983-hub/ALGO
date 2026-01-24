@@ -21,7 +21,7 @@ export default function BrokersPage() {
 
   const fetchBrokers = async () => {
     try {
-      const token = localStorage.getItem('token');
+      const token = localStorage.getItem('access_token');
       const response = await axios.get(`${API_URL}/brokers/credentials`, {
         headers: { Authorization: `Bearer ${token}` },
       });
@@ -38,7 +38,7 @@ export default function BrokersPage() {
     setIsLoading(true);
 
     try {
-      const token = localStorage.getItem('token');
+      const token = localStorage.getItem('access_token');
       await axios.post(
         `${API_URL}/brokers/credentials`,
         formData,
@@ -60,7 +60,7 @@ export default function BrokersPage() {
 
   const handleZerodhaLogin = async (brokerId) => {
     try {
-      const token = localStorage.getItem('token');
+      const token = localStorage.getItem('access_token');
       const response = await axios.get(
         `${API_URL}/brokers/zerodha/login/${brokerId}`,
         {
@@ -81,7 +81,7 @@ export default function BrokersPage() {
     if (!confirm(`Delete ${brokerName} credentials?`)) return;
 
     try {
-      const token = localStorage.getItem('token');
+      const token = localStorage.getItem('access_token');
       await axios.delete(
         `${API_URL}/brokers/credentials/${brokerName}`,
         {
