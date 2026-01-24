@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     """Application settings with environment variable support"""
     
     # Database
-    DATABASE_URL: str = "postgresql://user:password@localhost:5432/trading_db"
+    DATABASE_URL: str = "postgresql://user:password@localhost:5432/trading_db"  # Update if using cloud DB
     
     # Security
     SECRET_KEY: str = "your-super-secret-key-change-in-production"
@@ -31,17 +31,17 @@ class Settings(BaseSettings):
     GROWW_API_SECRET: str = ""
     
     # Redis
-    REDIS_URL: str = "redis://localhost:6379"
+    REDIS_URL: str = "redis://localhost:6379"  # Update if using cloud Redis
     
     # Logging
     LOG_LEVEL: str = "INFO"
     
     # Frontend URLs (for OAuth redirects)
-    FRONTEND_URL: str = "http://localhost:3000"
-    FRONTEND_ALT_URL: str = "http://localhost:5173"  # Fallback for old Vite port
+    FRONTEND_URL: str = "https://algo-trade-frontend.up.railway.app"
+    FRONTEND_ALT_URL: str = "https://algo-trade-frontend.up.railway.app"
 
     # CORS
-    ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:3001,http://localhost:8080,http://localhost:5173,https://algo-trade-frontend.up.railway.app"
+    ALLOWED_ORIGINS: str = "https://algo-trade-frontend.up.railway.app"
     
     class Config:
         env_file = ".env"
