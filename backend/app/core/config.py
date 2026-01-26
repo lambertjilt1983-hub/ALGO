@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     """Application settings with environment variable support"""
     
     # Database
-    DATABASE_URL: str = "postgresql://user:password@localhost:5432/trading_db"  # Update if using cloud DB
+    DATABASE_URL: str = "postgresql://user:password@YOUR_PRODUCTION_DB_HOST:5432/trading_db"  # Update for production
     
     # Security
     SECRET_KEY: str = "your-super-secret-key-change-in-production"
@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     GROWW_API_SECRET: str = ""
     
     # Redis
-    REDIS_URL: str = "redis://localhost:6379"  # Update if using cloud Redis
+    REDIS_URL: str = "redis://YOUR_PRODUCTION_REDIS_HOST:6379"  # Update for production
     
     # Logging
     LOG_LEVEL: str = "INFO"
