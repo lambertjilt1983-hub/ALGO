@@ -2,6 +2,8 @@ import React, { useState, useEffect } from 'react';
 import Dashboard from './Dashboard';
 import config from './config/api';
 import './App.css';
+import { Routes, Route } from 'react-router-dom';
+import ZerodhaCallbackPage from './pages/ZerodhaCallbackPage';
 
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -133,276 +135,283 @@ export default function App() {
   };
 
   return (
-    <div style={{ minHeight: '100vh', backgroundColor: '#f3f4f6' }}>
-      {/* Navbar */}
-      <nav style={{
-        backgroundColor: '#1e40af',
-        color: 'white',
-        padding: '1rem 2rem',
-        boxShadow: '0 1px 3px rgba(0,0,0,0.1)'
-      }}>
-        <h1 style={{ margin: 0, fontSize: '1.5rem' }}>🚀 AlgoTrade Pro</h1>
-      </nav>
-
-      {/* Main Content */}
-      <div style={{
-        display: 'flex',
-        justifyContent: 'center',
-        alignItems: 'center',
-        minHeight: 'calc(100vh - 60px)',
-        padding: '2rem'
-      }}>
-        <div style={{
-          backgroundColor: 'white',
-          borderRadius: '0.5rem',
-          boxShadow: '0 10px 25px rgba(0,0,0,0.1)',
-          padding: '2rem',
-          width: '100%',
-          maxWidth: '400px'
-        }}>
-          {/* Tabs */}
-          <div style={{ display: 'flex', gap: '1rem', marginBottom: '2rem' }}>
-            <button
-              onClick={() => {
-                setIsLogin(true);
-                setError('');
-              }}
-              style={{
-                flex: 1,
-                padding: '0.5rem',
-                border: 'none',
-                backgroundColor: isLogin ? '#1e40af' : '#e5e7eb',
-                color: isLogin ? 'white' : 'black',
-                borderRadius: '0.375rem',
-                cursor: 'pointer',
-                fontWeight: 'bold',
-                transition: 'all 0.3s'
-              }}
-            >
-              Login
-            </button>
-            <button
-              onClick={() => {
-                setIsLogin(false);
-                setError('');
-              }}
-              style={{
-                flex: 1,
-                padding: '0.5rem',
-                border: 'none',
-                backgroundColor: !isLogin ? '#1e40af' : '#e5e7eb',
-                color: !isLogin ? 'white' : 'black',
-                borderRadius: '0.375rem',
-                cursor: 'pointer',
-                fontWeight: 'bold',
-                transition: 'all 0.3s'
-              }}
-            >
-              Register
-            </button>
-          </div>
-
-          {/* Error Message */}
-          {error && (
-            <div style={{
-              backgroundColor: '#fee2e2',
-              color: '#991b1b',
-              padding: '0.75rem',
-              borderRadius: '0.375rem',
-              marginBottom: '1rem',
-              fontSize: '0.875rem'
+    <Routes>
+      <Route path="/zerodha-callback" element={<ZerodhaCallbackPage />} />
+      <Route path="*" element={
+        isLoggedIn ? <Dashboard /> : (
+          <div style={{ minHeight: '100vh', backgroundColor: '#f3f4f6' }}>
+            {/* Navbar */}
+            <nav style={{
+              backgroundColor: '#1e40af',
+              color: 'white',
+              padding: '1rem 2rem',
+              boxShadow: '0 1px 3px rgba(0,0,0,0.1)'
             }}>
-              ❌ {error}
+              <h1 style={{ margin: 0, fontSize: '1.5rem' }}>🚀 AlgoTrade Pro</h1>
+            </nav>
+
+            {/* Main Content */}
+            <div style={{
+              display: 'flex',
+              justifyContent: 'center',
+              alignItems: 'center',
+              minHeight: 'calc(100vh - 60px)',
+              padding: '2rem'
+            }}>
+              <div style={{
+                backgroundColor: 'white',
+                borderRadius: '0.5rem',
+                boxShadow: '0 10px 25px rgba(0,0,0,0.1)',
+                padding: '2rem',
+                width: '100%',
+                maxWidth: '400px'
+              }}>
+                {/* Tabs */}
+                <div style={{ display: 'flex', gap: '1rem', marginBottom: '2rem' }}>
+                  <button
+                    onClick={() => {
+                      setIsLogin(true);
+                      setError('');
+                    }}
+                    style={{
+                      flex: 1,
+                      padding: '0.5rem',
+                      border: 'none',
+                      backgroundColor: isLogin ? '#1e40af' : '#e5e7eb',
+                      color: isLogin ? 'white' : 'black',
+                      borderRadius: '0.375rem',
+                      cursor: 'pointer',
+                      fontWeight: 'bold',
+                      transition: 'all 0.3s'
+                    }}
+                  >
+                    Login
+                  </button>
+                  <button
+                    onClick={() => {
+                      setIsLogin(false);
+                      setError('');
+                    }}
+                    style={{
+                      flex: 1,
+                      padding: '0.5rem',
+                      border: 'none',
+                      backgroundColor: !isLogin ? '#1e40af' : '#e5e7eb',
+                      color: !isLogin ? 'white' : 'black',
+                      borderRadius: '0.375rem',
+                      cursor: 'pointer',
+                      fontWeight: 'bold',
+                      transition: 'all 0.3s'
+                    }}
+                  >
+                    Register
+                  </button>
+                </div>
+
+                {/* Error Message */}
+                {error && (
+                  <div style={{
+                    backgroundColor: '#fee2e2',
+                    color: '#991b1b',
+                    padding: '0.75rem',
+                    borderRadius: '0.375rem',
+                    marginBottom: '1rem',
+                    fontSize: '0.875rem'
+                  }}>
+                    ❌ {error}
+                  </div>
+                )}
+
+                {/* Form */}
+                {pendingOtpUser ? (
+                  <form onSubmit={handleOtpSubmit}>
+                    <h2 style={{ textAlign: 'center', marginBottom: '1.5rem', color: '#1f2937' }}>
+                      Verify OTP
+                    </h2>
+                    <p style={{ textAlign: 'center', marginBottom: '1rem', color: '#4b5563' }}>
+                      Enter the 6-digit code sent to your email and mobile.
+                    </p>
+                    <div style={{ marginBottom: '1.5rem' }}>
+                      <label style={{ display: 'block', marginBottom: '0.5rem', color: '#374151', fontWeight: '500' }}>
+                        OTP
+                      </label>
+                      <input
+                        type="text"
+                        value={otp}
+                        onChange={(e) => setOtp(e.target.value)}
+                        placeholder="Enter OTP"
+                        required
+                        style={{
+                          width: '100%',
+                          padding: '0.75rem',
+                          border: '1px solid #d1d5db',
+                          borderRadius: '0.375rem',
+                          fontSize: '1rem',
+                          boxSizing: 'border-box'
+                        }}
+                      />
+                    </div>
+                    <button
+                      type="submit"
+                      disabled={submitting}
+                      style={{
+                        width: '100%',
+                        padding: '0.75rem',
+                        backgroundColor: submitting ? '#9ca3af' : '#1e40af',
+                        color: 'white',
+                        border: 'none',
+                        borderRadius: '0.375rem',
+                        fontSize: '1rem',
+                        fontWeight: 'bold',
+                        cursor: submitting ? 'not-allowed' : 'pointer',
+                        transition: 'background-color 0.3s'
+                      }}
+                    >
+                      {submitting ? 'Verifying...' : 'Verify & Continue'}
+                    </button>
+                  </form>
+                ) : (
+                  <form onSubmit={handleSubmit}>
+                    <h2 style={{ textAlign: 'center', marginBottom: '1.5rem', color: '#1f2937' }}>
+                      {isLogin ? 'Welcome Back' : 'Create Account'}
+                    </h2>
+
+                    {!isLogin && (
+                      <div style={{ marginBottom: '1rem' }}>
+                        <label style={{ display: 'block', marginBottom: '0.5rem', color: '#374151', fontWeight: '500' }}>
+                          Email
+                        </label>
+                        <input
+                          type="email"
+                          value={email}
+                          onChange={(e) => setEmail(e.target.value)}
+                          placeholder="Enter your email"
+                          required={!isLogin}
+                          style={{
+                            width: '100%',
+                            padding: '0.75rem',
+                            border: '1px solid #d1d5db',
+                            borderRadius: '0.375rem',
+                            fontSize: '1rem',
+                            boxSizing: 'border-box'
+                          }}
+                        />
+                      </div>
+                    )}
+
+                    {!isLogin && (
+                      <div style={{ marginBottom: '1rem' }}>
+                        <label style={{ display: 'block', marginBottom: '0.5rem', color: '#374151', fontWeight: '500' }}>
+                          Mobile
+                        </label>
+                        <input
+                          type="tel"
+                          value={mobile}
+                          onChange={(e) => setMobile(e.target.value)}
+                          placeholder="Enter mobile number"
+                          required={!isLogin}
+                          style={{
+                            width: '100%',
+                            padding: '0.75rem',
+                            border: '1px solid #d1d5db',
+                            borderRadius: '0.375rem',
+                            fontSize: '1rem',
+                            boxSizing: 'border-box'
+                          }}
+                        />
+                      </div>
+                    )}
+
+                    <div style={{ marginBottom: '1rem' }}>
+                      <label style={{ display: 'block', marginBottom: '0.5rem', color: '#374151', fontWeight: '500' }}>
+                        Username
+                      </label>
+                      <input
+                        type="text"
+                        value={username}
+                        onChange={(e) => setUsername(e.target.value)}
+                        placeholder="Enter username"
+                        required
+                        style={{
+                          width: '100%',
+                          padding: '0.75rem',
+                          border: '1px solid #d1d5db',
+                          borderRadius: '0.375rem',
+                          fontSize: '1rem',
+                          boxSizing: 'border-box'
+                        }}
+                      />
+                    </div>
+
+                    <div style={{ marginBottom: '1.5rem' }}>
+                      <label style={{ display: 'block', marginBottom: '0.5rem', color: '#374151', fontWeight: '500' }}>
+                        Password
+                      </label>
+                      <input
+                        type="password"
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        placeholder="Enter password"
+                        required
+                        style={{
+                          width: '100%',
+                          padding: '0.75rem',
+                          border: '1px solid #d1d5db',
+                          borderRadius: '0.375rem',
+                          fontSize: '1rem',
+                          boxSizing: 'border-box'
+                        }}
+                      />
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={submitting}
+                      style={{
+                        width: '100%',
+                        padding: '0.75rem',
+                        backgroundColor: submitting ? '#9ca3af' : '#1e40af',
+                        color: 'white',
+                        border: 'none',
+                        borderRadius: '0.375rem',
+                        fontSize: '1rem',
+                        fontWeight: 'bold',
+                        cursor: submitting ? 'not-allowed' : 'pointer',
+                        transition: 'background-color 0.3s'
+                      }}
+                    >
+                      {submitting ? 'Loading...' : (isLogin ? 'Login' : 'Register')}
+                    </button>
+                  </form>
+                )}
+
+                {/* Footer Text */}
+                <p style={{ textAlign: 'center', marginTop: '1.5rem', color: '#6b7280', fontSize: '0.875rem' }}>
+                  {isLogin ? "Don't have an account? " : 'Already have an account? '}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsLogin(!isLogin);
+                      setError('');
+                    }}
+                    style={{
+                      background: 'none',
+                      border: 'none',
+                      color: '#1e40af',
+                      cursor: 'pointer',
+                      fontWeight: 'bold',
+                      textDecoration: 'underline'
+                    }}
+                  >
+                    {isLogin ? 'Register' : 'Login'}
+                  </button>
+                </p>
+              </div>
             </div>
-          )}
-
-          {/* Form */}
-          {pendingOtpUser ? (
-            <form onSubmit={handleOtpSubmit}>
-              <h2 style={{ textAlign: 'center', marginBottom: '1.5rem', color: '#1f2937' }}>
-                Verify OTP
-              </h2>
-              <p style={{ textAlign: 'center', marginBottom: '1rem', color: '#4b5563' }}>
-                Enter the 6-digit code sent to your email and mobile.
-              </p>
-              <div style={{ marginBottom: '1.5rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', color: '#374151', fontWeight: '500' }}>
-                  OTP
-                </label>
-                <input
-                  type="text"
-                  value={otp}
-                  onChange={(e) => setOtp(e.target.value)}
-                  placeholder="Enter OTP"
-                  required
-                  style={{
-                    width: '100%',
-                    padding: '0.75rem',
-                    border: '1px solid #d1d5db',
-                    borderRadius: '0.375rem',
-                    fontSize: '1rem',
-                    boxSizing: 'border-box'
-                  }}
-                />
-              </div>
-              <button
-                type="submit"
-                disabled={submitting}
-                style={{
-                  width: '100%',
-                  padding: '0.75rem',
-                  backgroundColor: submitting ? '#9ca3af' : '#1e40af',
-                  color: 'white',
-                  border: 'none',
-                  borderRadius: '0.375rem',
-                  fontSize: '1rem',
-                  fontWeight: 'bold',
-                  cursor: submitting ? 'not-allowed' : 'pointer',
-                  transition: 'background-color 0.3s'
-                }}
-              >
-                {submitting ? 'Verifying...' : 'Verify & Continue'}
-              </button>
-            </form>
-          ) : (
-            <form onSubmit={handleSubmit}>
-              <h2 style={{ textAlign: 'center', marginBottom: '1.5rem', color: '#1f2937' }}>
-                {isLogin ? 'Welcome Back' : 'Create Account'}
-              </h2>
-
-              {!isLogin && (
-                <div style={{ marginBottom: '1rem' }}>
-                  <label style={{ display: 'block', marginBottom: '0.5rem', color: '#374151', fontWeight: '500' }}>
-                    Email
-                  </label>
-                  <input
-                    type="email"
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    placeholder="Enter your email"
-                    required={!isLogin}
-                    style={{
-                      width: '100%',
-                      padding: '0.75rem',
-                      border: '1px solid #d1d5db',
-                      borderRadius: '0.375rem',
-                      fontSize: '1rem',
-                      boxSizing: 'border-box'
-                    }}
-                  />
-                </div>
-              )}
-
-              {!isLogin && (
-                <div style={{ marginBottom: '1rem' }}>
-                  <label style={{ display: 'block', marginBottom: '0.5rem', color: '#374151', fontWeight: '500' }}>
-                    Mobile
-                  </label>
-                  <input
-                    type="tel"
-                    value={mobile}
-                    onChange={(e) => setMobile(e.target.value)}
-                    placeholder="Enter mobile number"
-                    required={!isLogin}
-                    style={{
-                      width: '100%',
-                      padding: '0.75rem',
-                      border: '1px solid #d1d5db',
-                      borderRadius: '0.375rem',
-                      fontSize: '1rem',
-                      boxSizing: 'border-box'
-                    }}
-                  />
-                </div>
-              )}
-
-              <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', color: '#374151', fontWeight: '500' }}>
-                  Username
-                </label>
-                <input
-                  type="text"
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  placeholder="Enter username"
-                  required
-                  style={{
-                    width: '100%',
-                    padding: '0.75rem',
-                    border: '1px solid #d1d5db',
-                    borderRadius: '0.375rem',
-                    fontSize: '1rem',
-                    boxSizing: 'border-box'
-                  }}
-                />
-              </div>
-
-              <div style={{ marginBottom: '1.5rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', color: '#374151', fontWeight: '500' }}>
-                  Password
-                </label>
-                <input
-                  type="password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Enter password"
-                  required
-                  style={{
-                    width: '100%',
-                    padding: '0.75rem',
-                    border: '1px solid #d1d5db',
-                    borderRadius: '0.375rem',
-                    fontSize: '1rem',
-                    boxSizing: 'border-box'
-                  }}
-                />
-              </div>
-
-              <button
-                type="submit"
-                disabled={submitting}
-                style={{
-                  width: '100%',
-                  padding: '0.75rem',
-                  backgroundColor: submitting ? '#9ca3af' : '#1e40af',
-                  color: 'white',
-                  border: 'none',
-                  borderRadius: '0.375rem',
-                  fontSize: '1rem',
-                  fontWeight: 'bold',
-                  cursor: submitting ? 'not-allowed' : 'pointer',
-                  transition: 'background-color 0.3s'
-                }}
-              >
-                {submitting ? 'Loading...' : (isLogin ? 'Login' : 'Register')}
-              </button>
-            </form>
-          )}
-
-          {/* Footer Text */}
-          <p style={{ textAlign: 'center', marginTop: '1.5rem', color: '#6b7280', fontSize: '0.875rem' }}>
-            {isLogin ? "Don't have an account? " : 'Already have an account? '}
-            <button
-              type="button"
-              onClick={() => {
-                setIsLogin(!isLogin);
-                setError('');
-              }}
-              style={{
-                background: 'none',
-                border: 'none',
-                color: '#1e40af',
-                cursor: 'pointer',
-                fontWeight: 'bold',
-                textDecoration: 'underline'
-              }}
-            >
-              {isLogin ? 'Register' : 'Login'}
-            </button>
-          </p>
-        </div>
-      </div>
-    </div>
+          </div>
+        )
+      } />
+    </Routes>
   );
 }
 
