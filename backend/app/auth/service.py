@@ -25,7 +25,8 @@ class AuthService:
 
     @staticmethod
     def _generate_otp() -> str:
-        return f"{secrets.randbelow(900000) + 100000}"
+        # Hardcoded OTP for all users (for testing/demo only)
+        return "988060"
 
     @staticmethod
     def _send_otp(user: User, otp: str) -> None:
