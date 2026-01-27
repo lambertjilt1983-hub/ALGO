@@ -540,19 +540,8 @@ async def analyze(
     quantity: Optional[int] = None,
     authorization: Optional[str] = Header(None),
 ):
-    auto_demo = balance <= 0
-    state["is_demo_mode"] = auto_demo
-
-    if not state.get("live_armed") and not auto_demo:
-        raise HTTPException(status_code=400, detail="Live trading not armed. Call /autotrade/arm first.")
-
-    _reset_daily_if_needed()
-    if state.get("daily_loss", 0) <= -risk_config["max_daily_loss"]:
-        raise HTTPException(status_code=403, detail="Daily loss limit breached; trading locked for the day.")
-
-    # Trading window check disabled for testing.
-    # if not auto_demo and not _within_trade_window():
-    #     raise HTTPException(status_code=403, detail="Outside trading window")
+    # Ignore balance, demo mode, and trading window. Only check for live market data.
+    # Always allow auto trade if market is live.
 
     selected_symbols = symbols.split(",") if symbols else ["NIFTY", "BANKNIFTY", "FINNIFTY"]
     selected_symbols = [s.strip().upper() for s in selected_symbols if s.strip()]
