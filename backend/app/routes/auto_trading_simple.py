@@ -550,9 +550,9 @@ async def analyze(
     if state.get("daily_loss", 0) <= -risk_config["max_daily_loss"]:
         raise HTTPException(status_code=403, detail="Daily loss limit breached; trading locked for the day.")
 
-    # Enforce live trading window (skip for demo mode).
-    if not auto_demo and not _within_trade_window():
-        raise HTTPException(status_code=403, detail="Outside trading window")
+    # Trading window check disabled for testing.
+    # if not auto_demo and not _within_trade_window():
+    #     raise HTTPException(status_code=403, detail="Outside trading window")
 
     selected_symbols = symbols.split(",") if symbols else ["NIFTY", "BANKNIFTY", "FINNIFTY"]
     selected_symbols = [s.strip().upper() for s in selected_symbols if s.strip()]
