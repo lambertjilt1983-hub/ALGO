@@ -441,7 +441,13 @@ def _signal_from_index(symbol: str, data: Dict[str, any], instrument_type: str, 
 
 
 async def _live_signals(symbols: List[str], instrument_type: str, qty_override: Optional[int], balance: float) -> tuple[List[Dict], str]:
-    trends = await trend_analyzer.get_market_trends()
+    print(f"[_live_signals] Fetching market trends for symbols: {symbols}")
+    try:
+        trends = await trend_analyzer.get_market_trends()
+        print(f"[_live_signals] Market trends fetched: {trends}")
+    except Exception as e:
+        print(f"[_live_signals] Error fetching market trends: {e}")
+        return [], "error"
     indices = trends.get("indices", {}) if trends else {}
     data_source = "live"
 
@@ -449,12 +455,16 @@ async def _live_signals(symbols: List[str], instrument_type: str, qty_override: 
     for symbol in symbols:
         data = indices.get(symbol)
         if not data:
+            print(f"[_live_signals] No data for symbol: {symbol}")
             continue
         sig = _signal_from_index(symbol, data, instrument_type, qty_override, balance)
-        if sig:
+        if not sig:
+            print(f"[_live_signals] No signal generated for symbol: {symbol} (data: {data})")
+        else:
             sig["data_source"] = data_source
             signals.append(sig)
 
+    print(f"[_live_signals] Signals generated: {signals}")
     return signals, data_source
 
 
@@ -556,8 +566,11 @@ async def analyze(
     if instrument_type not in {"index", "weekly_option", "monthly_option", "future"}:
         raise HTTPException(status_code=400, detail="Invalid instrument_type")
 
+    print(f"[ANALYZE] Requested symbols: {selected_symbols}, instrument_type: {instrument_type}, quantity: {quantity}, balance: {balance}")
     signals, data_source = await _live_signals(selected_symbols, instrument_type, quantity, balance)
+    print(f"[ANALYZE] Signals returned: {signals}, data_source: {data_source}")
     if not signals:
+        print(f"[ANALYZE] No signals generated for symbols: {selected_symbols} (data_source: {data_source})")
         raise HTTPException(status_code=503, detail="No live market data available (quotes unavailable).")
 
     rec = signals[0]
