@@ -623,23 +623,8 @@ async def execute(
     broker_id: int = 1,
     authorization: Optional[str] = Header(None),
 ):
-    auto_demo = balance <= 0
-    state["is_demo_mode"] = auto_demo
-    mode = "DEMO" if auto_demo else "LIVE"
-
-    if not state.get("live_armed") and not auto_demo:
-        raise HTTPException(status_code=400, detail="Live trading not armed. Call /autotrade/arm first.")
-
-    _reset_daily_if_needed()
-    if state.get("daily_loss", 0) <= -risk_config["max_daily_loss"]:
-        raise HTTPException(status_code=403, detail="Daily loss limit breached; trading locked for the day.")
-
-    # Enforce live trading window.
-    if not _within_trade_window() and not auto_demo:
-        raise HTTPException(status_code=403, detail="Outside trading window")
-
-    if len(active_trades) >= MAX_TRADES and not auto_demo:
-        raise HTTPException(status_code=429, detail="Max active trades reached")
+    # Ignore balance, demo mode, trading window, and max trades. Always execute trade if market is live.
+    mode = "LIVE"
 
     pct = STOP_PCT / 100
     derived_stop = stop_loss
