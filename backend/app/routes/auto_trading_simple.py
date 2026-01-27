@@ -312,10 +312,13 @@ def _signal_from_index(symbol: str, data: Dict[str, any], instrument_type: str, 
     change_pct = data.get("change_percent", 0.0)
     direction = "BUY" if change_pct >= 0 else "SELL"
 
+
     if abs(change_pct) < risk_config["min_momentum_pct"]:
+        print(f"[FILTER] {symbol}: abs(change_pct) {abs(change_pct)} < min_momentum_pct {risk_config['min_momentum_pct']}")
         return None
 
     if not _win_rate_ok():
+        print(f"[FILTER] {symbol}: win rate below threshold")
         return None
 
     # Secondary confirmation filters to improve precision
@@ -327,15 +330,20 @@ def _signal_from_index(symbol: str, data: Dict[str, any], instrument_type: str, 
     support = data.get("support")
     resistance = data.get("resistance")
 
+
     if abs_change < CONFIRM_MOMENTUM_PCT:
+        print(f"[FILTER] {symbol}: abs_change {abs_change} < CONFIRM_MOMENTUM_PCT {CONFIRM_MOMENTUM_PCT}")
         return None
 
     # Relaxed confirmations to surface signals even on choppy days
+
     if direction == "BUY":
         if rsi < 45 or rsi > 85:
+            print(f"[FILTER] {symbol}: BUY rsi {rsi} not in [45, 85]")
             return None
     else:
         if rsi > 55 or rsi < 15:
+            print(f"[FILTER] {symbol}: SELL rsi {rsi} not in [15, 55]")
             return None
 
     target_move = price * (TARGET_PCT / 100)
