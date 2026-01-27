@@ -47,6 +47,18 @@ active_trades: List[Dict] = []
 history: List[Dict] = []
 broker_logs: List[Dict] = []
 
+# --- ADMIN/DEBUG: Manual reset endpoint ---
+from fastapi import Response
+
+@router.post("/reset")
+async def reset_state(authorization: Optional[str] = Header(None)):
+    """Reset daily_loss and active_trades (for admin/testing only)."""
+    state["daily_loss"] = 0.0
+    state["daily_date"] = datetime.now().date()
+    active_trades.clear()
+    history.clear()
+    return {"success": True, "message": "State reset: daily_loss=0, active_trades/history cleared."}
+
 
 def _now() -> str:
     return datetime.now().isoformat()
