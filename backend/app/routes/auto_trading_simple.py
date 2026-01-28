@@ -768,7 +768,7 @@ async def analyze(
             if recommendation:
                 auto_trade_result = await execute(
                     symbol=recommendation["symbol"],
-                    action=recommendation["action"],
+                    side=recommendation["action"],
                     quantity=recommendation["quantity"],
                     price=recommendation["entry_price"],
                     strategy=recommendation["strategy"],
