@@ -765,14 +765,15 @@ async def analyze(
             # You may want to customize this call or restrict to certain strategies
             from fastapi import Request
             # Simulate a request object for execute (if needed)
-            auto_trade_result = await execute(
-                symbol=rec["symbol"],
-                action=rec["action"],
-                quantity=rec["quantity"],
-                price=rec["entry_price"],
-                strategy=rec["strategy"],
-                authorization=authorization
-            )
+            if recommendation:
+                auto_trade_result = await execute(
+                    symbol=recommendation["symbol"],
+                    action=recommendation["action"],
+                    quantity=recommendation["quantity"],
+                    price=recommendation["entry_price"],
+                    strategy=recommendation["strategy"],
+                    authorization=authorization
+                )
         except Exception as e:
             print(f"[AUTO TRADE ERROR] Could not auto-execute trade: {e}")
 
