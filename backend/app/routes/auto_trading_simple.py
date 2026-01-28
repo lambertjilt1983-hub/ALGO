@@ -602,6 +602,7 @@ async def analyze(
         return {
             "success": True,
             "signals": [],
+            "high_confidence_signals": [],
             "message": f"No signals generated for symbols: {selected_symbols} (data_source: {data_source})",
             "signals_count": 0,
             "data_source": data_source,
@@ -612,6 +613,7 @@ async def analyze(
     from pathlib import Path
     extended_signals = []
     option_chains = []
+    high_confidence_signals = [s for s in signals if s.get("confidence", 0) > 80]
     for sig in signals:
         # Always add the original index signal
         extended_signals.append(sig)
