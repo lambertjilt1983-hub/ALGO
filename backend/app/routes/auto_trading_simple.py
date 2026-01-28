@@ -697,42 +697,46 @@ async def analyze(
                     extended_signals.append(opt_signal)
     signals = extended_signals
 
-    # Use the first signal as the main recommendation (if available)
-    rec = signals[0] if signals else None
-    recommendation = None
-    if rec:
-        recommendation = {
-            "action": rec["action"],
-            "symbol": rec["symbol"],
-            "confidence": rec["confidence"],
-            "strategy": rec["strategy"],
-            "entry_price": rec["entry_price"],
-            "stop_loss": rec["stop_loss"],
-            "target": rec["target"],
-            "quantity": rec["quantity"],
-            "capital_required": rec["capital_required"],
-            "potential_profit": round((rec["target"] - rec["entry_price"]) * rec["quantity"], 2),
-            "risk": round((rec["entry_price"] - rec["stop_loss"]) * rec["quantity"], 2),
-            "expiry": rec["expiry"],
-            "expiry_date": rec["expiry_date"],
-            "underlying_price": rec["underlying_price"],
-            "target_points": rec["target_points"],
-            "roi_percentage": round(((rec["target"] - rec["entry_price"]) * rec["quantity"] / rec["capital_required"]) * 100, 2),
+    # Build recommendations for all signals (including CE/PE ATM options)
+    recommendations = []
+    for sig in signals:
+        recommendations.append({
+            "action": sig["action"],
+            "symbol": sig["symbol"],
+            "confidence": sig["confidence"],
+            "strategy": sig["strategy"],
+            "entry_price": sig["entry_price"],
+            "stop_loss": sig["stop_loss"],
+            "target": sig["target"],
+            "quantity": sig["quantity"],
+            "capital_required": sig["capital_required"],
+            "potential_profit": round((sig["target"] - sig["entry_price"]) * sig["quantity"], 2),
+            "risk": round((sig["entry_price"] - sig["stop_loss"]) * sig["quantity"], 2),
+            "expiry": sig.get("expiry"),
+            "expiry_date": sig.get("expiry_date"),
+            "underlying_price": sig.get("underlying_price"),
+            "target_points": sig.get("target_points"),
+            "roi_percentage": round(((sig["target"] - sig["entry_price"]) * sig["quantity"] / sig["capital_required"]) * 100, 2) if sig["capital_required"] else 0.0,
             "trail": {
                 "enabled": trail_config["enabled"],
                 "trigger_pct": trail_config["trigger_pct"],
                 "step_pct": trail_config["step_pct"],
             },
-            "option_chain": option_chains[0] if option_chains else None,
-        }
-    # Log/store recommendation to a file (append as JSON lines)
+            "option_type": sig.get("option_type"),
+            "strike": sig.get("strike"),
+            "data_source": sig.get("data_source"),
+            "option_chain": option_chains[0] if option_chains else None if sig == signals[0] else None,
+        })
+    # For backward compatibility, keep the first as 'recommendation'
+    recommendation = recommendations[0] if recommendations else None
+    # Log/store all recommendations to a file (append as JSON lines)
     try:
         log_path = Path("backend/logs/recommendations.jsonl")
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps({
                 "timestamp": _now(),
-                "recommendation": recommendation,
+                "recommendations": recommendations,
                 "signals": signals,
                 "request": {
                     "symbols": selected_symbols,
@@ -767,13 +771,15 @@ async def analyze(
         except Exception as e:
             print(f"[AUTO TRADE ERROR] Could not auto-execute trade: {e}")
 
+
     response = {
         "success": True,
         "signals": signals,
         "recommendation": recommendation,
+        "recommendations": recommendations,
         "signals_count": len(signals),
         "live_balance": balance,
-        "live_price": rec["underlying_price"],
+        "live_price": recommendation["entry_price"] if recommendation else None,
         "is_demo_mode": state["is_demo_mode"],
         "mode": "DEMO" if state["is_demo_mode"] else "LIVE",
         "data_source": data_source,
