@@ -2,6 +2,9 @@ import asyncio
 from fastapi import APIRouter, Body, Header, HTTPException, BackgroundTasks
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
 
+# Demo trades storage for demo mode
+demo_trades: list = []
+
 # --- Automated Trade Closing Task ---
 async def auto_close_trades_task():
     while True:
@@ -694,30 +697,34 @@ async def analyze(
                     extended_signals.append(opt_signal)
     signals = extended_signals
 
-    recommendation = {
-        "action": rec["action"],
-        "symbol": rec["symbol"],
-        "confidence": rec["confidence"],
-        "strategy": rec["strategy"],
-        "entry_price": rec["entry_price"],
-        "stop_loss": rec["stop_loss"],
-        "target": rec["target"],
-        "quantity": rec["quantity"],
-        "capital_required": rec["capital_required"],
-        "potential_profit": round((rec["target"] - rec["entry_price"]) * rec["quantity"], 2),
-        "risk": round((rec["entry_price"] - rec["stop_loss"]) * rec["quantity"], 2),
-        "expiry": rec["expiry"],
-        "expiry_date": rec["expiry_date"],
-        "underlying_price": rec["underlying_price"],
-        "target_points": rec["target_points"],
-        "roi_percentage": round(((rec["target"] - rec["entry_price"]) * rec["quantity"] / rec["capital_required"]) * 100, 2),
-        "trail": {
-            "enabled": trail_config["enabled"],
-            "trigger_pct": trail_config["trigger_pct"],
-            "step_pct": trail_config["step_pct"],
-        },
-        "option_chain": option_chains[0] if option_chains else None,
-    }
+    # Use the first signal as the main recommendation (if available)
+    rec = signals[0] if signals else None
+    recommendation = None
+    if rec:
+        recommendation = {
+            "action": rec["action"],
+            "symbol": rec["symbol"],
+            "confidence": rec["confidence"],
+            "strategy": rec["strategy"],
+            "entry_price": rec["entry_price"],
+            "stop_loss": rec["stop_loss"],
+            "target": rec["target"],
+            "quantity": rec["quantity"],
+            "capital_required": rec["capital_required"],
+            "potential_profit": round((rec["target"] - rec["entry_price"]) * rec["quantity"], 2),
+            "risk": round((rec["entry_price"] - rec["stop_loss"]) * rec["quantity"], 2),
+            "expiry": rec["expiry"],
+            "expiry_date": rec["expiry_date"],
+            "underlying_price": rec["underlying_price"],
+            "target_points": rec["target_points"],
+            "roi_percentage": round(((rec["target"] - rec["entry_price"]) * rec["quantity"] / rec["capital_required"]) * 100, 2),
+            "trail": {
+                "enabled": trail_config["enabled"],
+                "trigger_pct": trail_config["trigger_pct"],
+                "step_pct": trail_config["step_pct"],
+            },
+            "option_chain": option_chains[0] if option_chains else None,
+        }
     # Log/store recommendation to a file (append as JSON lines)
     try:
         log_path = Path("backend/logs/recommendations.jsonl")
@@ -846,7 +853,7 @@ async def execute(
 
     return {
         "success": True,
-        "is_demo_mode": auto_demo,
+        "is_demo_mode": state["is_demo_mode"],
         "message": f"{mode} trade accepted for {symbol} at {price}",
         "timestamp": _now(),
         "broker_response": broker_response,
