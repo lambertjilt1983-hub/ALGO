@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException
 
+from app.strategies.ai_model import ai_model
 from app.strategies.market_intelligence import trend_analyzer
 from app.core.database import SessionLocal
 from app.models.trading import TradeReport
@@ -341,6 +342,15 @@ def _signal_from_index(symbol: str, data: Dict[str, any], instrument_type: str, 
     #     if rsi > 55 or rsi < 15:
     #         print(f"[FILTER] {symbol}: SELL rsi {rsi} not in [15, 55]")
     #         return None
+
+    # --- Simple AI model prediction ---
+    # Features: [change_percent, rsi, uptrend (1/0)]
+    uptrend = 1 if (data.get("trend", "").lower() == "uptrend") else 0
+    ai_decision = ai_model.predict([change_pct, data.get("rsi", 50), uptrend])
+    if ai_decision != 1:
+        print(f"[AI MODEL] {symbol}: AI model did not predict BUY (decision={ai_decision})")
+        return None
+    print(f"[AI MODEL] {symbol}: AI model predicted BUY (decision={ai_decision})")
 
     # --- Simple momentum-only signal logic ---
     if abs(change_pct) < 0.1:  # Only require 0.1% move for signal
