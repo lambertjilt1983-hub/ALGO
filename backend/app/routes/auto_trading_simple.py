@@ -615,6 +615,11 @@ async def status(authorization: Optional[str] = Header(None)):
     return {"status": payload, **payload}
 
 
+@router.get("/analyze")
+async def analyze_get():
+    """GET handler for /autotrade/analyze to provide a friendly message."""
+    return {"detail": "This endpoint only supports POST requests. Please use POST to analyze market data."}
+
 @router.post("/analyze")
 async def analyze(
     symbol: str = "NIFTY",
