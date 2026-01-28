@@ -607,6 +607,7 @@ async def analyze(
     for sig in signals:
         # Always add the original index signal
         extended_signals.append(sig)
+        import traceback
         try:
             expiry = sig.get("contract_expiry_weekly") or sig.get("expiry_date") or sig.get("expiry")
             symbol = sig["symbol"].replace(" INDEX", "")
@@ -627,6 +628,7 @@ async def analyze(
             print(f"[OPTION_CHAIN] Chain keys: {list(chain.keys()) if isinstance(chain, dict) else type(chain)}")
         except Exception as e:
             print(f"[OPTION_CHAIN] Error fetching option chain for {symbol}: {e}")
+            traceback.print_exc()
             chain = {"error": str(e)}
         option_chains.append(chain)
         # Find ATM strike (closest to underlying price)
