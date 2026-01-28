@@ -152,18 +152,36 @@ class ZerodhaKite(BrokerInterface):
                         # Returns CSV data, parse it
                         text = await resp.text()
                         instruments = []
-                        for line in text.split('\n')[1:]:  # Skip header
-                            if line.strip():
-                                parts = line.split(',')
-                                if len(parts) >= 12:
-                                    instruments.append({
-                                        'tradingsymbol': parts[1],
-                                        'name': parts[2],
-                                        'lot_size': int(parts[11]) if parts[11].isdigit() else 1,
-                                        'expiry': parts[9] if len(parts) > 9 else None,
-                                        'strike': float(parts[10]) if len(parts) > 10 and parts[10] else 0,
-                                        'instrument_type': parts[8] if len(parts) > 8 else None
-                                    })
+                        import sys
+                        for idx, line in enumerate(text.split('\n')[1:], 2):  # Skip header, line numbers start at 2
+                            if not line.strip():
+                                continue
+                            parts = line.split(',')
+                            if len(parts) < 12:
+                                print(f"[ZERODHA] Skipping malformed instrument line {idx}: {line}", file=sys.stderr)
+                                continue
+                            try:
+                                tradingsymbol = parts[1]
+                                name = parts[2]
+                                lot_size = int(parts[11]) if parts[11].isdigit() else 1
+                                expiry = parts[9] if len(parts) > 9 else None
+                                strike = float(parts[10]) if len(parts) > 10 and parts[10] else 0
+                                instrument_type = parts[8] if len(parts) > 8 else None
+                                # Defensive: skip if any required field is None
+                                if not tradingsymbol or not name or not instrument_type:
+                                    print(f"[ZERODHA] Skipping instrument with missing fields at line {idx}: {parts}", file=sys.stderr)
+                                    continue
+                                instruments.append({
+                                    'tradingsymbol': tradingsymbol,
+                                    'name': name,
+                                    'lot_size': lot_size,
+                                    'expiry': expiry,
+                                    'strike': strike,
+                                    'instrument_type': instrument_type
+                                })
+                            except Exception as parse_e:
+                                print(f"[ZERODHA] Exception parsing instrument line {idx}: {line} | Error: {parse_e}", file=sys.stderr)
+                                continue
                         logger.log_api_call("zerodha", "get_instruments", "success", {"count": len(instruments)})
                         return instruments
         except Exception as e:

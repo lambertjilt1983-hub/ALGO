@@ -621,6 +621,9 @@ async def analyze(
             api_secret = broker_cred.api_secret
             access_token = broker_cred.access_token
             chain = await get_option_chain(symbol, expiry, api_key, api_secret, access_token)
+            if not chain or not isinstance(chain, dict) or ("CE" not in chain and "PE" not in chain):
+                print(f"[OPTION_CHAIN] Chain is None or missing keys for {symbol} {expiry}: {chain}")
+                chain = {"CE": [], "PE": [], "error": "No option chain data returned"}
             print(f"[OPTION_CHAIN] Chain keys: {list(chain.keys()) if isinstance(chain, dict) else type(chain)}")
         except Exception as e:
             print(f"[OPTION_CHAIN] Error fetching option chain for {symbol}: {e}")
