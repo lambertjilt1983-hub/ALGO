@@ -1,3 +1,24 @@
+import asyncio
+from fastapi import BackgroundTasks
+# --- Automated Trade Closing Task ---
+async def auto_close_trades_task():
+    while True:
+        await asyncio.sleep(10)  # Check every 10 seconds
+        for trade in list(active_trades):
+            if trade.get("status") != "OPEN":
+                continue
+            # Simulate fetching latest price (replace with real price fetch)
+            price = trade.get("current_price") or trade.get("entry_price")
+            _maybe_update_trail(trade, price)
+            if _stop_hit(trade, price):
+                _close_trade(trade, price)
+        # Remove closed trades from active_trades
+        active_trades[:] = [t for t in active_trades if t.get("status") == "OPEN"]
+
+# Start background task on startup
+@router.on_event("startup")
+async def start_auto_close_trades():
+    asyncio.create_task(auto_close_trades_task())
 """Auto Trading Engine wired to live market data (no mocks)."""
 
 import math
@@ -727,7 +748,7 @@ async def analyze(
 async def execute(
     symbol: str,
     price: float = 0.0,
-    balance: float = 50000.0,
+    balance: float = 100.0,
     quantity: Optional[int] = None,
     side: str = "BUY",
     stop_loss: Optional[float] = None,
@@ -800,6 +821,9 @@ async def execute(
 @router.get("/trades/active")
 async def get_active_trades(authorization: Optional[str] = Header(None)):
     trades = active_trades
+    # Add more status details
+    for t in trades:
+        t["unrealized_pnl"] = (t.get("current_price", t.get("entry_price")) - t.get("entry_price", 0)) * t.get("quantity", 0)
     return {"trades": trades, "is_demo_mode": False, "count": len(trades)}
 
 
