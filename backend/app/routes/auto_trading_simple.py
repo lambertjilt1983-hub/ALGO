@@ -639,13 +639,22 @@ async def analyze(
             ce_list = chain["CE"]
             pe_list = chain["PE"]
             underlying = sig.get("underlying_price") or sig.get("entry_price")
+            print(f"[DEBUG] {symbol} CE list length: {len(ce_list)}")
+            print(f"[DEBUG] {symbol} PE list length: {len(pe_list)}")
+            if ce_list:
+                print(f"[DEBUG] {symbol} CE strikes: {[o['strike'] for o in ce_list]}")
+            if pe_list:
+                print(f"[DEBUG] {symbol} PE strikes: {[o['strike'] for o in pe_list]}")
             if ce_list:
                 atm_strike = min(ce_list, key=lambda x: abs(x["strike"] - underlying))["strike"]
                 print(f"[OPTION_CHAIN] {symbol} ATM strike: {atm_strike} (underlying: {underlying})")
+            else:
+                print(f"[OPTION_CHAIN] {symbol}: CE list is empty, cannot find ATM strike.")
             # Generate CE and PE signals for ATM
             for opt_type, opt_list in [("CE", ce_list), ("PE", pe_list)]:
                 if not opt_list or atm_strike is None:
                     print(f"[OPTION_CHAIN] {symbol} {opt_type}: No options or ATM strike not found.")
+                    print(f"[DEBUG] {symbol} {opt_type} opt_list: {opt_list}")
                     continue
                 atm_opt = next((o for o in opt_list if o["strike"] == atm_strike), None)
                 if atm_opt:
@@ -671,6 +680,7 @@ async def analyze(
                     extended_signals.append(opt_signal)
                 else:
                     print(f"[OPTION_CHAIN] {symbol} {opt_type}: No ATM option found for strike {atm_strike}.")
+                    print(f"[DEBUG] {symbol} {opt_type} strikes: {[o['strike'] for o in opt_list]}")
     signals = extended_signals
 
     # Build recommendations for all signals (including CE/PE ATM options)
