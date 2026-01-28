@@ -625,7 +625,7 @@ async def analyze(
             from app.core.database import SessionLocal
             db = SessionLocal()
             # You may want to get user_id from the session/token; here we use token=None for demo
-            broker_cred = await get_broker_credentials(broker_name="zerodha", db=db, token=None)
+            broker_cred = await get_broker_credentials(broker_name="zerodha", db=db, token=authorization)
             api_key = broker_cred.api_key
             api_secret = broker_cred.api_secret
             access_token = broker_cred.access_token
