@@ -9,6 +9,9 @@ class ZerodhaKite(BrokerInterface):
     """Zerodha Kite Connect API integration"""
     
     BASE_URL = "https://api.kite.trade"
+
+    def __init__(self, api_key: str, api_secret: str, access_token: Optional[str] = None):
+        super().__init__(api_key, api_secret, access_token)
     
     async def authenticate(self) -> bool:
         """Authenticate with Zerodha"""
