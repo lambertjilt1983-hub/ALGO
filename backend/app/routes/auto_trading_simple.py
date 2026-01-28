@@ -4,7 +4,23 @@ import math
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+
 from fastapi import APIRouter, Body, Header, HTTPException
+from app.routes.option_chain_utils import get_option_chain
+@router.get("/option_chain")
+async def option_chain(
+    symbol: str = "BANKNIFTY",
+    expiry: str = Body(..., embed=True),
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Return the full CE/PE option chain for a given index and expiry.
+    """
+    try:
+        data = await get_option_chain(symbol, expiry)
+        return {"success": True, "symbol": symbol, "expiry": expiry, "option_chain": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch option chain: {str(e)}")
 
 from app.strategies.ai_model import ai_model
 from app.strategies.market_intelligence import trend_analyzer
