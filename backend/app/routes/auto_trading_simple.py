@@ -14,7 +14,7 @@ from sqlalchemy import func
 
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
 
-MAX_TRADES = 6  # allow more intraday trades when signals align
+MAX_TRADES = 10000  # allow more intraday trades when signals align
 TARGET_PCT = 0.6  # target move in percent (slightly above stop for RR >= 1)
 STOP_PCT = 0.4    # stop move in percent (tighter risk)
 CONFIRM_MOMENTUM_PCT = 0.1  # very loose confirmation so signals appear on small moves
