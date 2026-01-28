@@ -1,5 +1,7 @@
 import asyncio
 from fastapi import BackgroundTasks
+router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
+
 # --- Automated Trade Closing Task ---
 async def auto_close_trades_task():
     while True:
@@ -636,26 +638,61 @@ async def analyze(
         raise HTTPException(status_code=400, detail="Invalid instrument_type")
 
     print(f"[ANALYZE] Requested symbols: {selected_symbols}, instrument_type: {instrument_type}, quantity: {quantity}, balance: {balance}")
+
     signals, data_source = await _live_signals(selected_symbols, instrument_type, quantity, balance)
     print(f"[ANALYZE] Signals returned: {signals}, data_source: {data_source}")
     if not signals:
         print(f"[ANALYZE] No signals generated for symbols: {selected_symbols} (data_source: {data_source})")
         raise HTTPException(status_code=503, detail="No live market data available (quotes unavailable).")
 
-
     import json
     from pathlib import Path
-    rec = signals[0]
-    # Fetch CE/PE option chain for each signal
+    extended_signals = []
     option_chains = []
     for sig in signals:
+        # Always add the original index signal
+        extended_signals.append(sig)
         try:
-            # Use expiry from signal if available, else fallback
             expiry = sig.get("contract_expiry_weekly") or sig.get("expiry_date") or sig.get("expiry")
-            chain = await get_option_chain(sig["symbol"].replace(" INDEX", ""), expiry)
+            symbol = sig["symbol"].replace(" INDEX", "")
+            chain = await get_option_chain(symbol, expiry)
         except Exception as e:
             chain = {"error": str(e)}
         option_chains.append(chain)
+        # Find ATM strike (closest to underlying price)
+        atm_strike = None
+        if chain.get("CE"):
+            ce_list = chain["CE"]
+            pe_list = chain["PE"]
+            underlying = sig.get("underlying_price") or sig.get("entry_price")
+            if ce_list:
+                atm_strike = min(ce_list, key=lambda x: abs(x["strike"] - underlying))["strike"]
+            # Generate CE and PE signals for ATM
+            for opt_type, opt_list in [("CE", ce_list), ("PE", pe_list)]:
+                if not opt_list or atm_strike is None:
+                    continue
+                atm_opt = next((o for o in opt_list if o["strike"] == atm_strike), None)
+                if atm_opt:
+                    opt_signal = {
+                        "symbol": atm_opt["tradingsymbol"],
+                        "action": sig["action"],
+                        "confidence": sig["confidence"],
+                        "strategy": sig["strategy"] + f"_{opt_type}",
+                        "entry_price": atm_opt.get("last_price", 0),
+                        "stop_loss": sig["stop_loss"],
+                        "target": sig["target"],
+                        "quantity": atm_opt.get("lot_size", 1),
+                        "capital_required": atm_opt.get("lot_size", 1) * atm_opt.get("last_price", 0),
+                        "expiry": atm_opt.get("expiry"),
+                        "expiry_date": atm_opt.get("expiry"),
+                        "underlying_price": underlying,
+                        "target_points": sig.get("target_points"),
+                        "option_type": opt_type,
+                        "strike": atm_strike,
+                        "data_source": "option_chain"
+                    }
+                    extended_signals.append(opt_signal)
+    signals = extended_signals
 
     recommendation = {
         "action": rec["action"],
