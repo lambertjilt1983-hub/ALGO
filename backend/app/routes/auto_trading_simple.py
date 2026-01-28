@@ -572,8 +572,16 @@ async def analyze(
     # Ignore balance, demo mode, and trading window. Only check for live market data.
     # Always allow auto trade if market is live.
 
-    selected_symbols = symbols.split(",") if symbols else ["NIFTY", "BANKNIFTY", "FINNIFTY"]
-    selected_symbols = [s.strip().upper() for s in selected_symbols if s.strip()]
+    if symbols is not None:
+        if not isinstance(symbols, str):
+            print(f"[ANALYZE] symbols is not a string: {symbols} (type={type(symbols)})")
+            selected_symbols = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
+        else:
+            print(f"[ANALYZE] symbols before split: {symbols} (type={type(symbols)})")
+            selected_symbols = symbols.split(",")
+    else:
+        selected_symbols = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
+    selected_symbols = [s.strip().upper() for s in selected_symbols if isinstance(s, str) and s.strip()]
     if not selected_symbols:
         raise HTTPException(status_code=400, detail="No symbols provided")
 

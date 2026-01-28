@@ -153,9 +153,23 @@ class ZerodhaKite(BrokerInterface):
                         text = await resp.text()
                         instruments = []
                         import sys
+                        if text is None:
+                            print(f"[ZERODHA] instruments text is None!", file=sys.stderr)
+                            return []
+                        if not isinstance(text, str):
+                            print(f"[ZERODHA] instruments text is not a string: {text} (type={type(text)})", file=sys.stderr)
+                            return []
+                        print(f"[ZERODHA] instruments text type: {type(text)} length: {len(text)}", file=sys.stderr)
                         for idx, line in enumerate(text.split('\n')[1:], 2):  # Skip header, line numbers start at 2
+                            if line is None:
+                                print(f"[ZERODHA] Skipping None line at {idx}", file=sys.stderr)
+                                continue
+                            if not isinstance(line, str):
+                                print(f"[ZERODHA] Skipping non-string line at {idx}: {line} (type={type(line)})", file=sys.stderr)
+                                continue
                             if not line.strip():
                                 continue
+                            print(f"[ZERODHA] line before split: {line[:80]} (type={type(line)})", file=sys.stderr)
                             parts = line.split(',')
                             if len(parts) < 12:
                                 print(f"[ZERODHA] Skipping malformed instrument line {idx}: {line}", file=sys.stderr)
