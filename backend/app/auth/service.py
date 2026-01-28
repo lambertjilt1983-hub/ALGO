@@ -336,13 +336,17 @@ class BrokerAuthService:
             (BrokerCredential.user_id == user_id) &
             (BrokerCredential.broker_name == broker_name)
         ).first()
-        
         if not credential:
+            # Log all credentials for this user for debugging
+            all_creds = db.query(BrokerCredential).filter(BrokerCredential.user_id == user_id).all()
+            print(f"[CREDENTIALS DEBUG] No credentials found for broker '{broker_name}' and user {user_id}.")
+            print(f"[CREDENTIALS DEBUG] Existing credentials for user {user_id}:")
+            for cred in all_creds:
+                print(f"  Broker: {cred.broker_name}, API Key: {bool(cred.api_key)}, Access Token: {bool(cred.access_token)}, Active: {cred.is_active}")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"No credentials found for {broker_name}"
             )
-        
         return credential
     
     @staticmethod
