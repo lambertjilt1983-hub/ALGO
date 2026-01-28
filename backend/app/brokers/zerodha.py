@@ -195,6 +195,16 @@ class ZerodhaKite(BrokerInterface):
                             print(f"[ZERODHA] instruments text is not a string: {text} (type={type(text)})", file=sys.stderr)
                             return []
                         print(f"[ZERODHA] instruments text type: {type(text)} length: {len(text)}", file=sys.stderr)
+                        def safe_float(val):
+                            try:
+                                return float(val)
+                            except Exception:
+                                return 0
+                        def safe_int(val):
+                            try:
+                                return int(val)
+                            except Exception:
+                                return 1
                         for idx, line in enumerate(text.split('\n')[1:], 2):  # Skip header, line numbers start at 2
                             if line is None:
                                 print(f"[ZERODHA] Skipping None line at {idx}", file=sys.stderr)
@@ -212,9 +222,9 @@ class ZerodhaKite(BrokerInterface):
                             try:
                                 tradingsymbol = parts[1]
                                 name = parts[2]
-                                lot_size = int(parts[11]) if parts[11].isdigit() else 1
+                                lot_size = safe_int(parts[11]) if len(parts) > 11 else 1
                                 expiry = parts[9] if len(parts) > 9 else None
-                                strike = float(parts[10]) if len(parts) > 10 and parts[10] else 0
+                                strike = safe_float(parts[10]) if len(parts) > 10 else 0
                                 instrument_type = parts[8] if len(parts) > 8 else None
                                 # Defensive: skip if any required field is None
                                 if not tradingsymbol or not name or not instrument_type:
