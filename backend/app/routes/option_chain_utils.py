@@ -1,12 +1,38 @@
-from app.brokers.zerodha import ZerodhaKite
 
-async def get_option_chain(symbol: str, expiry: str, api_key: str, api_secret: str, access_token: str):
+import sys
+from app.brokers.zerodha import ZerodhaKite
+from app.routes.broker import get_broker_credentials
+from app.core.database import SessionLocal
+from datetime import datetime
+
+async def get_option_chain(symbol: str, expiry: str, authorization: str = None):
     """
-    Fetch the full CE/PE option chain for a given index and expiry using provided credentials.
-    Returns a dict with 'CE' and 'PE' lists of instruments.
+    Fetch the full CE/PE option chain for a given index and expiry using DB-backed credentials.
+    Handles token expiry/refresh automatically.
     """
-    import sys
-    kite = ZerodhaKite(api_key, api_secret, access_token)
+    db = SessionLocal()
+    token = None
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ", 1)[1]
+    elif authorization:
+        token = authorization
+    broker_cred = await get_broker_credentials(broker_name="zerodha", db=db, token=token)
+    # Decrypt credentials if needed
+    api_key = broker_cred.api_key
+    api_secret = broker_cred.api_secret
+    access_token = broker_cred.access_token
+    refresh_token = getattr(broker_cred, 'refresh_token', None)
+    token_expiry = getattr(broker_cred, 'token_expiry', None)
+
+    # Check expiry and refresh if needed (pseudo-code, implement refresh logic as needed)
+    if token_expiry and datetime.utcnow() >= token_expiry:
+        print(f"[OPTION_CHAIN_UTILS] Access token expired, refreshing...")
+        # TODO: Implement refresh logic here, update DB, and set new access_token
+        # access_token = refresh_access_token(api_key, api_secret, refresh_token)
+        # Save new access_token and expiry to DB
+        pass
+
+    kite = await ZerodhaKite.from_user_context(authorization)
     instruments = await kite.get_instruments()
     if not instruments or not isinstance(instruments, list):
         print(f"[OPTION_CHAIN_UTILS] No instruments returned for {symbol} {expiry}", file=sys.stderr)

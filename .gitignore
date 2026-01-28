@@ -17,8 +17,6 @@ logs/
 .vscode/
 *.swp
 *.swo
-db.sqlite3
-algotrade.db
 .next/
 .turbo/
-.gitignore
+*.gitignore/

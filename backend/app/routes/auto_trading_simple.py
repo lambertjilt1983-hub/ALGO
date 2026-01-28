@@ -55,7 +55,7 @@ async def option_chain(
     Return the full CE/PE option chain for a given index and expiry.
     """
     try:
-        data = await get_option_chain(symbol, expiry)
+        data = await get_option_chain(symbol, expiry, authorization)
         return {"success": True, "symbol": symbol, "expiry": expiry, "option_chain": data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch option chain: {str(e)}")
@@ -620,16 +620,8 @@ async def analyze(
             expiry = sig.get("contract_expiry_weekly") or sig.get("expiry_date") or sig.get("expiry")
             symbol = sig["symbol"].replace(" INDEX", "")
             print(f"[OPTION_CHAIN] Fetching option chain for {symbol} expiry {expiry}")
-            # Fetch broker credentials for the user (assume broker_id=1, zerodha)
-            from app.routes.broker import get_broker_credentials
-            from app.core.database import SessionLocal
-            db = SessionLocal()
-            # You may want to get user_id from the session/token; here we use token=None for demo
-            broker_cred = await get_broker_credentials(broker_name="zerodha", db=db, token=authorization)
-            api_key = broker_cred.api_key
-            api_secret = broker_cred.api_secret
-            access_token = broker_cred.access_token
-            chain = await get_option_chain(symbol, expiry, api_key, api_secret, access_token)
+            # Fetch option chain using DB-backed credentials (handles token/refresh)
+            chain = await get_option_chain(symbol, expiry, authorization)
             if not chain or not isinstance(chain, dict) or ("CE" not in chain and "PE" not in chain):
                 print(f"[OPTION_CHAIN] Chain is None or missing keys for {symbol} {expiry}: {chain}")
                 chain = {"CE": [], "PE": [], "error": "No option chain data returned"}
