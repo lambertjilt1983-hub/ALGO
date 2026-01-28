@@ -68,7 +68,7 @@ async def analyze(symbol: str = Query("NIFTY"), balance: float = Query(100000)):
             decision = "HOLD"
 
         # Demo values for entry, target, stop_loss
-        entry = float(data.get("current")) if data.get("current") is not None else 0.0
+        entry = float(data.get("current")) if data.get("current") not in (None, 0, "0.00", "0") else target / 1.01 if target else 0.0
         target = round(entry * 1.01, 2) if entry else 0.0
         stop_loss = round(entry * 0.99, 2) if entry else 0.0
         strategy = "LIVE_TREND_FOLLOW"
@@ -119,9 +119,9 @@ async def trades_active():
             "id": t["id"],
             "symbol": t["symbol"],
             "action": t["action"],
-            "entry": t["entry"],
-            "target": t["target"],
-            "stop_loss": t["stop_loss"],
+            "entry": float(t["entry"]),
+            "target": float(t["target"]),
+            "stop_loss": float(t["stop_loss"]),
             "strategy": t["strategy"],
             "time": t["time"]
         }
