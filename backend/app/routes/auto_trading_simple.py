@@ -611,7 +611,16 @@ async def analyze(
             expiry = sig.get("contract_expiry_weekly") or sig.get("expiry_date") or sig.get("expiry")
             symbol = sig["symbol"].replace(" INDEX", "")
             print(f"[OPTION_CHAIN] Fetching option chain for {symbol} expiry {expiry}")
-            chain = await get_option_chain(symbol, expiry)
+            # Fetch broker credentials for the user (assume broker_id=1, zerodha)
+            from app.routes.broker import get_broker_credentials
+            from app.core.database import SessionLocal
+            db = SessionLocal()
+            # You may want to get user_id from the session/token; here we use user_id=1 for demo
+            broker_cred = get_broker_credentials.__wrapped__(broker_name="zerodha", db=db, token=None)
+            api_key = broker_cred.api_key
+            api_secret = broker_cred.api_secret
+            access_token = broker_cred.access_token
+            chain = await get_option_chain(symbol, expiry, api_key, api_secret, access_token)
             print(f"[OPTION_CHAIN] Chain keys: {list(chain.keys()) if isinstance(chain, dict) else type(chain)}")
         except Exception as e:
             print(f"[OPTION_CHAIN] Error fetching option chain for {symbol}: {e}")
