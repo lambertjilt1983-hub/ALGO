@@ -621,7 +621,21 @@ async def analyze(
         print(f"[ANALYZE] No signals generated for symbols: {selected_symbols} (data_source: {data_source})")
         raise HTTPException(status_code=503, detail="No live market data available (quotes unavailable).")
 
+
+    import json
+    from pathlib import Path
     rec = signals[0]
+    # Fetch CE/PE option chain for each signal
+    option_chains = []
+    for sig in signals:
+        try:
+            # Use expiry from signal if available, else fallback
+            expiry = sig.get("contract_expiry_weekly") or sig.get("expiry_date") or sig.get("expiry")
+            chain = await get_option_chain(sig["symbol"].replace(" INDEX", ""), expiry)
+        except Exception as e:
+            chain = {"error": str(e)}
+        option_chains.append(chain)
+
     recommendation = {
         "action": rec["action"],
         "symbol": rec["symbol"],
@@ -644,11 +658,49 @@ async def analyze(
             "trigger_pct": trail_config["trigger_pct"],
             "step_pct": trail_config["step_pct"],
         },
+        "option_chain": option_chains[0] if option_chains else None,
     }
+    # Log/store recommendation to a file (append as JSON lines)
+    try:
+        log_path = Path("backend/logs/recommendations.jsonl")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "timestamp": _now(),
+                "recommendation": recommendation,
+                "signals": signals,
+                "request": {
+                    "symbols": selected_symbols,
+                    "instrument_type": instrument_type,
+                    "quantity": quantity,
+                    "balance": balance
+                }
+            }) + "\n")
+    except Exception as e:
+        print(f"[LOGGING ERROR] Could not log recommendation: {e}")
 
     capital_in_use = _capital_in_use()
     remaining_cap = balance * risk_config.get("max_portfolio_pct", 1.0) - capital_in_use
     can_trade = True if state.get("is_demo_mode") else (len(active_trades) < MAX_TRADES and remaining_cap > 0)
+
+
+    # Optionally auto-trigger trade execution for each recommendation
+    auto_trade_result = None
+    if can_trade:
+        try:
+            # You may want to customize this call or restrict to certain strategies
+            from fastapi import Request
+            # Simulate a request object for execute (if needed)
+            auto_trade_result = await execute(
+                symbol=rec["symbol"],
+                action=rec["action"],
+                quantity=rec["quantity"],
+                price=rec["entry_price"],
+                strategy=rec["strategy"],
+                authorization=authorization
+            )
+        except Exception as e:
+            print(f"[AUTO TRADE ERROR] Could not auto-execute trade: {e}")
 
     response = {
         "success": True,
@@ -665,6 +717,7 @@ async def analyze(
         "capital_in_use": round(capital_in_use, 2),
         "portfolio_cap": round(balance * risk_config.get("max_portfolio_pct", 1.0), 2),
         "timestamp": _now(),
+        "auto_trade_result": auto_trade_result,
     }
 
     return response
