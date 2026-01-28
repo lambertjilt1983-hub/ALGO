@@ -101,6 +101,8 @@ class AuthService:
     @staticmethod
     def verify_token(token: str) -> dict:
         """Verify and decode JWT token"""
+        if token is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="No authentication token provided")
         try:
             payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
             user_id = payload.get("sub")

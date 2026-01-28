@@ -76,9 +76,10 @@ async def get_broker_credentials(
     token: str = Depends(AuthService.verify_bearer_token)
 ):
     """Get specific broker credentials"""
+    if token is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="No authentication token provided")
     payload = AuthService.verify_token(token)
     user_id = int(payload.get("sub"))
-    
     credential = BrokerAuthService.get_credentials(
         user_id=user_id,
         broker_name=broker_name,
