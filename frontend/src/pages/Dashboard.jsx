@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import axios from 'axios';
 import { Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import { ordersAPI, strategiesAPI, marketAPI } from '../api/client';
 import toast from 'react-hot-toast';
@@ -13,6 +14,8 @@ export default function Dashboard() {
     activeStrategies: 0,
   });
   const [isLoading, setIsLoading] = useState(true);
+  const [signals, setSignals] = useState([]);
+  const [activeTrade, setActiveTrade] = useState(null);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -21,10 +24,8 @@ export default function Dashboard() {
           ordersAPI.listOrders(),
           strategiesAPI.listStrategies(),
         ]);
-
         setOrders(ordersRes.data);
         setStrategies(strategiesRes.data);
-
         setStats({
           totalOrders: ordersRes.data.length,
           totalStrategies: strategiesRes.data.length,
@@ -48,13 +49,65 @@ export default function Dashboard() {
       }
     };
 
+    const fetchSignals = async () => {
+      try {
+        const response = await axios.post('/autotrade/analyze?symbol=NIFTY,BANKNIFTY,FINNIFTY&balance=100000');
+        if (response.data && response.data.signals) {
+          setSignals(response.data.signals);
+        }
+      } catch (error) {
+        console.error('Error fetching signals:', error);
+      }
+    };
+
+    const fetchActiveTrade = async () => {
+      try {
+        const response = await axios.get('/autotrade/trades/active');
+        if (response.data && response.data.length > 0) {
+          setActiveTrade(response.data[0]);
+        } else {
+          setActiveTrade(null);
+        }
+      } catch (error) {
+        setActiveTrade(null);
+      }
+    };
+
     fetchData();
     fetchIndices();
-    
-    // Refresh indices every 5 seconds
-    const interval = setInterval(fetchIndices, 5000);
+    fetchSignals();
+    fetchActiveTrade();
+
+    // Refresh signals and active trade every 10 seconds
+    const interval = setInterval(() => {
+      fetchSignals();
+      fetchActiveTrade();
+    }, 10000);
     return () => clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    // Auto-trade for signals with confidence > 80 if no active trade
+    if (!activeTrade && signals.length > 0) {
+      const highConf = signals.filter(s => s.confidence > 80);
+      if (highConf.length > 0) {
+        const sig = highConf[0];
+        axios.post('/autotrade/execute', {
+          symbol: sig.symbol,
+          price: sig.entry_price,
+          quantity: sig.quantity,
+          side: sig.action,
+          stop_loss: sig.stop_loss,
+          target: sig.target,
+          expiry: sig.expiry_date || sig.expiry,
+        }).then(() => {
+          toast.success(`Auto-trade executed for ${sig.symbol}`);
+        }).catch(() => {
+          toast.error('Auto-trade failed');
+        });
+      }
+    }
+  }, [signals, activeTrade]);
 
   const chartData = [
     { name: 'Jan', wins: 12, losses: 8 },
@@ -67,6 +120,7 @@ export default function Dashboard() {
     return <div className="text-center py-10">Loading...</div>;
   }
 
+
   return (
     <div className="max-w-7xl mx-auto px-4 py-8">
       <h1 className="text-4xl font-bold text-gray-900 mb-4">Dashboard</h1>
@@ -75,38 +129,51 @@ export default function Dashboard() {
       {indices && (
         <div className="bg-gradient-to-r from-blue-600 to-blue-800 text-white rounded-lg shadow-lg p-4 mb-8">
           <div className="flex flex-wrap justify-center gap-6">
-            <div className="flex flex-col items-center">
-              <span className="text-xs font-medium opacity-90">NIFTY 50</span>
-              <div className="flex items-center space-x-2">
-                <span className="text-2xl font-bold">{indices.NIFTY?.value?.toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span>
-                <span className={`text-sm font-semibold px-2 py-1 rounded ${indices.NIFTY?.change >= 0 ? 'bg-green-500' : 'bg-red-500'}`}>
-                  {indices.NIFTY?.change >= 0 ? '▲' : '▼'} {Math.abs(indices.NIFTY?.change_percent || 0).toFixed(2)}%
-                </span>
-              </div>
-            </div>
-            <div className="w-px h-12 bg-white/30"></div>
-            <div className="flex flex-col items-center">
-              <span className="text-xs font-medium opacity-90">BANK NIFTY</span>
-              <div className="flex items-center space-x-2">
-                <span className="text-2xl font-bold">{indices.BANKNIFTY?.value?.toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span>
-                <span className={`text-sm font-semibold px-2 py-1 rounded ${indices.BANKNIFTY?.change >= 0 ? 'bg-green-500' : 'bg-red-500'}`}>
-                  {indices.BANKNIFTY?.change >= 0 ? '▲' : '▼'} {Math.abs(indices.BANKNIFTY?.change_percent || 0).toFixed(2)}%
-                </span>
-              </div>
-            </div>
-            <div className="w-px h-12 bg-white/30"></div>
-            <div className="flex flex-col items-center">
-              <span className="text-xs font-medium opacity-90">SENSEX</span>
-              <div className="flex items-center space-x-2">
-                <span className="text-2xl font-bold">{indices.SENSEX?.value?.toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span>
-                <span className={`text-sm font-semibold px-2 py-1 rounded ${indices.SENSEX?.change >= 0 ? 'bg-green-500' : 'bg-red-500'}`}>
-                  {indices.SENSEX?.change >= 0 ? '▲' : '▼'} {Math.abs(indices.SENSEX?.change_percent || 0).toFixed(2)}%
-                </span>
-              </div>
-            </div>
+            {/* ...existing code... */}
           </div>
         </div>
       )}
+
+      {/* All Strategy Signals (including CE/PE) */}
+      <div className="bg-white rounded-lg shadow p-6 mb-8">
+        <h2 className="text-xl font-bold text-gray-900 mb-4">All Strategy Signals (including CE/PE)</h2>
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead className="bg-gray-50">
+              <tr>
+                <th className="px-2 py-2">Strategy</th>
+                <th className="px-2 py-2">Symbol</th>
+                <th className="px-2 py-2">Action</th>
+                <th className="px-2 py-2">Confidence</th>
+                <th className="px-2 py-2">Quantity</th>
+                <th className="px-2 py-2">Entry</th>
+                <th className="px-2 py-2">Target</th>
+                <th className="px-2 py-2">Stop Loss</th>
+                <th className="px-2 py-2">Expiry</th>
+                <th className="px-2 py-2">Type</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-200">
+              {signals.map((sig, idx) => (
+                <tr key={idx}>
+                  <td className="px-2 py-2">{sig.strategy}</td>
+                  <td className="px-2 py-2">{sig.symbol}</td>
+                  <td className="px-2 py-2">{sig.action}</td>
+                  <td className="px-2 py-2">{sig.confidence}%</td>
+                  <td className="px-2 py-2">{sig.quantity}</td>
+                  <td className="px-2 py-2">₹{sig.entry_price}</td>
+                  <td className="px-2 py-2">₹{sig.target}</td>
+                  <td className="px-2 py-2">₹{sig.stop_loss}</td>
+                  <td className="px-2 py-2">{sig.expiry_date || sig.expiry}</td>
+                  <td className="px-2 py-2">{sig.option_type || '-'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* ...existing code... */}
 
       {/* Stats Grid */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
