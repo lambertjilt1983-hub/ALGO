@@ -24,6 +24,7 @@ class ZerodhaKite(BrokerInterface):
             token = authorization.split(" ", 1)[1]
         elif authorization:
             token = authorization
+        # Always pass only the JWT token string
         broker_cred = await get_broker_credentials(broker_name="zerodha", db=db, token=token)
         api_key = broker_cred.api_key
         api_secret = broker_cred.api_secret

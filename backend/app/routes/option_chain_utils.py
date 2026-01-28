@@ -16,6 +16,7 @@ async def get_option_chain(symbol: str, expiry: str, authorization: str = None):
         token = authorization.split(" ", 1)[1]
     elif authorization:
         token = authorization
+    # Always pass only the JWT token string
     broker_cred = await get_broker_credentials(broker_name="zerodha", db=db, token=token)
     # Decrypt credentials if needed
     api_key = broker_cred.api_key
