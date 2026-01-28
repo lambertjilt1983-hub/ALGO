@@ -4,6 +4,7 @@
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional, List
 from app.strategies.market_intelligence import trend_analyzer
+from app.strategies.ai_model import ai_model
 import datetime
 
 router = APIRouter(prefix="/autotrade", tags=["Simple Auto Trading"])
@@ -58,20 +59,23 @@ async def analyze(symbol: str = Query("NIFTY"), balance: float = Query(100000)):
         if not data:
             raise HTTPException(status_code=404, detail=f"No market data for symbol: {symbol}")
         change_pct = data.get("change_percent")
+        rsi = data.get("rsi", 50)
+        trend = data.get("trend", "Flat")
+        uptrend = 1 if trend == "Uptrend" else 0
         if change_pct is None:
             raise HTTPException(status_code=500, detail="Market data missing change_percent")
-        if change_pct > 0.2:
-            decision = "BUY"
-        elif change_pct < -0.2:
-            decision = "SELL"
-        else:
-            decision = "HOLD"
 
-        # Demo values for entry, target, stop_loss
-        entry = float(data.get("current")) if data.get("current") not in (None, 0, "0.00", "0") else target / 1.01 if target else 0.0
+        # Use AI model for decision
+        ai_signal = ai_model.predict([change_pct, rsi, uptrend])
+        if ai_signal == 1:
+            decision = "BUY"
+        else:
+            decision = "SELL"
+
+        entry = float(data.get("current")) if data.get("current") not in (None, 0, "0.00", "0") else 0.0
         target = round(entry * 1.01, 2) if entry else 0.0
         stop_loss = round(entry * 0.99, 2) if entry else 0.0
-        strategy = "LIVE_TREND_FOLLOW"
+        strategy = "AI_AUTO_TRADE"
 
         trade = {
             "id": trade_id_counter,
