@@ -867,7 +867,13 @@ async def get_active_trades(authorization: Optional[str] = Header(None)):
     trades = active_trades
     # Add more status details
     for t in trades:
-        t["unrealized_pnl"] = (t.get("current_price", t.get("entry_price")) - t.get("entry_price", 0)) * t.get("quantity", 0)
+        entry_price = t.get("entry_price", 0)
+        if entry_price is None:
+            entry_price = 0.0
+        current_price = t.get("current_price")
+        if current_price is None:
+            current_price = entry_price
+        t["unrealized_pnl"] = (current_price - entry_price) * t.get("quantity", 0)
     return {"trades": trades, "is_demo_mode": False, "count": len(trades)}
 
 
