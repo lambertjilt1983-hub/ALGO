@@ -1,5 +1,5 @@
 import asyncio
-from fastapi import BackgroundTasks
+from fastapi import APIRouter, Body, Header, HTTPException, BackgroundTasks
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
 
 # --- Automated Trade Closing Task ---
