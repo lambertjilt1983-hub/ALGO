@@ -359,40 +359,9 @@ def _signal_from_index(symbol: str, data: Dict[str, any], instrument_type: str, 
     change_pct = data.get("change_percent", 0.0)
     direction = "BUY" if change_pct >= 0 else "SELL"
 
-    # --- Original filters (commented out for simple momentum test) ---
-    # if abs(change_pct) < risk_config["min_momentum_pct"]:
-    #     print(f"[FILTER] {symbol}: abs(change_pct) {abs(change_pct)} < min_momentum_pct {risk_config['min_momentum_pct']}")
-    #     return None
-
-    # if not _win_rate_ok():
-    #     print(f"[FILTER] {symbol}: win rate below threshold")
-    #     return None
-
-    # abs_change = abs(change_pct)
-    # strength = (data.get("strength") or "").title()
-    # macd = (data.get("macd") or "").title()
-    # volume_bucket = (data.get("volume") or "Average").title()
-    # rsi = data.get("rsi", 50)
-    # support = data.get("support")
-    # resistance = data.get("resistance")
-
-    # if abs_change < CONFIRM_MOMENTUM_PCT:
-    #     print(f"[FILTER] {symbol}: abs_change {abs_change} < CONFIRM_MOMENTUM_PCT {CONFIRM_MOMENTUM_PCT}")
-    #     return None
-
-    # if direction == "BUY":
-    #     if rsi < 45 or rsi > 85:
-    #         print(f"[FILTER] {symbol}: BUY rsi {rsi} not in [45, 85]")
-    #         return None
-    # else:
-    #     if rsi > 55 or rsi < 15:
-    #         print(f"[FILTER] {symbol}: SELL rsi {rsi} not in [15, 55]")
-    #         return None
-
-    # --- Simple AI model prediction ---
-    # Features: [change_percent, rsi, uptrend (1/0)]
     uptrend = 1 if (data.get("trend", "").lower() == "uptrend") else 0
     ai_decision = ai_model.predict([change_pct, data.get("rsi", 50), uptrend])
+
     if ai_decision != 1:
         print(f"[AI MODEL] {symbol}: AI model did not predict BUY (decision={ai_decision})")
         return None
@@ -435,39 +404,12 @@ def _signal_from_index(symbol: str, data: Dict[str, any], instrument_type: str, 
     lot_size = instruments["lot_size"]
     min_cost = unit_price * lot_size
 
-    # For demo mode, allow synthetic sizing even when capital is tiny so UI still shows signals.
-    if capital_cap <= 0 or remaining_cap <= 0:
-        if not state.get("is_demo_mode"):
-            return None
-        capital_cap = max(capital_cap, unit_price)
-        remaining_cap = max(remaining_cap, unit_price)
-
-    if min_cost > capital_cap:
-        if state.get("is_demo_mode"):
-            lot_size = 1
-            min_cost = unit_price
-        else:
-            return None
-
+    # FORCE SIGNAL GENERATION: Bypass all capital, lot size, and risk filters
+    # Always use at least 1 lot, and set capital_required to unit_price * lot_size
     if qty_override and qty_override > 0:
-        if qty_override * unit_price > capital_cap and not state.get("is_demo_mode"):
-            return None
         qty = qty_override
     else:
-        # Fit within capital cap by whole units; respect lot size minimum
-        max_units = int(capital_cap // unit_price)
-        if max_units < lot_size:
-            if state.get("is_demo_mode"):
-                qty = lot_size  # minimal synthetic lot for demo
-            else:
-                return None  # cannot size within risk
-        else:
-            qty = max_units - (max_units % lot_size)
-            if qty <= 0:
-                if state.get("is_demo_mode"):
-                    qty = lot_size
-                else:
-                    return None
+        qty = lot_size
 
     tradable_symbol = {
         "index": symbol,
@@ -477,8 +419,6 @@ def _signal_from_index(symbol: str, data: Dict[str, any], instrument_type: str, 
     }.get(instrument_type, instruments["weekly_option"])
 
     capital_required = round(unit_price * qty, 2)
-    if capital_required > remaining_cap:
-        return None
 
     confidence_bonus = 0
     if strength == "Strong":
@@ -670,8 +610,11 @@ async def analyze(
         try:
             expiry = sig.get("contract_expiry_weekly") or sig.get("expiry_date") or sig.get("expiry")
             symbol = sig["symbol"].replace(" INDEX", "")
+            print(f"[OPTION_CHAIN] Fetching option chain for {symbol} expiry {expiry}")
             chain = await get_option_chain(symbol, expiry)
+            print(f"[OPTION_CHAIN] Chain keys: {list(chain.keys()) if isinstance(chain, dict) else type(chain)}")
         except Exception as e:
+            print(f"[OPTION_CHAIN] Error fetching option chain for {symbol}: {e}")
             chain = {"error": str(e)}
         option_chains.append(chain)
         # Find ATM strike (closest to underlying price)
@@ -682,12 +625,15 @@ async def analyze(
             underlying = sig.get("underlying_price") or sig.get("entry_price")
             if ce_list:
                 atm_strike = min(ce_list, key=lambda x: abs(x["strike"] - underlying))["strike"]
+                print(f"[OPTION_CHAIN] {symbol} ATM strike: {atm_strike} (underlying: {underlying})")
             # Generate CE and PE signals for ATM
             for opt_type, opt_list in [("CE", ce_list), ("PE", pe_list)]:
                 if not opt_list or atm_strike is None:
+                    print(f"[OPTION_CHAIN] {symbol} {opt_type}: No options or ATM strike not found.")
                     continue
                 atm_opt = next((o for o in opt_list if o["strike"] == atm_strike), None)
                 if atm_opt:
+                    print(f"[OPTION_CHAIN] {symbol} {opt_type} ATM option found: {atm_opt['tradingsymbol']}")
                     opt_signal = {
                         "symbol": atm_opt["tradingsymbol"],
                         "action": sig["action"],
@@ -707,6 +653,8 @@ async def analyze(
                         "data_source": "option_chain"
                     }
                     extended_signals.append(opt_signal)
+                else:
+                    print(f"[OPTION_CHAIN] {symbol} {opt_type}: No ATM option found for strike {atm_strike}.")
     signals = extended_signals
 
     # Build recommendations for all signals (including CE/PE ATM options)
@@ -762,16 +710,18 @@ async def analyze(
 
     capital_in_use = _capital_in_use()
     remaining_cap = balance * risk_config.get("max_portfolio_pct", 1.0) - capital_in_use
-    can_trade = True if state.get("is_demo_mode") else (len(active_trades) < MAX_TRADES and remaining_cap > 0)
+    # Determine if there is enough money for the recommended trade
+    required_capital = recommendation["capital_required"] if recommendation else 0
+    can_trade = (
+        len(active_trades) < MAX_TRADES and remaining_cap >= required_capital and required_capital > 0
+    )
 
 
     # Optionally auto-trigger trade execution for each recommendation
     auto_trade_result = None
     if can_trade:
         try:
-            # You may want to customize this call or restrict to certain strategies
             from fastapi import Request
-            # Simulate a request object for execute (if needed)
             if recommendation:
                 auto_trade_result = await execute(
                     symbol=recommendation["symbol"],
@@ -780,8 +730,29 @@ async def analyze(
                     price=recommendation["entry_price"],
                     authorization=authorization
                 )
+                if auto_trade_result is not None:
+                    auto_trade_result["executed"] = True
         except Exception as e:
             print(f"[AUTO TRADE ERROR] Could not auto-execute trade: {e}")
+            if auto_trade_result is None:
+                auto_trade_result = {}
+            auto_trade_result["executed"] = False
+            auto_trade_result["error"] = str(e)
+    else:
+        # Not enough money: show the trade as simulated, do not execute
+        if recommendation:
+            auto_trade_result = {
+                "executed": False,
+                "capital_required": recommendation["capital_required"],
+                "potential_profit": round((recommendation["target"] - recommendation["entry_price"]) * recommendation["quantity"], 2),
+                "potential_loss": round((recommendation["entry_price"] - recommendation["stop_loss"]) * recommendation["quantity"], 2),
+                "message": "Not enough capital to execute trade. Simulated only."
+            }
+            # Mark as demo mode if trade fails
+            if auto_trade_result is None:
+                auto_trade_result = {}
+            auto_trade_result["demo_mode"] = True
+            auto_trade_result["error"] = str(e)
 
 
     response = {
