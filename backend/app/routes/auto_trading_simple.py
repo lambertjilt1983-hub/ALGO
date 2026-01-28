@@ -771,7 +771,6 @@ async def analyze(
                     side=recommendation["action"],
                     quantity=recommendation["quantity"],
                     price=recommendation["entry_price"],
-                    strategy=recommendation["strategy"],
                     authorization=authorization
                 )
         except Exception as e:
