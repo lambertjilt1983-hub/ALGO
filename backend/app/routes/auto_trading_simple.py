@@ -755,13 +755,9 @@ async def analyze(
                 "capital_required": recommendation["capital_required"],
                 "potential_profit": round((recommendation["target"] - recommendation["entry_price"]) * recommendation["quantity"], 2),
                 "potential_loss": round((recommendation["entry_price"] - recommendation["stop_loss"]) * recommendation["quantity"], 2),
-                "message": "Not enough capital to execute trade. Simulated only."
+                "message": "Not enough capital to execute trade. Simulated only.",
+                "demo_mode": True
             }
-            # Mark as demo mode if trade fails
-            if auto_trade_result is None:
-                auto_trade_result = {}
-            auto_trade_result["demo_mode"] = True
-            auto_trade_result["error"] = str(e)
 
 
     response = {
