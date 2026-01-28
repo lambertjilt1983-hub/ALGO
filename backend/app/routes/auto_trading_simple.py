@@ -651,7 +651,14 @@ async def analyze(
     print(f"[ANALYZE] Signals returned: {signals}, data_source: {data_source}")
     if not signals:
         print(f"[ANALYZE] No signals generated for symbols: {selected_symbols} (data_source: {data_source})")
-        raise HTTPException(status_code=503, detail="No live market data available (quotes unavailable).")
+        return {
+            "success": True,
+            "signals": [],
+            "message": f"No signals generated for symbols: {selected_symbols} (data_source: {data_source})",
+            "signals_count": 0,
+            "data_source": data_source,
+            "timestamp": _now(),
+        }
 
     import json
     from pathlib import Path
