@@ -615,8 +615,8 @@ async def analyze(
             from app.routes.broker import get_broker_credentials
             from app.core.database import SessionLocal
             db = SessionLocal()
-            # You may want to get user_id from the session/token; here we use user_id=1 for demo
-            broker_cred = get_broker_credentials.__wrapped__(broker_name="zerodha", db=db, token=None)
+            # You may want to get user_id from the session/token; here we use token=None for demo
+            broker_cred = await get_broker_credentials(broker_name="zerodha", db=db, token=None)
             api_key = broker_cred.api_key
             api_secret = broker_cred.api_secret
             access_token = broker_cred.access_token
@@ -932,93 +932,30 @@ async def trade_report(
     start_dt = datetime.fromisoformat(start_date).date() if start_date else (today - timedelta(days=30))
     end_dt = datetime.fromisoformat(end_date).date() if end_date else today
 
-    db = SessionLocal()
-    try:
-        q = (
-            db.query(TradeReport)
-            .filter(TradeReport.trading_date >= start_dt)
-            .filter(TradeReport.trading_date <= end_dt)
-            .order_by(TradeReport.exit_time.desc())
-            .limit(limit)
-        )
-        rows = q.all()
+    # Example: Use in-memory history (replace with DB query as needed)
+    filtered = [t for t in history if start_dt <= (t.get("trading_date") or today) <= end_dt]
+    trades = filtered[-limit:]
+    total_pnl = sum((t.get("pnl") or 0) for t in trades)
+    wins = sum(1 for t in trades if (t.get("pnl") or 0) > 0)
+    losses = sum(1 for t in trades if (t.get("pnl") or 0) < 0)
+    total = len(trades)
+    by_date: Dict[str, Dict[str, Any]] = {}
+    for t in trades:
+        key = t.get("trading_date") or today.isoformat()
+        rec = by_date.setdefault(key, {"trades": 0, "pnl": 0.0})
+        rec["trades"] += 1
+        rec["pnl"] += t.get("pnl") or 0
 
-        def serialize(row: TradeReport) -> Dict[str, Any]:
-            return {
-                "id": row.id,
-                "symbol": row.symbol,
-                "action": row.side,
-                "quantity": row.quantity,
-                "entry_price": row.entry_price,
-                "exit_price": row.exit_price,
-                "pnl": row.pnl,
-                "pnl_percentage": row.pnl_percentage,
-                "strategy": row.strategy,
-                "status": row.status,
-                "entry_time": row.entry_time.isoformat() if row.entry_time else None,
-                "exit_time": row.exit_time.isoformat() if row.exit_time else None,
-                "trading_date": row.trading_date.isoformat() if row.trading_date else None,
-                "meta": row.meta,
-            }
+    summary = {
+        "total_trades": total,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round((wins / total) * 100, 2) if total else 0.0,
+        "total_pnl": round(total_pnl, 2),
+        "by_date": [{"date": d, "trades": v["trades"], "pnl": round(v["pnl"], 2)} for d, v in sorted(by_date.items())],
+    }
 
-        trades = [serialize(r) for r in rows]
-
-        # Include in-memory history (e.g., trades closed in current session) to ensure today's trades appear immediately
-        seen_keys = {(t.get("symbol"), t.get("entry_time"), t.get("exit_time")) for t in trades}
-        for t in history:
-            ts = t.get("exit_time") or t.get("entry_time") or t.get("timestamp")
-            if not ts:
-                continue
-            ts_dt = datetime.fromisoformat(ts) if isinstance(ts, str) else ts
-            if ts_dt.date() < start_dt or ts_dt.date() > end_dt:
-                continue
-            key = (t.get("symbol") or t.get("index"), t.get("entry_time"), t.get("exit_time"))
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            trades.append(
-                {
-                    "id": t.get("id"),
-                    "symbol": t.get("symbol") or t.get("index"),
-                    "action": t.get("action") or t.get("side"),
-                    "quantity": t.get("quantity"),
-                    "entry_price": t.get("entry_price") or t.get("price"),
-                    "exit_price": t.get("exit_price"),
-                    "pnl": t.get("pnl") or t.get("profit_loss"),
-                    "pnl_percentage": t.get("pnl_percentage") or t.get("pnl_percent"),
-                    "strategy": t.get("strategy") or t.get("strategy_name"),
-                    "status": t.get("status"),
-                    "entry_time": t.get("entry_time"),
-                    "exit_time": t.get("exit_time"),
-                    "trading_date": ts_dt.date().isoformat(),
-                    "meta": {"support": t.get("support"), "resistance": t.get("resistance")},
-                }
-            )
-
-        # Recompute summary on merged trades
-        total_pnl = sum((t.get("pnl") or 0) for t in trades)
-        wins = sum(1 for t in trades if (t.get("pnl") or 0) > 0)
-        losses = sum(1 for t in trades if (t.get("pnl") or 0) < 0)
-        total = len(trades)
-        by_date: Dict[str, Dict[str, Any]] = {}
-        for t in trades:
-            key = t.get("trading_date") or today.isoformat()
-            rec = by_date.setdefault(key, {"trades": 0, "pnl": 0.0})
-            rec["trades"] += 1
-            rec["pnl"] += t.get("pnl") or 0
-
-        summary = {
-            "total_trades": total,
-            "wins": wins,
-            "losses": losses,
-            "win_rate": round((wins / total) * 100, 2) if total else 0.0,
-            "total_pnl": round(total_pnl, 2),
-            "by_date": [{"date": d, "trades": v["trades"], "pnl": round(v["pnl"], 2)} for d, v in sorted(by_date.items())],
-        }
-
-        return {"trades": trades, "summary": summary, "start_date": start_dt.isoformat(), "end_date": end_dt.isoformat()}
-    finally:
-        db.close()
+    return {"trades": trades, "summary": summary, "start_date": start_dt.isoformat(), "end_date": end_dt.isoformat()}
 
 
 @router.get("/market/indices")
