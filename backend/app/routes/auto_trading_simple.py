@@ -5,8 +5,20 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 
+
 from fastapi import APIRouter, Body, Header, HTTPException
 from app.routes.option_chain_utils import get_option_chain
+
+from app.strategies.ai_model import ai_model
+from app.strategies.market_intelligence import trend_analyzer
+from app.core.database import SessionLocal
+from app.models.trading import TradeReport
+from sqlalchemy import func
+
+
+router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
+
+# Option Chain Endpoint (must be after router is defined)
 @router.get("/option_chain")
 async def option_chain(
     symbol: str = "BANKNIFTY",
@@ -21,14 +33,6 @@ async def option_chain(
         return {"success": True, "symbol": symbol, "expiry": expiry, "option_chain": data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch option chain: {str(e)}")
-
-from app.strategies.ai_model import ai_model
-from app.strategies.market_intelligence import trend_analyzer
-from app.core.database import SessionLocal
-from app.models.trading import TradeReport
-from sqlalchemy import func
-
-router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
 
 MAX_TRADES = 10000  # allow more intraday trades when signals align
 TARGET_PCT = 0.6  # target move in percent (slightly above stop for RR >= 1)
