@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import config from './config/api';
-import AutoTradingDashboard from './components/AutoTradingDashboard';
 import AdminPanel from './components/AdminPanel';
 
 function Dashboard() {
@@ -860,6 +859,18 @@ function Dashboard() {
                 </div>
               ))}
             </div>
+            {/* Auto Trading Engine Link */}
+            <div style={{ marginTop: '32px', display: 'flex', alignItems: 'center' }}>
+              <span style={{ marginRight: '8px' }}>🤖</span>
+              <a
+                href="/autotrading"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: '#2563eb', textDecoration: 'underline', fontWeight: 600 }}
+              >
+                Auto Trading Engine
+              </a>
+            </div>
           </div>
         )}
 
@@ -1418,9 +1429,6 @@ function Dashboard() {
             </div>
           </div>
         )}
-
-        {/* Auto Trading Dashboard */}
-        <AutoTradingDashboard />
 
         {/* Market Intelligence Section */}
         <div style={{

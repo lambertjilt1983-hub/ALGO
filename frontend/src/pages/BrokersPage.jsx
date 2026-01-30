@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import toast from 'react-hot-toast';
 import axios from 'axios';
 import config from '../config/api';
+import AutoTradingDashboard from '../components/AutoTradingDashboard';
 
 const API_URL = config.API_BASE_URL;
 
@@ -250,6 +251,19 @@ export default function BrokersPage() {
             </div>
           ))
         )}
+      </div>
+
+      {/* Auto Trading Engine Link */}
+      <div className="mt-8 flex items-center">
+        <span className="mr-2">🤖</span>
+        <a
+          href="/autotrading"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-blue-600 hover:underline font-semibold"
+        >
+          Auto Trading Engine
+        </a>
       </div>
 
       {/* Instructions */}

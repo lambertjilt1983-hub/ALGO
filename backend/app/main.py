@@ -1,6 +1,12 @@
+import os
+from dotenv import load_dotenv
+dotenv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env.qa')
+load_dotenv(dotenv_path)
+from dotenv import load_dotenv
+load_dotenv('.env.qa')
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routes import auth, broker, orders, strategies, market_intelligence, auto_trading_simple, test_market, token_refresh, admin
+from app.routes import auth, broker, orders, strategies, market_intelligence, auto_trading_simple, test_market, token_refresh, admin, option_signals, zerodha_postback
 from app.core.database import Base, engine, SessionLocal
 from app.core.config import get_settings
 from app.core.background_tasks import start_background_tasks, stop_background_tasks
@@ -37,19 +43,31 @@ app.include_router(orders.router)
 app.include_router(strategies.router)
 app.include_router(test_market.router)  # Test endpoint with real data
 app.include_router(market_intelligence.router)
+app.include_router(option_signals.router)
 app.include_router(auto_trading_simple.router)  # Using simplified version
 app.include_router(token_refresh.router)  # Token refresh and validation endpoints
 app.include_router(admin.router)  # Admin-only utilities
+app.include_router(zerodha_postback.router)  # Zerodha postback endpoint
 
 # Startup and shutdown events
+import logging
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize background tasks on startup"""
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("startup")
+    logger.info("[STARTUP] FastAPI startup event triggered.")
     db = SessionLocal()
     try:
+        logger.info("[STARTUP] Ensuring default admin user...")
         AuthService.ensure_default_admin(db)
+        logger.info("[STARTUP] Default admin ensured.")
+    except Exception as e:
+        logger.error(f"[STARTUP] Exception during startup: {e}", exc_info=True)
     finally:
         db.close()
+        logger.info("[STARTUP] Database session closed.")
 
 @app.on_event("shutdown")
 async def shutdown_event():

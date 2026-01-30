@@ -85,6 +85,7 @@ export const config = {
       report: '/autotrade/report',
       liveIndices: '/autotrade/market/indices',
       monitor: '/autotrade/monitor',
+      resetDailyLoss: '/autotrade/reset_daily_loss',
     },
 
     // Admin

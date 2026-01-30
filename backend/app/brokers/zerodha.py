@@ -3,7 +3,15 @@ import asyncio
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from app.brokers.base import BrokerInterface, OrderData, OrderResponse, Position, Account, BrokerFactory
+
+import os
 from app.core.logger import logger
+def get_zerodha_access_token():
+    """
+    Fetch Zerodha access token from environment variable or return a placeholder.
+    Update this logic as per your actual token management.
+    """
+    return os.getenv("ZERODHA_ACCESS_TOKEN", "your_access_token")
 
 class ZerodhaKite(BrokerInterface):
     """Zerodha Kite Connect API integration"""

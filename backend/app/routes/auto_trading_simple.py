@@ -1,15 +1,27 @@
+from typing import Optional
+from pydantic import BaseModel
+from fastapi import APIRouter, Body, Header, HTTPException
+from app.engine.zerodha_order_util import place_zerodha_order
+
+router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
+
+@router.post("/reset_daily_loss")
+async def reset_daily_loss(authorization: Optional[str] = Header(None)):
+    state["daily_loss"] = 0.0
+    return {"message": "Daily loss reset to 0.0", "daily_loss": state["daily_loss"]}
 """Auto Trading Engine wired to live market data (no mocks)."""
 
 import math
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Body, Header, HTTPException
-
 from app.strategies.market_intelligence import trend_analyzer
 from app.core.database import SessionLocal
 from app.models.trading import TradeReport
 from sqlalchemy import func
+from app.engine.auto_trading_engine import AutoTradingEngine
+from app.engine.zerodha_broker import ZerodhaBroker
+from app.engine.simple_momentum_strategy import SimpleMomentumStrategy
 
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
 
@@ -47,6 +59,11 @@ active_trades: List[Dict] = []
 history: List[Dict] = []
 broker_logs: List[Dict] = []
 
+# Initialize engine, broker, and strategy
+engine = AutoTradingEngine()
+zerodha_broker = ZerodhaBroker()
+engine.register_broker("zerodha", zerodha_broker)
+strategy = SimpleMomentumStrategy()
 
 def _now() -> str:
     return datetime.now().isoformat()
@@ -608,21 +625,25 @@ async def analyze(
     return response
 
 
+class TradeRequest(BaseModel):
+    symbol: str
+    price: float = 0.0
+    balance: float = 50000.0
+    quantity: Optional[int] = None
+    side: str = "BUY"
+    stop_loss: Optional[float] = None
+    target: Optional[float] = None
+    support: Optional[float] = None
+    resistance: Optional[float] = None
+    broker_id: int = 1
+    expiry: Optional[str] = None
+
 @router.post("/execute")
 async def execute(
-    symbol: str,
-    price: float = 0.0,
-    balance: float = 50000.0,
-    quantity: Optional[int] = None,
-    side: str = "BUY",
-    stop_loss: Optional[float] = None,
-    target: Optional[float] = None,
-    support: Optional[float] = None,
-    resistance: Optional[float] = None,
-    broker_id: int = 1,
+    trade: TradeRequest,
     authorization: Optional[str] = Header(None),
 ):
-    auto_demo = balance <= 0
+    auto_demo = trade.balance <= 0
     state["is_demo_mode"] = auto_demo
     mode = "DEMO" if auto_demo else "LIVE"
 
@@ -637,59 +658,72 @@ async def execute(
     if not _within_trade_window() and not auto_demo:
         raise HTTPException(status_code=403, detail="Outside trading window")
 
+
     if len(active_trades) >= MAX_TRADES and not auto_demo:
         raise HTTPException(status_code=429, detail="Max active trades reached")
 
     pct = STOP_PCT / 100
-    derived_stop = stop_loss
+    derived_stop = trade.stop_loss
     if derived_stop is None:
-        if side.upper() == "BUY":
-            derived_stop = round(price * (1 - pct), 2)
+        if trade.side.upper() == "BUY":
+            derived_stop = round(trade.price * (1 - pct), 2)
         else:
-            derived_stop = round(price * (1 + pct), 2)
+            derived_stop = round(trade.price * (1 + pct), 2)
 
-    derived_target = target
+    derived_target = trade.target
     if derived_target is None:
-        if side.upper() == "BUY":
-            derived_target = round(price * (1 + pct * (TARGET_PCT / STOP_PCT)), 2)
+        if trade.side.upper() == "BUY":
+            derived_target = round(trade.price * (1 + pct * (TARGET_PCT / STOP_PCT)), 2)
         else:
-            derived_target = round(price * (1 - pct * (TARGET_PCT / STOP_PCT)), 2)
+            derived_target = round(trade.price * (1 - pct * (TARGET_PCT / STOP_PCT)), 2)
 
     broker_response: Dict[str, any] = {}
 
-    trail_fields = _init_trailing_fields(price, side)
+    trail_fields = _init_trailing_fields(trade.price, trade.side)
 
-    trade = {
+    trade_obj = {
         "id": len(active_trades) + 1,
-        "symbol": symbol,
-        "price": price,
-        "side": side.upper(),
-        "quantity": quantity or 1,
+        "symbol": trade.symbol,
+        "price": trade.price,
+        "side": trade.side.upper(),
+        "quantity": trade.quantity or 1,
         "status": "OPEN",
-        "broker_id": broker_id,
+        "broker_id": trade.broker_id,
         "timestamp": _now(),
         "stop_loss": derived_stop,
         "target": derived_target,
-        "support": support,
-        "resistance": resistance,
+        "support": trade.support,
+        "resistance": trade.resistance,
         **trail_fields,
     }
 
-    active_trades.append(trade)
-    # TODO: integrate broker SDK here
-    broker_response = {
-        "broker_id": broker_id,
-        "symbol": symbol,
-        "price": price,
-        "status": "accepted (stub)",
-        "timestamp": _now(),
-    }
-    broker_logs.append({"trade": trade, "response": broker_response})
+    # --- REAL ZERODHA ORDER PLACEMENT ---
+    # Map your signal to the correct Zerodha symbol (tradingsymbol)
+    zerodha_symbol = trade.symbol  # You may need to convert to e.g. 'BANKNIFTY24FEB48000CE'
+    real_order = place_zerodha_order(
+        symbol=zerodha_symbol,
+        quantity=trade.quantity or 1,
+        side=trade.side,
+        order_type="MARKET",
+        product="MIS",
+        exchange="NFO"  # Use 'NFO' for options
+    )
+    if real_order["success"]:
+        broker_response = real_order
+        active_trades.append(trade_obj)
+    else:
+        return {
+            "success": False,
+            "message": real_order["error"],
+            "timestamp": _now(),
+        }
+
+    broker_logs.append({"trade": trade_obj, "response": broker_response})
 
     return {
         "success": True,
         "is_demo_mode": auto_demo,
-        "message": f"{mode} trade accepted for {symbol} at {price}",
+        "message": f"{mode} trade accepted for {trade.symbol} at {trade.price}",
         "timestamp": _now(),
         "broker_response": broker_response,
         "stop_loss": derived_stop,
@@ -874,3 +908,16 @@ async def monitor(authorization: Optional[str] = Header(None)):
         "timestamp": _now(),
     }
     return {"monitor": payload, **payload}
+
+@router.post("/run-strategy")
+async def run_strategy(market_data: dict, credentials: dict, authorization: Optional[str] = Header(None)):
+    # Connect broker
+    if not engine.connect_broker("zerodha", credentials):
+        return {"success": False, "error": "Failed to connect to Zerodha broker"}
+    # Strategy pipeline
+    opportunities = strategy.scan(market_data)
+    signals = strategy.identify(opportunities)
+    analyzed = strategy.analyze(signals)
+    results = strategy.execute(analyzed, engine)
+    engine.disconnect_broker("zerodha")
+    return {"success": True, "results": results}

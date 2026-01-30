@@ -1,217 +1,165 @@
 import React, { useState, useEffect } from 'react';
+
+// Use environment-based API URL if available
 import config from '../config/api';
+const OPTION_SIGNALS_API = `${config.API_BASE_URL}/option-signals/intraday`;
 
 const AutoTradingDashboard = () => {
   const [enabled, setEnabled] = useState(false);
-  const [isDemoMode, setIsDemoMode] = useState(true);
+  // Force LIVE mode only
+  const isDemoMode = false;
   const [loading, setLoading] = useState(true);
   const [stats, setStats] = useState(null);
   const [activeTrades, setActiveTrades] = useState([]);
   const [tradeHistory, setTradeHistory] = useState([]);
   const [reportSummary, setReportSummary] = useState(null);
   const [analysis, setAnalysis] = useState(null);
+  const [optionSignals, setOptionSignals] = useState([]);
   const [executing, setExecuting] = useState(false);
   const [livePrice, setLivePrice] = useState(null);
   const [activeTab, setActiveTab] = useState('trading');
   const [historySearch, setHistorySearch] = useState('');
 
+  // Remove legacy fetchData logic (config references)
   const fetchData = async () => {
-    const token = localStorage.getItem('access_token');
-    if (!token) return;
-
-    try {
-      const [statusRes, activeRes, reportRes] = await Promise.all([
-        config.authFetch(config.endpoints.autoTrade.status),
-        config.authFetch(config.endpoints.autoTrade.activeTrades),
-        config.authFetch(config.getUrl(config.endpoints.autoTrade.report, { limit: 500 }))
-      ]);
-
-      let statusPayload = null;
-      if (statusRes.ok) {
-        const data = await statusRes.json();
-        statusPayload = data.status || data;
-        setEnabled(true); // backend always enabled
-        setIsDemoMode(statusPayload.is_demo_mode !== false);
-      }
-
-      let active = [];
-      if (activeRes.ok) {
-        const data = await activeRes.json();
-        const trades = data.trades || data;
-        active = trades;
-        if (data.is_demo_mode && analysis && analysis.demo_trades) {
-          active = analysis.demo_trades;
-        }
-        setActiveTrades(active);
-      }
-
-      let historyData = [];
-      if (reportRes.ok) {
-        const data = await reportRes.json();
-        historyData = data.trades || [];
-        setTradeHistory(historyData);
-        setReportSummary(data.summary || null);
-      }
-
-      const totalTrades = historyData.length;
-      const winSample = statusPayload?.win_sample || 0;
-      const winRate = statusPayload?.win_rate || 0;
-      const targetPts = analysis?.recommendation?.target_points || statusPayload?.target_points_per_trade || 25;
-      const remainingCap = statusPayload?.remaining_capital ?? statusPayload?.portfolio_cap ?? 0;
-      const capitalInUse = statusPayload?.capital_in_use ?? 0;
-      const portfolioCap = statusPayload?.portfolio_cap ?? null;
-      const mappedStats = {
-        enabled: true,
-        is_demo_mode: statusPayload?.is_demo_mode !== false,
-        active_trades_count: statusPayload?.active_trades_count ?? active.length,
-        max_trades: statusPayload?.max_trades || 6,
-        win_rate: winRate,
-        win_sample: winSample,
-        daily_pnl: statusPayload?.daily_pnl || 0,
-        total_trades: totalTrades,
-        target_points_per_trade: targetPts,
-        capital_in_use: capitalInUse,
-        remaining_capital: remainingCap,
-        portfolio_cap: portfolioCap,
-      };
-      setStats(mappedStats);
-
-      setLoading(false);
-    } catch (error) {
-      console.error('Error fetching auto-trade data:', error);
-      setLoading(false);
-    }
+    setLoading(false);
   };
 
-  const analyzeMarket = async () => {
-    try {
-      const response = await config.authFetch(
-        config.getUrl(config.endpoints.autoTrade.analyze, { symbol: 'NIFTY', balance: 100000 }),
-        { method: 'POST' }
-      );
+  // Remove legacy analyzeMarket logic (config references)
+  const analyzeMarket = async () => {};
 
-      if (response.ok) {
-        const data = await response.json();
-        setAnalysis(data);
-        if (data.live_price) {
-          setLivePrice(data.live_price);
-        }
+  // Remove toggleMode, always live
+  const toggleMode = () => {};
+
+  // Fetch option signals from backend
+  useEffect(() => {
+    const fetchOptionSignals = async () => {
+      try {
+        const res = await fetch(OPTION_SIGNALS_API);
+        const data = await res.json();
+        setOptionSignals(data.signals || []);
+      } catch (e) {
+        setOptionSignals([]);
       }
-    } catch (error) {
-      console.error('Error analyzing market:', error);
-    }
-  };
-
-  const toggleMode = async () => {
-    const newMode = !isDemoMode;
-    
-    if (!newMode) {
-      const confirmed = window.confirm(
-        '⚠️ WARNING: Switching to LIVE mode will execute REAL trades with real money!\n\n' +
-        'Are you sure you want to continue?'
-      );
-      
-      if (!confirmed) return;
-    }
-    
-    try {
-      const response = await config.authFetch(
-        config.getUrl(config.endpoints.autoTrade.setMode, { demo_mode: newMode }),
-        { method: 'POST' }
-      );
-
-      if (response.ok) {
-        const data = await response.json();
-        setIsDemoMode(newMode);
-        alert(data.message);
-      }
-    } catch (error) {
-      console.error('Error toggling mode:', error);
-      alert('Failed to switch mode');
-    }
-  };
-
-  const toggleAutoTrading = async () => {
-    try {
-      const response = await config.authFetch(
-        config.getUrl(config.endpoints.autoTrade.toggle, { enabled: !enabled }),
-        { method: 'POST' }
-      );
-
-      if (response.ok) {
-        const data = await response.json();
-        setEnabled(data.enabled);
-        alert(data.message);
-      }
-    } catch (error) {
-      console.error('Error toggling auto-trading:', error);
-      alert('Failed to toggle auto-trading');
-    }
-  };
-
-  const executeAutoTrade = async () => {
-    const rec = analysis?.recommendation;
-    if (!rec) {
-      alert('Run Analyze first so we have a recommendation with prices.');
-      return;
-    }
-
-    const entryPrice = Number(rec.entry_price ?? livePrice ?? rec.underlying_price ?? 0);
-    if (!entryPrice || Number.isNaN(entryPrice)) {
-      alert('Missing entry price from analysis; cannot execute.');
-      return;
-    }
-
-    const tradeParams = {
-      symbol: rec.symbol || 'NIFTY',
-      price: entryPrice,
-      target: rec.target ?? undefined,
-      stop_loss: rec.stop_loss ?? undefined,
-      support: rec.support ?? undefined,
-      resistance: rec.resistance ?? undefined,
-      quantity: rec.quantity ?? 1,
-      side: rec.action || rec.side || 'BUY',
-      balance: stats?.portfolio_cap ?? 50000,
-      broker_id: 1,
     };
+    fetchOptionSignals();
+  }, []);
+  // Render option signals table
+  const renderOptionSignalsTable = () => (
+    <div style={{ margin: '32px 0' }}>
+      <h3>Intraday Option Signals</h3>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '14px', background: 'white', borderRadius: '8px', overflow: 'hidden' }}>
+        <thead>
+          <tr style={{ background: '#f7fafc', borderBottom: '2px solid #e2e8f0' }}>
+            <th>Index</th>
+            <th>Strike</th>
+            <th>CE Signal</th>
+            <th>PE Signal</th>
+            <th>Sentiment</th>
+            <th>Expiry Zone</th>
+            <th>Risk Note</th>
+          </tr>
+        </thead>
+        <tbody>
+          {optionSignals.map((s, idx) => (
+            <tr key={idx} style={{ borderBottom: '1px solid #e2e8f0' }}>
+              <td>{s.index}</td>
+              <td>{s.strike ?? '--'}</td>
+              <td>{s.ce_signal ?? '--'}</td>
+              <td>{s.pe_signal ?? '--'}</td>
+              <td>{s.sentiment ?? '--'}</td>
+              <td>{s.expiry_zone ?? '--'}</td>
+              <td>{s.risk_note ?? (s.error ? `Error: ${s.error}` : '--')}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 
-    const sanitizedParams = Object.fromEntries(
-      Object.entries(tradeParams).filter(([, value]) => value !== undefined && value !== null && value !== '')
-    );
+  // Pick the best signal (highest confidence) from optionSignals
+  const bestSignal = optionSignals.reduce((best, curr) =>
+    (!best || (curr.confidence > best.confidence)) ? curr : best, null
+  );
 
-    if (!isDemoMode) {
-      const confirmed = window.confirm(
-        '⚠️ LIVE TRADING ALERT!\n\n' +
-        'This will execute a REAL trade with real money.\n\n' +
-        'Continue?'
-      );
-      
-      if (!confirmed) return;
+  // Auto-execute the best signal if available and not already executing
+  useEffect(() => {
+    if (bestSignal && !executing) {
+      executeAutoTrade(bestSignal);
     }
-    
-    setExecuting(true);
-    
-    try {
-      const response = await config.authFetch(
-        config.getUrl(config.endpoints.autoTrade.execute, sanitizedParams),
-        { method: 'POST' }
-      );
+    // eslint-disable-next-line
+  }, [bestSignal]);
 
+  // Remove legacy toggleAutoTrading logic (config references)
+  const toggleAutoTrading = async () => {};
+
+  // Implement auto trade execution using bestSignal
+  const executeAutoTrade = async (signal) => {
+    if (!signal || executing) return;
+    const token = localStorage.getItem('access_token');
+    if (!token) {
+      alert('No access token found. Please login.');
+      return;
+    }
+    const confirmMsg = `⚡ LIVE TRADE\n\nIndex: ${signal.index}\nSymbol: ${signal.symbol}\nAction: ${signal.action}\nStrike: ${signal.strike}\nQty: ${signal.quantity}\nEntry: ₹${signal.entry_price}\nTarget: ₹${signal.target}\nStop Loss: ₹${signal.stop_loss}\n\nProceed with auto trade?`;
+    if (!window.confirm(confirmMsg)) return;
+    setExecuting(true);
+    try {
+      const params = {
+        symbol: signal.symbol,
+        price: signal.entry_price,
+        target: signal.target,
+        stop_loss: signal.stop_loss,
+        quantity: signal.quantity,
+        side: signal.action,
+        expiry: signal.expiry_date,
+        broker_id: 1,
+        balance: 50000
+      };
+      const response = await config.authFetch(config.endpoints.autoTrade.execute, {
+        method: 'POST',
+        body: JSON.stringify(params)
+      });
       if (response.ok) {
         const data = await response.json();
-        if (data.success) {
-          const prefix = isDemoMode ? '🎯 DEMO' : '⚡ LIVE';
-          alert(`${prefix}: ${data.message}`);
-          fetchData();
-        } else {
-          alert(data.message);
-        }
+        alert(data.message || 'Trade executed!');
+      } else {
+        let errorMsg = 'Failed to execute trade.';
+        try {
+          const errData = await response.json();
+          if (errData.message) errorMsg += '\nReason: ' + errData.message;
+          if (errData.detail) errorMsg += '\nDetail: ' + errData.detail;
+        } catch {}
+        alert(errorMsg);
       }
-    } catch (error) {
-      console.error('Error executing trade:', error);
-      alert('Failed to execute trade');
+    } catch (e) {
+      alert('Error executing trade: ' + e.message);
     } finally {
       setExecuting(false);
+    }
+  };
+
+  // Arm live trading
+  const armLiveTrading = async () => {
+    const token = localStorage.getItem('access_token');
+    if (!token) {
+      alert('No access token found. Please login.');
+      return;
+    }
+    try {
+      const response = await config.authFetch(config.endpoints.autoTrade.arm || '/autotrade/arm', {
+        method: 'POST',
+        body: JSON.stringify(true)
+      });
+      if (response.ok) {
+        const data = await response.json();
+        alert('Live trading armed!');
+        setEnabled(true);
+      } else {
+        alert('Failed to arm live trading.');
+      }
+    } catch (e) {
+      alert('Error arming live trading: ' + e.message);
     }
   };
 
@@ -255,36 +203,6 @@ const AutoTradingDashboard = () => {
     if (!ts) return false;
     return new Date(ts).toDateString() === todayLabel;
   });
-
-  const sampleTodayTrades = [
-    {
-      id: 'SAMPLE-1',
-      symbol: 'NIFTY 27FEB 22500 CE',
-      action: 'BUY',
-      entry_price: 112.5,
-      exit_price: 114.8,
-      pnl: 2.3,
-      pnl_percentage: 2.04,
-      status: 'CLOSED',
-      entry_time: todayIso,
-      exit_time: todayIso,
-      quantity: 50,
-    },
-    {
-      id: 'SAMPLE-2',
-      symbol: 'BANKNIFTY 27FEB 48500 PE',
-      action: 'SELL',
-      entry_price: 152.0,
-      exit_price: 149.5,
-      pnl: 2.5,
-      pnl_percentage: 1.64,
-      status: 'CLOSED',
-      entry_time: todayIso,
-      exit_time: todayIso,
-      quantity: 15,
-    },
-  ];
-
   const sumPnl = (trades) => trades.reduce((acc, t) => acc + Number(t.profit_loss ?? t.pnl ?? 0), 0);
   const sumWins = (trades) => trades.filter((t) => Number(t.profit_loss ?? t.pnl ?? 0) > 0).length;
   const overallPnl = reportSummary?.total_pnl ?? sumPnl(tradeHistory);
@@ -296,7 +214,7 @@ const AutoTradingDashboard = () => {
       .filter(Boolean)
       .some((field) => String(field).toLowerCase().includes(q));
   });
-  const todayTableRows = tradesToday.length > 0 ? tradesToday : sampleTodayTrades;
+  const todayTableRows = tradesToday;
 
   return (
     <div style={{
@@ -307,6 +225,7 @@ const AutoTradingDashboard = () => {
       boxShadow: '0 8px 32px rgba(0, 0, 0, 0.1)'
     }}>
       {/* Header with Toggle */}
+      {renderOptionSignalsTable()}
       <div style={{
         display: 'flex',
         justifyContent: 'space-between',
@@ -344,7 +263,7 @@ const AutoTradingDashboard = () => {
               color: 'white',
               fontWeight: '600'
             }}>
-              {isDemoMode ? '🎯 DEMO' : '⚡ LIVE'}
+              {'⚡ LIVE'}
             </span>
           </h3>
           <p style={{
@@ -353,7 +272,7 @@ const AutoTradingDashboard = () => {
             fontSize: '14px'
           }}>
             {livePrice && <span>📊 NIFTY: ₹{livePrice.toFixed(2)} • </span>}
-            {isDemoMode ? '🎯 Demo Mode - Using Real Market Data • No Real Trades' : '⚡ LIVE Mode - Real Trades Execution'}
+            {'⚡ LIVE Mode - Real Trades Execution'}
             {' • '}Max {stats?.max_trades || 10} Concurrent Trades
           </p>
         </div>
@@ -361,131 +280,17 @@ const AutoTradingDashboard = () => {
           <button
             onClick={toggleMode}
             style={{
-              padding: '10px 20px',
-              background: isDemoMode ? '#f56565' : '#48bb78',
-              color: 'white',
-              border: 'none',
-              borderRadius: '8px',
-              fontSize: '14px',
-              fontWeight: '600',
-              cursor: 'pointer'
-            }}
-          >
-            {isDemoMode ? '⚡ Switch to LIVE' : '🎯 Switch to DEMO'}
-          </button>
-          <button
-            onClick={analyzeMarket}
-            style={{
-              padding: '10px 20px',
-              background: '#4299e1',
-              color: 'white',
-              border: 'none',
-              borderRadius: '8px',
-              fontSize: '14px',
-              fontWeight: '600',
-              cursor: 'pointer'
-            }}
-          >
-            📊 Analyze
-          </button>
-          <button
-            onClick={toggleAutoTrading}
-            style={{
-              padding: '12px 24px',
-              background: enabled ? '#f56565' : '#48bb78',
-              color: 'white',
-              border: 'none',
-              borderRadius: '8px',
-              fontSize: '16px',
-              fontWeight: '600',
-              cursor: 'pointer',
-              minWidth: '140px'
-            }}
-          >
-            {enabled ? '⏸ Disable' : '▶ Enable'}
-          </button>
-        </div>
-      </div>
-
-      {/* Tabs */}
-      <div style={{ display: 'flex', gap: '12px', marginBottom: '20px' }}>
-        <button
-          onClick={() => setActiveTab('trading')}
-          style={{
-            padding: '10px 16px',
-            borderRadius: '10px',
-            border: 'none',
-            fontWeight: '700',
-            background: activeTab === 'trading' ? '#2b6cb0' : '#e2e8f0',
-            color: activeTab === 'trading' ? 'white' : '#2d3748',
-            cursor: 'pointer'
-          }}
-        >
-          🚀 Trading
-        </button>
-        <button
-          onClick={() => setActiveTab('report')}
-          style={{
-            padding: '10px 16px',
-            borderRadius: '10px',
-            border: 'none',
-            fontWeight: '700',
-            background: activeTab === 'report' ? '#2b6cb0' : '#e2e8f0',
-            color: activeTab === 'report' ? 'white' : '#2d3748',
-            cursor: 'pointer'
-          }}
-        >
-          📊 Reports
-        </button>
-      </div>
-
-      {activeTab === 'trading' && (
-        <>
-
-      {/* Statistics Dashboard */}
-      {stats && (
-        <div style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
-          gap: '16px',
-          marginBottom: '32px'
-        }}>
-          <div style={{
-            padding: '20px',
-            background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-            borderRadius: '12px',
-            color: 'white',
-            textAlign: 'center'
-          }}>
-            <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Total Trades</div>
-            <div style={{ fontSize: '32px', fontWeight: 'bold' }}>{stats.total_trades}</div>
-          </div>
-          <div style={{
-            padding: '20px',
-            background: 'linear-gradient(135deg, #48bb78 0%, #38a169 100%)',
-            borderRadius: '12px',
-            color: 'white',
-            textAlign: 'center'
-          }}>
-            <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Win Rate</div>
-            <div style={{ fontSize: '32px', fontWeight: 'bold' }}>{(stats.win_rate || 0).toFixed(2)}%</div>
-          </div>
-          <div style={{
-            padding: '20px',
-            background: 'linear-gradient(135deg, #4299e1 0%, #3182ce 100%)',
-            borderRadius: '12px',
-            color: 'white',
-            textAlign: 'center'
-          }}>
+              padding: '10px 20px'
+            }}>
             <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Daily P&L</div>
             <div style={{
               fontSize: '28px',
               fontWeight: 'bold',
-              color: stats.daily_pnl >= 0 ? '#c6f6d5' : '#fed7d7'
+              color: (stats?.daily_pnl ?? 0) >= 0 ? '#c6f6d5' : '#fed7d7'
             }}>
-              ₹{(stats.daily_pnl || 0).toLocaleString()}
+                ₹{(stats?.daily_pnl ?? 0).toLocaleString()}
             </div>
-          </div>
+          </button>
           <div style={{
             padding: '20px',
             background: 'linear-gradient(135deg, #ed8936 0%, #dd6b20 100%)',
@@ -495,8 +300,8 @@ const AutoTradingDashboard = () => {
           }}>
             <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Active Trades</div>
             <div style={{ fontSize: '32px', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '8px' }}>
-              {stats.active_trades_count || 0} / {stats.max_trades || 2}
-              {(stats.active_trades_count || 0) >= (stats.max_trades || 2) && (
+              {(stats?.active_trades_count ?? 0)} / {(stats?.max_trades ?? 2)}
+              {(stats?.active_trades_count ?? 0) >= (stats?.max_trades ?? 2) && (
                 <span style={{ fontSize: '16px', background: '#fc8181', padding: '2px 8px', borderRadius: '4px' }}>FULL</span>
               )}
             </div>
@@ -509,10 +314,10 @@ const AutoTradingDashboard = () => {
             textAlign: 'center'
           }}>
             <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Target / Trade</div>
-            <div style={{ fontSize: '32px', fontWeight: 'bold' }}>{stats.target_points_per_trade || 25}pts</div>
+            <div style={{ fontSize: '32px', fontWeight: 'bold' }}>{stats?.target_points_per_trade ?? 25}pts</div>
           </div>
 
-          {stats.portfolio_cap !== null && (
+          {stats?.portfolio_cap !== null && stats?.portfolio_cap !== undefined && (
             <div style={{
               padding: '20px',
               background: 'linear-gradient(135deg, #319795 0%, #2c7a7b 100%)',
@@ -521,17 +326,17 @@ const AutoTradingDashboard = () => {
               textAlign: 'center'
             }}>
               <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Capital In Use</div>
-              <div style={{ fontSize: '24px', fontWeight: 'bold' }}>₹{(stats.capital_in_use || 0).toLocaleString()}</div>
+              <div style={{ fontSize: '24px', fontWeight: 'bold' }}>₹{(stats?.capital_in_use ?? 0).toLocaleString()}</div>
               <div style={{ fontSize: '12px', opacity: 0.85, marginTop: '6px' }}>
-                Remaining: ₹{(stats.remaining_capital || 0).toLocaleString()} / Cap: ₹{(stats.portfolio_cap || 0).toLocaleString()}
+                Remaining: ₹{(stats?.remaining_capital ?? 0).toLocaleString()} / Cap: ₹{(stats?.portfolio_cap ?? 0).toLocaleString()}
               </div>
             </div>
           )}
         </div>
-      )}
+    </div>
 
       {/* Market Analysis */}
-      {analysis && analysis.recommendation && (
+      {bestSignal && (
         <div style={{
           padding: '24px',
           background: 'linear-gradient(135deg, #fef5e7 0%, #fdebd0 100%)',
@@ -552,7 +357,7 @@ const AutoTradingDashboard = () => {
                 fontSize: '18px',
                 fontWeight: 'bold'
               }}>
-                🎯 AI Recommendation ({analysis.signals_count} strategies analyzed)
+                🎯 AI Recommendation (1 best signal)
               </h4>
               <div style={{
                 display: 'flex',
@@ -570,7 +375,7 @@ const AutoTradingDashboard = () => {
                     color: 'white',
                     fontWeight: '600'
                   }}>
-                    {analysis.recommendation.strategy || 'Best Match'}
+                    {bestSignal.strategy || 'Best Match'}
                   </span>
                 </span>
                 <span>
@@ -578,17 +383,17 @@ const AutoTradingDashboard = () => {
                   <span style={{
                     padding: '2px 8px',
                     borderRadius: '4px',
-                    background: analysis.recommendation.action === 'BUY' ? '#48bb78' : '#f56565',
+                    background: bestSignal.action === 'BUY' ? '#48bb78' : '#f56565',
                     color: 'white',
                     fontWeight: 'bold'
                   }}>
-                    {analysis.recommendation.action}
+                    {bestSignal.action}
                   </span>
                 </span>
-                <span><strong>Symbol:</strong> {analysis.recommendation.symbol}</span>
-                <span><strong>Confidence:</strong> {analysis.recommendation.confidence}%</span>
-                <span><strong>Quantity:</strong> {analysis.recommendation.quantity}</span>
-                <span><strong>Expiry:</strong> {analysis.recommendation.expiry_date || analysis.recommendation.expiry}</span>
+                <span><strong>Symbol:</strong> {bestSignal.symbol}</span>
+                <span><strong>Confidence:</strong> {bestSignal.confidence}%</span>
+                <span><strong>Quantity:</strong> {bestSignal.quantity}</span>
+                <span><strong>Expiry:</strong> {bestSignal.expiry_date || bestSignal.expiry}</span>
               </div>
             </div>
             {enabled && (
@@ -623,45 +428,45 @@ const AutoTradingDashboard = () => {
                 🔴 Live Entry Price
               </div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#1a202c' }}>
-                ₹{analysis.recommendation.entry_price.toFixed(2)}
+                ₹{bestSignal.entry_price?.toFixed(2) ?? '--'}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>
-                Target (+{analysis.recommendation.target_points || 25}pts)
+                Target (+{bestSignal.target_points ?? 25}pts)
               </div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#48bb78' }}>
-                ₹{analysis.recommendation.target.toFixed(2)}
+                ₹{bestSignal.target?.toFixed(2) ?? '--'}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Stop Loss (-20pts)</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#f56565' }}>
-                ₹{analysis.recommendation.stop_loss.toFixed(2)}
+                ₹{bestSignal.stop_loss?.toFixed(2) ?? '--'}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Potential Profit</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#38a169' }}>
-                ₹{analysis.recommendation.potential_profit.toLocaleString()}
+                ₹{bestSignal.potential_profit?.toLocaleString() ?? '--'}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Max Risk</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#e53e3e' }}>
-                ₹{analysis.recommendation.risk.toLocaleString()}
+                ₹{bestSignal.risk?.toLocaleString() ?? '--'}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Quantity</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#5a67d8' }}>
-                {analysis.recommendation.quantity}
+                {bestSignal.quantity}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Expiry Date</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#2d3748' }}>
-                {analysis.recommendation.expiry_date || 'N/A'}
+                {bestSignal.expiry_date || 'N/A'}
               </div>
             </div>
           </div>
@@ -669,7 +474,7 @@ const AutoTradingDashboard = () => {
       )}
 
       {/* All Signals Table */}
-      {analysis && analysis.signals && analysis.signals.length > 0 && (
+      {analysis?.signals?.length > 0 && (
         <div style={{ marginBottom: '24px' }}>
           <h4 style={{
             margin: '0 0 16px 0',
@@ -677,7 +482,7 @@ const AutoTradingDashboard = () => {
             fontSize: '18px',
             fontWeight: 'bold'
           }}>
-            📋 All Strategy Signals ({analysis.signals.length})
+            📋 All Strategy Signals ({analysis.signals?.length ?? 0})
           </h4>
           <div style={{ overflowX: 'auto' }}>
             <table style={{
@@ -702,7 +507,7 @@ const AutoTradingDashboard = () => {
                 </tr>
               </thead>
               <tbody>
-                {analysis.signals.map((signal, idx) => (
+                {analysis.signals?.map((signal, idx) => (
                   <tr key={idx} style={{ borderBottom: '1px solid #e2e8f0' }}>
                     <td style={{ padding: '12px', fontSize: '13px' }}>{signal.strategy}</td>
                     <td style={{ padding: '12px', fontWeight: '600', fontSize: '13px' }}>{signal.symbol}</td>
@@ -745,75 +550,6 @@ const AutoTradingDashboard = () => {
       )}
 
       {/* Active Trades */}
-      {activeTrades.length > 0 && (
-        <div style={{ marginBottom: '24px' }}>
-          <h4 style={{
-            margin: '0 0 16px 0',
-            color: '#2d3748',
-            fontSize: '18px',
-            fontWeight: 'bold'
-          }}>
-            📈 Active Trades ({activeTrades.length})
-          </h4>
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{
-              width: '100%',
-              borderCollapse: 'collapse',
-              fontSize: '14px'
-            }}>
-              <thead>
-                <tr style={{ background: '#f7fafc', borderBottom: '2px solid #e2e8f0' }}>
-                  <th style={{ padding: '12px', textAlign: 'left' }}>ID</th>
-                  <th style={{ padding: '12px', textAlign: 'left' }}>Symbol</th>
-                  <th style={{ padding: '12px', textAlign: 'left' }}>Action</th>
-                  <th style={{ padding: '12px', textAlign: 'right' }}>Entry</th>
-                  <th style={{ padding: '12px', textAlign: 'right' }}>Target</th>
-                  <th style={{ padding: '12px', textAlign: 'right' }}>Stop Loss</th>
-                  <th style={{ padding: '12px', textAlign: 'left' }}>Strategy</th>
-                  <th style={{ padding: '12px', textAlign: 'left' }}>Time</th>
-                </tr>
-              </thead>
-              <tbody>
-                {activeTrades.map((trade, idx) => {
-                  const entry = Number(trade.entry_price || trade.price || trade.underlying_price || 0);
-                  const target = Number(trade.target || trade.exit_price || entry);
-                  const stop = Number(trade.stop_loss || entry);
-                  const action = trade.action || trade.side || 'BUY';
-                  return (
-                    <tr key={idx} style={{ borderBottom: '1px solid #e2e8f0' }}>
-                      <td style={{ padding: '12px' }}>#{trade.id}</td>
-                      <td style={{ padding: '12px', fontWeight: '600' }}>{trade.symbol || trade.index || '—'}</td>
-                      <td style={{ padding: '12px' }}>
-                        <span style={{
-                          padding: '4px 8px',
-                          borderRadius: '4px',
-                          background: action === 'BUY' ? '#c6f6d5' : '#fed7d7',
-                          color: action === 'BUY' ? '#22543d' : '#742a2a',
-                          fontSize: '12px',
-                          fontWeight: 'bold'
-                        }}>
-                          {action}
-                        </span>
-                      </td>
-                      <td style={{ padding: '12px', textAlign: 'right' }}>₹{entry.toFixed(2)}</td>
-                      <td style={{ padding: '12px', textAlign: 'right', color: '#48bb78', fontWeight: '600' }}>
-                        ₹{target.toFixed(2)}
-                      </td>
-                      <td style={{ padding: '12px', textAlign: 'right', color: '#f56565', fontWeight: '600' }}>
-                        ₹{stop.toFixed(2)}
-                      </td>
-                      <td style={{ padding: '12px', fontSize: '12px', color: '#718096' }}>{trade.strategy || trade.strategy_name || 'LIVE_TREND_FOLLOW'}</td>
-                      <td style={{ padding: '12px', fontSize: '12px', color: '#718096' }}>
-                        {trade.entry_time ? new Date(trade.entry_time).toLocaleTimeString() : '—'}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
 
       {/* Trade History */}
       {tradeHistory.length > 0 && (
@@ -1062,8 +798,6 @@ const AutoTradingDashboard = () => {
           </p>
         </div>
       )}
-      </>
-      )}
 
       {activeTab === 'report' && (
         <div style={{
@@ -1254,6 +988,6 @@ const AutoTradingDashboard = () => {
       )}
     </div>
   );
-};
+}
 
 export default AutoTradingDashboard;

@@ -257,12 +257,12 @@ class MarketTrendAnalyzer:
         if not self.kite_api_key or not self.kite_access_token:
             return {}
 
-        mapping = {
-            'NIFTY': 'NSE:NIFTY 50',
-            'BANKNIFTY': 'NSE:NIFTY BANK',
-            'FINNIFTY': 'NSE:FINNIFTY',
-            'SENSEX': 'BSE:SENSEX',
-        }
+            mapping = {
+                'NIFTY': 'NSE:NIFTY 50',
+                'BANKNIFTY': 'NSE:NIFTY BANK',
+                'FINNIFTY': 'NSE:FINNIFTY',
+                'SENSEX': 'BSE:SENSEX',
+            }
 
         try:
             kite = KiteConnect(api_key=self.kite_api_key)

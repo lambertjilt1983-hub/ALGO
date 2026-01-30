@@ -13,10 +13,12 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     ENCRYPTION_KEY: str = "your-32-char-encryption-key-here"
+    FERNET_KEY: str = ""
     
     # Broker Credentials (Zerodha)
     ZERODHA_API_KEY: str = ""
     ZERODHA_API_SECRET: str = ""
+    ZERODHA_REDIRECT_URL: str = ""
     
     # Broker Credentials (Upstox)
     UPSTOX_API_KEY: str = ""
@@ -44,7 +46,13 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: str = "https://algo-trade-frontend.up.railway.app"
     
     class Config:
-        env_file = ".env"
+        env_file = os.environ.get("ENV_FILE", ".env")
+        if env_file == "env.qa":
+            env_file = ".env.qa"
+        elif env_file == "env.local":
+            env_file = ".env.local"
+        else:
+            env_file = ".env"
         case_sensitive = True
 
 @lru_cache()
