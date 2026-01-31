@@ -19,10 +19,37 @@ try:
 except Exception as e:
     print(f"Warning: Could not create tables: {e}")
 
+
+# --- FastAPI lifespan event handler (replaces deprecated on_event) ---
+from contextlib import asynccontextmanager
+import logging
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("startup")
+    logger.info("[STARTUP] FastAPI startup event triggered.")
+    db = SessionLocal()
+    try:
+        logger.info("[STARTUP] Ensuring default admin user...")
+        AuthService.ensure_default_admin(db)
+        logger.info("[STARTUP] Default admin ensured.")
+    except Exception as e:
+        logger.error(f"[STARTUP] Exception during startup: {e}", exc_info=True)
+    finally:
+        db.close()
+        logger.info("[STARTUP] Database session closed.")
+    yield
+    # Shutdown
+    logger.info("[SHUTDOWN] FastAPI shutdown event triggered.")
+
+# Single app instance with all config
 app = FastAPI(
     title="AlgoTrade Pro",
     description="Enterprise Algorithmic Trading Platform",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # CORS middleware
@@ -48,31 +75,6 @@ app.include_router(auto_trading_simple.router)  # Using simplified version
 app.include_router(token_refresh.router)  # Token refresh and validation endpoints
 app.include_router(admin.router)  # Admin-only utilities
 app.include_router(zerodha_postback.router)  # Zerodha postback endpoint
-
-# Startup and shutdown events
-import logging
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize background tasks on startup"""
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger("startup")
-    logger.info("[STARTUP] FastAPI startup event triggered.")
-    db = SessionLocal()
-    try:
-        logger.info("[STARTUP] Ensuring default admin user...")
-        AuthService.ensure_default_admin(db)
-        logger.info("[STARTUP] Default admin ensured.")
-    except Exception as e:
-        logger.error(f"[STARTUP] Exception during startup: {e}", exc_info=True)
-    finally:
-        db.close()
-        logger.info("[STARTUP] Database session closed.")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown"""
-    pass
 
 @app.get("/")
 async def root():

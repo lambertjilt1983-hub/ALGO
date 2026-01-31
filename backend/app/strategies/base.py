@@ -209,20 +209,54 @@ class MomentumStrategy(Strategy):
             strength=0
         )
 
+
+# --- Import the professional strategy ---
+from app.strategies.intraday_professional import generate_signals as professional_generate_signals
+
+class IntradayProfessionalStrategy(Strategy):
+    """Professional Intraday Strategy Wrapper for API integration"""
+    def __init__(self, parameters: Dict[str, Any]):
+        super().__init__("Intraday Professional", parameters)
+        self.capital = parameters.get("capital", 100000)
+        self.data = None
+
+    def validate_data(self, data: pd.DataFrame) -> bool:
+        required_cols = ["open", "high", "low", "close", "volume"]
+        return all(col in data.columns for col in required_cols)
+
+    def generate_signal(self, data: pd.DataFrame) -> Signal:
+        self.data = data
+        df = professional_generate_signals(data, self.capital)
+        # Find the last non-empty signal
+        last_row = df[df['Signal'] != ''].iloc[-1] if (df['Signal'] != '').any() else None
+        if last_row is not None:
+            return Signal(
+                timestamp=last_row.name if hasattr(last_row, 'name') else datetime.now(),
+                symbol=self.parameters.get('symbol', ''),
+                action=last_row['Signal'],
+                strength=1.0,
+                entry_price=last_row['close'],
+                stop_loss=last_row.get('Supertrend', None),
+                take_profit=None
+            )
+        return Signal(
+            timestamp=datetime.now(),
+            symbol=self.parameters.get('symbol', ''),
+            action="hold",
+            strength=0
+        )
+
 class StrategyFactory:
     """Factory for creating strategy instances"""
-    
     _strategies = {
         "ma_crossover": MovingAverageCrossover,
         "rsi": RSIStrategy,
-        "momentum": MomentumStrategy
+        "momentum": MomentumStrategy,
+        "intraday_professional": IntradayProfessionalStrategy
     }
-    
     @classmethod
     def create_strategy(cls, strategy_type: str, parameters: Dict[str, Any]) -> Strategy:
-        """Create strategy instance"""
         strategy_class = cls._strategies.get(strategy_type.lower())
         if not strategy_class:
             raise ValueError(f"Unknown strategy: {strategy_type}")
-        
         return strategy_class(parameters)

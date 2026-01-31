@@ -3,6 +3,7 @@ import React, { useState, useEffect } from 'react';
 // Use environment-based API URL if available
 import config from '../config/api';
 const OPTION_SIGNALS_API = `${config.API_BASE_URL}/option-signals/intraday`;
+const PROFESSIONAL_SIGNAL_API = `${config.API_BASE_URL}/strategies/live/professional-signal`;
 
 const AutoTradingDashboard = () => {
   const [enabled, setEnabled] = useState(false);
@@ -19,6 +20,23 @@ const AutoTradingDashboard = () => {
   const [livePrice, setLivePrice] = useState(null);
   const [activeTab, setActiveTab] = useState('trading');
   const [historySearch, setHistorySearch] = useState('');
+
+  // --- Professional Signal Integration ---
+  const [professionalSignal, setProfessionalSignal] = useState(null);
+  useEffect(() => {
+    const fetchProfessionalSignal = async () => {
+      try {
+        const res = await config.authFetch(PROFESSIONAL_SIGNAL_API);
+        const data = await res.json();
+        setProfessionalSignal(data);
+      } catch (err) {
+        setProfessionalSignal({ error: err.message });
+      }
+    };
+    fetchProfessionalSignal();
+    const interval = setInterval(fetchProfessionalSignal, 60000); // refresh every 60s
+    return () => clearInterval(interval);
+  }, []);
 
   // Remove legacy fetchData logic (config references)
   const fetchData = async () => {
@@ -215,6 +233,9 @@ const AutoTradingDashboard = () => {
       .some((field) => String(field).toLowerCase().includes(q));
   });
   const todayTableRows = tradesToday;
+
+  // --- Professional Signal Integration ---
+  // ...existing code...
 
   return (
     <div style={{

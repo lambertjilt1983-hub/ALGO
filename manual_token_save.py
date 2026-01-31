@@ -1,12 +1,17 @@
 """
 Manually exchange Zerodha request token and save to database
 """
+import datetime
+print(f"[DEBUG] Script started at {datetime.datetime.now()}")
 import sqlite3
 from kiteconnect import KiteConnect
 import sys
 
+
 # Your request token from the URL
-request_token = "[REMOVED_REQUEST_TOKEN]"
+request_token = "4WGqxY75Wcb1bxUk5vBwPar2RrYjB949"
+
+print(f"[DEBUG] Using request_token: {request_token}")
 
 # Get credentials from database
 conn = sqlite3.connect('F:/ALGO/algotrade.db')
@@ -15,6 +20,8 @@ c = conn.cursor()
 c.execute('SELECT id, api_key, api_secret FROM broker_credentials WHERE id = 4')
 broker = c.fetchone()
 
+print(f"[DEBUG] Broker DB row: {broker}")
+
 if not broker:
     print("❌ Broker not found!")
     sys.exit(1)
@@ -22,6 +29,9 @@ if not broker:
 broker_id = broker[0]
 encrypted_api_key = broker[1]
 encrypted_api_secret = broker[2]
+
+print(f"[DEBUG] Encrypted API Key: {encrypted_api_key}")
+print(f"[DEBUG] Encrypted API Secret: {encrypted_api_secret}")
 
 print(f"📋 Broker ID: {broker_id}")
 print(f"🔐 Encrypted API Key: {encrypted_api_key[:30]}...")
@@ -32,8 +42,13 @@ import sys
 sys.path.insert(0, 'F:/ALGO/backend')
 from app.core.security import encryption_manager
 
+print("[DEBUG] Decrypting credentials...")
+
 api_key = encryption_manager.decrypt_credentials(encrypted_api_key)
 api_secret = encryption_manager.decrypt_credentials(encrypted_api_secret)
+
+print(f"[DEBUG] Decrypted API Key: {api_key}")
+print(f"[DEBUG] Decrypted API Secret: {api_secret}")
 
 print(f"\n✅ Decrypted API Key: {api_key}")
 print(f"✅ Decrypted API Secret: {api_secret[:10]}...")
@@ -42,23 +57,30 @@ print(f"✅ Decrypted API Secret: {api_secret[:10]}...")
 print(f"\n🔄 Initializing KiteConnect with API key...")
 kite = KiteConnect(api_key=api_key)
 
+print(f"[DEBUG] KiteConnect initialized with api_key: {api_key}")
+
 # Exchange request token for access token
 print(f"🔄 Exchanging request token: {request_token}")
 try:
     data = kite.generate_session(request_token, api_secret=api_secret)
     access_token = data["access_token"]
+    print(f"[DEBUG] Received access_token: {access_token}")
+    print(f"[DEBUG] Token length: {len(access_token)}")
     
     print(f"\n✅ Access Token Received: {access_token}")
     print(f"📏 Token Length: {len(access_token)} chars")
     
     # Save to database
     print(f"\n💾 Saving access token to database...")
+    print(f"[DEBUG] Running UPDATE for broker_id={broker_id}")
     c.execute('UPDATE broker_credentials SET access_token = ? WHERE id = ?', (access_token, broker_id))
     conn.commit()
     
     # Verify it was saved
     c.execute('SELECT access_token FROM broker_credentials WHERE id = 4')
+    print(f"[DEBUG] Ran SELECT to verify token save.")
     saved_token = c.fetchone()[0]
+    print(f"[DEBUG] Saved token in DB: {saved_token}")
     
     if saved_token == access_token:
         print(f"✅ Token successfully saved to database!")
@@ -82,3 +104,4 @@ except Exception as e:
     traceback.print_exc()
 finally:
     conn.close()
+    print(f"[DEBUG] Script finished at {datetime.datetime.now()}")

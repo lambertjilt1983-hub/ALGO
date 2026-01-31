@@ -4,7 +4,7 @@ import os
 from app.brokers.zerodha import get_zerodha_access_token
 
 # Load your API key/secret and access token from environment or config
-KITE_API_KEY = os.getenv("ZERODHA_API_KEY", "your_api_key")
+KITE_API_KEY = os.getenv("ZERODHA_API_KEY")
 KITE_API_SECRET = os.getenv("ZERODHA_API_SECRET", "your_api_secret")
 KITE_ACCESS_TOKEN = get_zerodha_access_token()  # Fetch from DB/config
 

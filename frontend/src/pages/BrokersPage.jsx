@@ -253,18 +253,20 @@ export default function BrokersPage() {
         )}
       </div>
 
-      {/* Auto Trading Engine Link */}
-      <div className="mt-8 flex items-center">
-        <span className="mr-2">🤖</span>
-        <a
-          href="/autotrading"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-blue-600 hover:underline font-semibold"
-        >
-          Auto Trading Engine
-        </a>
-      </div>
+      {/* Auto Trading Engine Link - Only show if Zerodha is connected */}
+      {brokers.some(b => b.broker_name.toLowerCase() === 'zerodha' && b.access_token) && (
+        <div className="mt-8 flex items-center">
+          <span className="mr-2">🤖</span>
+          <a
+            href="/autotrading"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-blue-600 hover:underline font-semibold"
+          >
+            Auto Trading Engine
+          </a>
+        </div>
+      )}
 
       {/* Instructions */}
       <div className="mt-8 bg-gray-50 rounded-lg p-6">

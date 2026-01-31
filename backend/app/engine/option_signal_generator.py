@@ -1,5 +1,8 @@
 import requests
 from typing import List, Dict
+import functools
+import threading
+import time
 from kiteconnect import KiteConnect
 import os
 
@@ -12,8 +15,8 @@ OPTION_CHAIN_URLS = {
 }
 
 # Zerodha Kite Connect
-KITE_API_KEY = os.getenv("ZERODHA_API_KEY", "your_api_key")
-KITE_ACCESS_TOKEN = os.getenv("ZERODHA_ACCESS_TOKEN", "your_access_token")
+KITE_API_KEY = os.getenv("ZERODHA_API_KEY")
+KITE_ACCESS_TOKEN = os.getenv("ZERODHA_ACCESS_TOKEN")
 kite = KiteConnect(api_key=KITE_API_KEY)
 kite.set_access_token(KITE_ACCESS_TOKEN)
 
@@ -152,21 +155,45 @@ def analyze_option_chain(chain: Dict) -> Dict:
         'risk_note': 'High IV: Options expensive',
     }
 
+
+# --- Simple in-memory cache and rate limiter ---
+_signals_cache = None
+_signals_cache_time = 0
+_signals_cache_lock = threading.Lock()
+_signals_cache_ttl = 30  # seconds
+_signals_rate_limit = 10  # seconds between calls
+_signals_last_call = 0
+
 def generate_signals() -> List[Dict]:
-    # Dynamically discover all available index names with options
-    try:
-        kite_indices = set()
-        instruments = kite.instruments("NFO")
-        for i in instruments:
-            if i.get("segment") == "NFO-OPT" and i.get("name"):
-                kite_indices.add(i["name"])
-        indices = sorted(kite_indices)
-    except Exception as e:
-        indices = ["BANKNIFTY", "NIFTY", "SENSEX", "FINNIFTY"]
-    signals = []
-    for idx in indices:
-        signals.append(fetch_index_option_chain(idx))
-    return signals
+    global _signals_cache, _signals_cache_time, _signals_last_call
+    now = time.time()
+    with _signals_cache_lock:
+        # Serve from cache if not expired
+        if _signals_cache is not None and (now - _signals_cache_time) < _signals_cache_ttl:
+            return _signals_cache
+        # Rate limit: if last call was too recent, return error signals
+        if (now - _signals_last_call) < _signals_rate_limit:
+            return [
+                {"index": idx, "error": "Too many requests (rate limited)"}
+                for idx in ["BANKNIFTY", "NIFTY", "SENSEX", "FINNIFTY"]
+            ]
+        _signals_last_call = now
+        # Actual signal generation
+        try:
+            kite_indices = set()
+            instruments = kite.instruments("NFO")
+            for i in instruments:
+                if i.get("segment") == "NFO-OPT" and i.get("name"):
+                    kite_indices.add(i["name"])
+            indices = sorted(kite_indices)
+        except Exception as e:
+            indices = ["BANKNIFTY", "NIFTY", "SENSEX", "FINNIFTY"]
+        signals = []
+        for idx in indices:
+            signals.append(fetch_index_option_chain(idx))
+        _signals_cache = signals
+        _signals_cache_time = now
+        return signals
 
 if __name__ == "__main__":
     from pprint import pprint

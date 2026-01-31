@@ -61,7 +61,11 @@ class NewsAnalyzer:
         items: List[Dict[str, Any]] = []
 
         try:
-            response = requests.get(url, timeout=self.request_timeout)
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8',
+            }
+            response = requests.get(url, headers=headers, timeout=self.request_timeout)
             response.raise_for_status()
             root = ET.fromstring(response.content)
 
@@ -254,15 +258,15 @@ class MarketTrendAnalyzer:
         """Fetch live quotes from Zerodha Kite if API key + access token are set."""
         # Always re-hydrate in case tokens rotated.
         self._hydrate_tokens_from_db()
+
+        mapping = {
+            'NIFTY': 'NSE:NIFTY 50',
+            'BANKNIFTY': 'NSE:NIFTY BANK',
+            'FINNIFTY': 'NSE:FINNIFTY',
+            'SENSEX': 'BSE:SENSEX',
+        }
         if not self.kite_api_key or not self.kite_access_token:
             return {}
-
-            mapping = {
-                'NIFTY': 'NSE:NIFTY 50',
-                'BANKNIFTY': 'NSE:NIFTY BANK',
-                'FINNIFTY': 'NSE:FINNIFTY',
-                'SENSEX': 'BSE:SENSEX',
-            }
 
         try:
             kite = KiteConnect(api_key=self.kite_api_key)

@@ -11,7 +11,7 @@ def get_zerodha_access_token():
     Fetch Zerodha access token from environment variable or return a placeholder.
     Update this logic as per your actual token management.
     """
-    return os.getenv("ZERODHA_ACCESS_TOKEN", "your_access_token")
+    return os.getenv("ZERODHA_ACCESS_TOKEN")
 
 class ZerodhaKite(BrokerInterface):
     """Zerodha Kite Connect API integration"""
