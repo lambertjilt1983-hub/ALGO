@@ -1,10 +1,14 @@
 import React, { useState, useEffect } from 'react';
-import PaperTradingDashboard from './PaperTradingDashboard';
 
 // Use environment-based API URL if available
 import config from '../config/api';
-const OPTION_SIGNALS_API = `${config.API_BASE_URL}/option-signals/intraday`;
+const OPTION_SIGNALS_API = `${config.API_BASE_URL}/option-signals/intraday-advanced`;
 const PROFESSIONAL_SIGNAL_API = `${config.API_BASE_URL}/strategies/live/professional-signal`;
+const PAPER_TRADES_ACTIVE_API = `${config.API_BASE_URL}/paper-trades/active`;
+const PAPER_TRADES_HISTORY_API = `${config.API_BASE_URL}/paper-trades/history`;
+const PAPER_TRADES_PERFORMANCE_API = `${config.API_BASE_URL}/paper-trades/performance`;
+const PAPER_TRADES_UPDATE_API = `${config.API_BASE_URL}/paper-trades/update-prices`;
+const PAPER_TRADES_CREATE_API = `${config.API_BASE_URL}/paper-trades`;
 
 const AutoTradingDashboard = () => {
   const [enabled, setEnabled] = useState(false);
@@ -24,8 +28,13 @@ const AutoTradingDashboard = () => {
   const [lotMultiplier, setLotMultiplier] = useState(1); // For quantity adjustment
   const [autoTradingActive, setAutoTradingActive] = useState(false);
   const [hasActiveTrade, setHasActiveTrade] = useState(false);
-  const [showPaperTrading, setShowPaperTrading] = useState(false);
-  const [lastLoggedSignal, setLastLoggedSignal] = useState(null);
+  const [lastPaperSignalSymbol, setLastPaperSignalSymbol] = useState(null);
+  const [confirmationMode, setConfirmationMode] = useState('balanced');
+  const [selectedSignalSymbol, setSelectedSignalSymbol] = useState(() => {
+    if (typeof window === 'undefined') return null;
+    return localStorage.getItem('selectedSignalSymbol');
+  });
+  const [signalsLoaded, setSignalsLoaded] = useState(false);
 
   // --- Professional Signal Integration ---
   const [professionalSignal, setProfessionalSignal] = useState(null);
@@ -46,11 +55,72 @@ const AutoTradingDashboard = () => {
 
   // Remove legacy fetchData logic (config references)
   const fetchData = async () => {
-    setLoading(false);
+    try {
+      // Update paper trade prices with LIVE data
+      await config.authFetch(PAPER_TRADES_UPDATE_API, { method: 'POST' });
+
+      const [activeRes, historyRes, perfRes] = await Promise.all([
+        config.authFetch(PAPER_TRADES_ACTIVE_API),
+        config.authFetch(`${PAPER_TRADES_HISTORY_API}?days=7&limit=100`),
+        config.authFetch(`${PAPER_TRADES_PERFORMANCE_API}?days=30`),
+      ]);
+
+      const activeData = activeRes.ok ? await activeRes.json() : { trades: [] };
+      const historyData = historyRes.ok ? await historyRes.json() : { trades: [] };
+      const perfData = perfRes.ok ? await perfRes.json() : null;
+
+      const active = activeData.trades || [];
+      const history = historyData.trades || [];
+
+      setActiveTrades(active);
+      setTradeHistory(history);
+      setReportSummary(perfData);
+      setHasActiveTrade(active.length > 0);
+
+      // Compute daily P&L from closed trades
+      const todayLabel = new Date().toDateString();
+      const dailyPnl = history
+        .filter((t) => {
+          const ts = t.exit_time || t.entry_time;
+          if (!ts) return false;
+          return new Date(ts).toDateString() === todayLabel;
+        })
+        .reduce((acc, t) => acc + Number(t.pnl ?? t.profit_loss ?? 0), 0);
+
+      const capitalInUse = active.reduce((acc, t) => acc + Number(t.entry_price ?? 0) * Number(t.quantity ?? 0), 0);
+
+      const targetPoints = Number(activeSignal?.target_points ?? 0) || (activeSignal && activeSignal.entry_price && activeSignal.target
+        ? Math.max(0, Number(activeSignal.target) - Number(activeSignal.entry_price))
+        : 25);
+
+      setStats({
+        daily_pnl: dailyPnl,
+        active_trades_count: active.length,
+        max_trades: 2,
+        target_points_per_trade: Math.round(targetPoints),
+        capital_in_use: capitalInUse,
+        remaining_capital: null,
+        portfolio_cap: null,
+      });
+    } catch (e) {
+      setActiveTrades([]);
+      setTradeHistory([]);
+      setReportSummary(null);
+    } finally {
+      setLoading(false);
+    }
   };
 
   // Remove legacy analyzeMarket logic (config references)
-  const analyzeMarket = async () => {};
+  const analyzeMarket = async () => {
+    if (!activeSignal) return;
+
+    // In demo mode, log paper trade and show live P&L
+    if (!autoTradingActive) {
+      await createPaperTradeFromSignal(activeSignal);
+      await fetchData();
+    }
+  };
 
   // Remove toggleMode, always live
   const toggleMode = () => {};
@@ -59,41 +129,149 @@ const AutoTradingDashboard = () => {
   useEffect(() => {
     const fetchOptionSignals = async () => {
       try {
-        const res = await fetch(OPTION_SIGNALS_API);
+        const res = await fetch(`${OPTION_SIGNALS_API}?mode=${encodeURIComponent(confirmationMode)}`);
         const data = await res.json();
         setOptionSignals(data.signals || []);
       } catch (e) {
         setOptionSignals([]);
+      } finally {
+        setSignalsLoaded(true);
       }
     };
     fetchOptionSignals();
-  }, []);
-  // Render option signals table
+  }, [confirmationMode]);
+
+  // Group signals by index to show CE and PE side-by-side
+  const groupedSignals = optionSignals.reduce((acc, signal) => {
+    // Filter out fake/invalid signals
+    if (signal.error) return acc;
+    if (!signal.symbol || !signal.index || !signal.strike) return acc;
+    if (!signal.entry_price || signal.entry_price <= 0) return acc;
+    if (!signal.target || signal.target <= 0) return acc;
+    if (!signal.stop_loss || signal.stop_loss <= 0) return acc;
+    if (!signal.confirmation_score && !signal.confidence) return acc;
+    
+    const key = signal.index;
+    if (!acc[key]) {
+      acc[key] = { ce: null, pe: null, strike: signal.strike, expiry: signal.expiry_date || signal.expiry_zone };
+    }
+    if (signal.option_type === 'CE') {
+      acc[key].ce = signal;
+    } else if (signal.option_type === 'PE') {
+      acc[key].pe = signal;
+    }
+    return acc;
+  }, {});
+
+  // Get selected signal from grouped signals
+  const selectedSignal = selectedSignalSymbol
+    ? optionSignals.find((s) => s.symbol === selectedSignalSymbol)
+    : null;
+
+  // Pick the best signal (highest confidence) from valid optionSignals only
+  const bestSignal = optionSignals.reduce((best, curr) => {
+    // Skip invalid signals
+    if (curr.error || !curr.symbol || !curr.entry_price || curr.entry_price <= 0) return best;
+    if (!curr.confirmation_score && !curr.confidence) return best;
+    
+    return (!best || ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence))) ? curr : best;
+  }, null);
+
+  const activeSignal = selectedSignal || bestSignal;
+
+  // Render option signals table - Side by side CE and PE
   const renderOptionSignalsTable = () => (
     <div style={{ margin: '32px 0' }}>
-      <h3>Intraday Option Signals</h3>
-      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '14px', background: 'white', borderRadius: '8px', overflow: 'hidden' }}>
+      <h3>📊 Intraday Option Signals (CE vs PE)</h3>
+      {Object.keys(groupedSignals).length === 0 && signalsLoaded && (
+        <div style={{ padding: '20px', background: '#fff3cd', border: '1px solid #ffc107', borderRadius: '4px', marginBottom: '16px' }}>
+          <strong>⚠️ No signals available</strong> - API may not have returned any data or all signals have errors.
+        </div>
+      )}
+      {!signalsLoaded && (
+        <div style={{ padding: '20px', background: '#d1ecf1', border: '1px solid #17a2b8', borderRadius: '4px', marginBottom: '16px' }}>
+          <strong>Loading signals...</strong>
+        </div>
+      )}
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px', background: 'white', borderRadius: '8px', overflow: 'hidden' }}>
         <thead>
           <tr style={{ background: '#f7fafc', borderBottom: '2px solid #e2e8f0' }}>
-            <th>Index</th>
-            <th>Strike</th>
-            <th>CE Signal</th>
-            <th>PE Signal</th>
-            <th>Sentiment</th>
-            <th>Expiry Zone</th>
-            <th>Risk Note</th>
+            <th style={{ padding: '12px', border: '1px solid #e2e8f0', textAlign: 'center' }}>Index</th>
+            <th style={{ padding: '12px', border: '1px solid #e2e8f0', textAlign: 'center', color: '#2d8a3f', fontWeight: '700' }}>📈 CALL (CE) - BUY</th>
+            <th style={{ padding: '12px', border: '1px solid #e2e8f0', textAlign: 'center', color: '#c92a2a', fontWeight: '700' }}>📉 PUT (PE) - BUY</th>
+            <th style={{ padding: '12px', border: '1px solid #e2e8f0', textAlign: 'center' }}>Strike</th>
+            <th style={{ padding: '12px', border: '1px solid #e2e8f0', textAlign: 'center' }}>Expiry</th>
           </tr>
         </thead>
         <tbody>
-          {optionSignals.map((s, idx) => (
-            <tr key={idx} style={{ borderBottom: '1px solid #e2e8f0' }}>
-              <td>{s.index}</td>
-              <td>{s.strike ?? '--'}</td>
-              <td>{s.ce_signal ?? '--'}</td>
-              <td>{s.pe_signal ?? '--'}</td>
-              <td>{s.sentiment ?? '--'}</td>
-              <td>{s.expiry_zone ?? '--'}</td>
-              <td>{s.risk_note ?? (s.error ? `Error: ${s.error}` : '--')}</td>
+          {Object.entries(groupedSignals).map(([index, data]) => (
+            <tr key={index} style={{ borderBottom: '1px solid #e2e8f0' }}>
+              <td style={{ padding: '12px', border: '1px solid #e2e8f0', fontWeight: '700', textAlign: 'center', color: '#2b6cb0' }}>{index}</td>
+              
+              {/* CALL (CE) Signal */}
+              <td style={{ padding: '10px', border: '1px solid #e2e8f0', textAlign: 'center', background: selectedSignalSymbol === data.ce?.symbol ? '#eff6ff' : 'white' }}>
+                {data.ce ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', alignItems: 'center' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+                      <input
+                        type="radio"
+                        name="signal_selection"
+                        checked={selectedSignalSymbol === data.ce.symbol}
+                        onChange={() => {
+                          setSelectedSignalSymbol(data.ce.symbol);
+                          localStorage.setItem('selectedSignalSymbol', data.ce.symbol);
+                        }}
+                        style={{ cursor: 'pointer', width: '16px', height: '16px' }}
+                      />
+                      <span style={{ color: '#2d8a3f', fontWeight: 'bold', fontSize: '12px' }}>SELECT</span>
+                    </label>
+                    <div style={{ fontSize: '12px', lineHeight: '1.4' }}>
+                      <div><strong>Entry:</strong> ₹{(data.ce.entry_price ?? 0).toFixed(2)}</div>
+                      <div><strong>Target:</strong> <span style={{ color: '#48bb78', fontWeight: 'bold' }}>₹{(data.ce.target ?? 0).toFixed(2)}</span></div>
+                      <div><strong>SL:</strong> <span style={{ color: '#f56565' }}>₹{(data.ce.stop_loss ?? 0).toFixed(2)}</span></div>
+                      <div style={{ marginTop: '4px', padding: '4px', borderRadius: '3px', background: Number(data.ce.confirmation_score ?? data.ce.confidence ?? 0) >= 85 ? '#c6f6d5' : Number(data.ce.confirmation_score ?? data.ce.confidence ?? 0) >= 75 ? '#feebc8' : '#fed7d7', color: Number(data.ce.confirmation_score ?? data.ce.confidence ?? 0) >= 85 ? '#22543d' : Number(data.ce.confirmation_score ?? data.ce.confidence ?? 0) >= 75 ? '#92400e' : '#742a2a', fontWeight: 'bold' }}>
+                        Conf: {(data.ce.confirmation_score ?? data.ce.confidence ?? 0).toFixed(1)}%
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <span style={{ color: '#cbd5e0' }}>No Signal</span>
+                )}
+              </td>
+              
+              {/* PUT (PE) Signal */}
+              <td style={{ padding: '10px', border: '1px solid #e2e8f0', textAlign: 'center', background: selectedSignalSymbol === data.pe?.symbol ? '#eff6ff' : 'white' }}>
+                {data.pe ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', alignItems: 'center' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+                      <input
+                        type="radio"
+                        name="signal_selection"
+                        checked={selectedSignalSymbol === data.pe.symbol}
+                        onChange={() => {
+                          setSelectedSignalSymbol(data.pe.symbol);
+                          localStorage.setItem('selectedSignalSymbol', data.pe.symbol);
+                        }}
+                        style={{ cursor: 'pointer', width: '16px', height: '16px' }}
+                      />
+                      <span style={{ color: '#c92a2a', fontWeight: 'bold', fontSize: '12px' }}>SELECT</span>
+                    </label>
+                    <div style={{ fontSize: '12px', lineHeight: '1.4' }}>
+                      <div><strong>Entry:</strong> ₹{(data.pe.entry_price ?? 0).toFixed(2)}</div>
+                      <div><strong>Target:</strong> <span style={{ color: '#48bb78', fontWeight: 'bold' }}>₹{(data.pe.target ?? 0).toFixed(2)}</span></div>
+                      <div><strong>SL:</strong> <span style={{ color: '#f56565' }}>₹{(data.pe.stop_loss ?? 0).toFixed(2)}</span></div>
+                      <div style={{ marginTop: '4px', padding: '4px', borderRadius: '3px', background: Number(data.pe.confirmation_score ?? data.pe.confidence ?? 0) >= 85 ? '#c6f6d5' : Number(data.pe.confirmation_score ?? data.pe.confidence ?? 0) >= 75 ? '#feebc8' : '#fed7d7', color: Number(data.pe.confirmation_score ?? data.pe.confidence ?? 0) >= 85 ? '#22543d' : Number(data.pe.confirmation_score ?? data.pe.confidence ?? 0) >= 75 ? '#92400e' : '#742a2a', fontWeight: 'bold' }}>
+                        Conf: {(data.pe.confirmation_score ?? data.pe.confidence ?? 0).toFixed(1)}%
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <span style={{ color: '#cbd5e0' }}>No Signal</span>
+                )}
+              </td>
+              
+              <td style={{ padding: '12px', border: '1px solid #e2e8f0', textAlign: 'center', fontWeight: '600' }}>{data.strike}</td>
+              <td style={{ padding: '12px', border: '1px solid #e2e8f0', textAlign: 'center', fontSize: '12px', color: '#666' }}>{data.expiry}</td>
             </tr>
           ))}
         </tbody>
@@ -101,18 +279,29 @@ const AutoTradingDashboard = () => {
     </div>
   );
 
-  // Pick the best signal (highest confidence) from optionSignals
-  const bestSignal = optionSignals.reduce((best, curr) =>
-    (!best || (curr.confidence > best.confidence)) ? curr : best, null
-  );
-
-  // Auto-execute the best signal if available and auto-trading is active
   useEffect(() => {
-    if (bestSignal && !executing && autoTradingActive && !hasActiveTrade) {
-      executeAutoTrade(bestSignal);
+    if (signalsLoaded && selectedSignalSymbol && !selectedSignal) {
+      setSelectedSignalSymbol(null);
+      localStorage.removeItem('selectedSignalSymbol');
     }
     // eslint-disable-next-line
-  }, [bestSignal, autoTradingActive, hasActiveTrade]);
+  }, [signalsLoaded, optionSignals, selectedSignalSymbol]);
+
+  useEffect(() => {
+    if (selectedSignalSymbol) {
+      localStorage.setItem('selectedSignalSymbol', selectedSignalSymbol);
+    } else {
+      localStorage.removeItem('selectedSignalSymbol');
+    }
+  }, [selectedSignalSymbol]);
+
+  // Auto-execute the selected/best signal if available and auto-trading is active
+  useEffect(() => {
+    if (activeSignal && !executing && autoTradingActive && !hasActiveTrade) {
+      executeAutoTrade(activeSignal);
+    }
+    // eslint-disable-next-line
+  }, [activeSignal, autoTradingActive, hasActiveTrade]);
 
   // Remove legacy toggleAutoTrading logic (config references)
   const toggleAutoTrading = async () => {};
@@ -175,6 +364,41 @@ const AutoTradingDashboard = () => {
     }
   };
 
+  const createPaperTradeFromSignal = async (signal) => {
+    if (!signal || !signal.symbol) return;
+    if (autoTradingActive) return;
+    if (activeTrades.length > 0) return;
+    if (lastPaperSignalSymbol === signal.symbol) return;
+
+    const payload = {
+      symbol: signal.symbol,
+      index_name: signal.index,
+      side: signal.action,
+      signal_type: 'intraday_option',
+      quantity: (signal.quantity || 1) * lotMultiplier,
+      entry_price: signal.entry_price,
+      stop_loss: signal.stop_loss,
+      target: signal.target,
+      strategy: signal.strategy || 'ATM Option',
+      signal_data: signal,
+    };
+
+    try {
+      const res = await config.authFetch(PAPER_TRADES_CREATE_API, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.success !== false) {
+          setLastPaperSignalSymbol(signal.symbol);
+        }
+      }
+    } catch (e) {
+      // ignore paper trade creation errors in demo mode
+    }
+  };
+
   // Arm live trading
   const armLiveTrading = async () => {
     const token = localStorage.getItem('access_token');
@@ -199,90 +423,32 @@ const AutoTradingDashboard = () => {
     }
   };
 
-  // Log paper trade when signal appears (if not auto-trading)
-  const logPaperTrade = async (signal) => {
-    try {
-      // Check if there's an active open trade - if yes, don't log new signal
-      const activesResponse = await fetch(`${config.API_BASE_URL}/paper-trades/active`);
-      const activesData = await activesResponse.json();
-      
-      if (activesData.success && activesData.trades && activesData.trades.length > 0) {
-        console.log('Active trade exists. Waiting for it to close before logging new signal.');
-        return; // Don't log new signal if one is already active
-      }
-
-      const response = await fetch(`${config.API_BASE_URL}/paper-trades`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          symbol: signal.symbol,
-          index_name: signal.index || signal.index_name,
-          side: signal.action,
-          signal_type: signal.signal_type || signal.type,
-          quantity: signal.quantity * lotMultiplier,
-          entry_price: signal.entry_price,
-          stop_loss: signal.stop_loss,
-          target: signal.target,
-          strategy: signal.strategy || 'professional',
-          signal_data: signal
-        })
-      });
-      
-      if (response.ok) {
-        console.log('Paper trade logged successfully for', signal.symbol);
-      }
-    } catch (error) {
-      console.error('Failed to log paper trade:', error);
-    }
-  };
-
-  // Auto-log paper trade when new signal appears and auto-trading is OFF
-  useEffect(() => {
-    if (bestSignal && !autoTradingActive) {
-      // Create unique signal key with timestamp to avoid duplicates
-      const signalKey = `${bestSignal.symbol}-${bestSignal.entry_price}-${bestSignal.action}-${Math.floor(Date.now() / 5000)}`;
-      if (lastLoggedSignal !== signalKey) {
-        logPaperTrade(bestSignal);
-        setLastLoggedSignal(signalKey);
-      }
-    }
-    // eslint-disable-next-line
-  }, [bestSignal, autoTradingActive]);
-
-  // When a trade closes, immediately try to log the next trade
-  useEffect(() => {
-    const handleTradeClosed = () => {
-      console.log('Trade closed event received - attempting to log next trade');
-      setHasActiveTrade(false);
-      setLastLoggedSignal(null); // Reset to allow same signal to log again
-      
-      // If auto-trading is OFF and there's a signal, log it immediately
-      if (bestSignal && !autoTradingActive) {
-        setTimeout(() => {
-          console.log('Logging next trade after closure:', bestSignal.symbol);
-          logPaperTrade(bestSignal);
-        }, 1000); // 1 second delay to ensure backend state is updated
-      }
-    };
-    
-    window.addEventListener('tradeClosedEvent', handleTradeClosed);
-    return () => window.removeEventListener('tradeClosedEvent', handleTradeClosed);
-  }, [bestSignal, autoTradingActive]);
-
   useEffect(() => {
     fetchData();
     analyzeMarket();
 
-    // Auto-refresh every 10 seconds
+    // Auto-refresh every 1 second for live updates
     const interval = setInterval(() => {
       fetchData();
       if (enabled) {
         analyzeMarket();
       }
-    }, 10000);
+    }, 1000);
 
     return () => clearInterval(interval);
   }, [enabled]);
+
+  useEffect(() => {
+    if (activeSignal?.entry_price) {
+      setLivePrice(activeSignal.entry_price);
+    }
+  }, [activeSignal]);
+
+  useEffect(() => {
+    if (!autoTradingActive && activeSignal && signalsLoaded) {
+      createPaperTradeFromSignal(activeSignal);
+    }
+  }, [autoTradingActive, activeSignal, signalsLoaded, activeTrades.length, lotMultiplier]);
 
   if (loading) {
     return (
@@ -503,7 +669,7 @@ const AutoTradingDashboard = () => {
     </div>
 
       {/* Market Analysis */}
-      {bestSignal && (
+      {activeSignal && (
         <div style={{
           padding: '24px',
           background: 'linear-gradient(135deg, #fef5e7 0%, #fdebd0 100%)',
@@ -524,25 +690,25 @@ const AutoTradingDashboard = () => {
                 fontSize: '18px',
                 fontWeight: 'bold'
               }}>
-                🎯 AI Recommendation (1 best signal)
+                {selectedSignal ? `🎯 Selected Signal ${activeSignal.option_type === 'CE' ? '📈 (CALL)' : '📉 (PUT)'}` : '🎯 AI Recommendation (best signal)'}
               </h4>
-              <div style={{
-                display: 'flex',
-                gap: '16px',
-                fontSize: '14px',
-                color: '#92400e',
-                flexWrap: 'wrap'
-              }}>
-                <span>
-                  <strong>Strategy:</strong>{' '}
-                  <span style={{
-                    padding: '2px 8px',
-                    borderRadius: '4px',
-                    background: '#667eea',
-                    color: 'white',
-                    fontWeight: '600'
+                  <div style={{
+                    display: 'flex',
+                    gap: '16px',
+                    fontSize: '14px',
+                    color: '#92400e',
+                    flexWrap: 'wrap'
                   }}>
-                    {bestSignal.strategy || 'Best Match'}
+                    <span>
+                      <strong>Strategy:</strong>{' '}
+                      <span style={{
+                        padding: '2px 8px',
+                        borderRadius: '4px',
+                        background: '#667eea',
+                        color: 'white',
+                        fontWeight: '600'
+                      }}>
+                        {activeSignal.strategy || 'Best Match'}
                   </span>
                 </span>
                 <span>
@@ -550,15 +716,26 @@ const AutoTradingDashboard = () => {
                   <span style={{
                     padding: '2px 8px',
                     borderRadius: '4px',
-                    background: bestSignal.action === 'BUY' ? '#48bb78' : '#f56565',
+                    background: activeSignal.action === 'BUY' ? '#48bb78' : '#f56565',
                     color: 'white',
                     fontWeight: 'bold'
                   }}>
-                    {bestSignal.action}
+                    {activeSignal.action}
                   </span>
                 </span>
-                <span><strong>Symbol:</strong> {bestSignal.symbol}</span>
-                <span><strong>Confidence:</strong> {bestSignal.confidence}%</span>
+                <span><strong>Symbol:</strong> {activeSignal.symbol}</span>
+                <span>
+                  <strong>Confidence:</strong>{' '}
+                  <span style={{
+                    padding: '2px 8px',
+                    borderRadius: '4px',
+                    background: Number(activeSignal.confirmation_score ?? activeSignal.confidence) >= 85 ? '#c6f6d5' : Number(activeSignal.confirmation_score ?? activeSignal.confidence) >= 75 ? '#feebc8' : '#fed7d7',
+                    color: Number(activeSignal.confirmation_score ?? activeSignal.confidence) >= 85 ? '#22543d' : Number(activeSignal.confirmation_score ?? activeSignal.confidence) >= 75 ? '#92400e' : '#742a2a',
+                    fontWeight: '600'
+                  }}>
+                    {(activeSignal.confirmation_score ?? activeSignal.confidence ?? 0).toFixed(1)}%
+                  </span>
+                </span>
                 <span style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                   <strong>Quantity:</strong>
                   <button
@@ -583,7 +760,7 @@ const AutoTradingDashboard = () => {
                     minWidth: '80px',
                     textAlign: 'center'
                   }}>
-                    {bestSignal.quantity * lotMultiplier}
+                    {activeSignal.quantity * lotMultiplier}
                   </span>
                   <button
                     onClick={() => setLotMultiplier(lotMultiplier + 1)}
@@ -601,7 +778,7 @@ const AutoTradingDashboard = () => {
                   </button>
                   <span style={{ fontSize: '12px', color: '#718096' }}>({lotMultiplier} lots)</span>
                 </span>
-                <span><strong>Expiry:</strong> {bestSignal.expiry_date || bestSignal.expiry}</span>
+                <span><strong>Expiry:</strong> {activeSignal.expiry_date || activeSignal.expiry}</span>
               </div>
             </div>
             <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
@@ -653,45 +830,45 @@ const AutoTradingDashboard = () => {
                 🔴 Live Entry Price
               </div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#1a202c' }}>
-                ₹{bestSignal.entry_price?.toFixed(2) ?? '--'}
+                ₹{activeSignal.entry_price?.toFixed(2) ?? '--'}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>
-                Target (+{bestSignal.target_points ?? 25}pts)
+                Target (+{activeSignal.target_points ?? 25}pts)
               </div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#48bb78' }}>
-                ₹{bestSignal.target?.toFixed(2) ?? '--'}
+                ₹{activeSignal.target?.toFixed(2) ?? '--'}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Stop Loss (-20pts)</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#f56565' }}>
-                ₹{bestSignal.stop_loss?.toFixed(2) ?? '--'}
+                ₹{activeSignal.stop_loss?.toFixed(2) ?? '--'}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Potential Profit</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#38a169' }}>
-                ₹{((bestSignal.target - bestSignal.entry_price) * bestSignal.quantity * lotMultiplier)?.toLocaleString() ?? '--'}
+                ₹{((activeSignal.target - activeSignal.entry_price) * activeSignal.quantity * lotMultiplier)?.toLocaleString() ?? '--'}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Max Risk</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#e53e3e' }}>
-                ₹{((bestSignal.entry_price - bestSignal.stop_loss) * bestSignal.quantity * lotMultiplier)?.toLocaleString() ?? '--'}
+                ₹{((activeSignal.entry_price - activeSignal.stop_loss) * activeSignal.quantity * lotMultiplier)?.toLocaleString() ?? '--'}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Quantity</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#5a67d8' }}>
-                {bestSignal.quantity * lotMultiplier}
+                {activeSignal.quantity * lotMultiplier}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Expiry Date</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#2d3748' }}>
-                {bestSignal.expiry_date || 'N/A'}
+                {activeSignal.expiry_date || 'N/A'}
               </div>
             </div>
           </div>
@@ -775,6 +952,89 @@ const AutoTradingDashboard = () => {
       )}
 
       {/* Active Trades */}
+      {activeTrades.length > 0 && (
+        <div style={{ marginBottom: '24px' }}>
+          <h4 style={{
+            margin: '0 0 16px 0',
+            color: '#2d3748',
+            fontSize: '18px',
+            fontWeight: 'bold'
+          }}>
+            ⚡ Active Trades (LIVE P&L)
+          </h4>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{
+              width: '100%',
+              borderCollapse: 'collapse',
+              fontSize: '13px',
+              background: 'white',
+              borderRadius: '8px',
+              overflow: 'hidden'
+            }}>
+              <thead>
+                <tr style={{ background: '#f7fafc', borderBottom: '2px solid #e2e8f0' }}>
+                  <th style={{ padding: '10px', textAlign: 'left' }}>Symbol</th>
+                  <th style={{ padding: '10px', textAlign: 'left' }}>Action</th>
+                  <th style={{ padding: '10px', textAlign: 'right' }}>Entry</th>
+                  <th style={{ padding: '10px', textAlign: 'right' }}>Current</th>
+                  <th style={{ padding: '10px', textAlign: 'right' }}>P&L</th>
+                  <th style={{ padding: '10px', textAlign: 'right' }}>%</th>
+                  <th style={{ padding: '10px', textAlign: 'right' }}>Qty</th>
+                  <th style={{ padding: '10px', textAlign: 'left' }}>Opened</th>
+                </tr>
+              </thead>
+              <tbody>
+                {activeTrades.map((trade) => {
+                  const entry = Number(trade.entry_price || 0);
+                  const current = Number(trade.current_price ?? entry);
+                  const pnl = Number(trade.pnl ?? 0);
+                  const pnlPct = Number(trade.pnl_percentage ?? 0);
+                  const action = trade.side || 'BUY';
+                  return (
+                    <tr key={trade.id} style={{ borderBottom: '1px solid #e2e8f0' }}>
+                      <td style={{ padding: '10px', fontWeight: '600' }}>{trade.symbol}</td>
+                      <td style={{ padding: '10px' }}>
+                        <span style={{
+                          padding: '2px 6px',
+                          borderRadius: '3px',
+                          background: action === 'BUY' ? '#c6f6d5' : '#fed7d7',
+                          color: action === 'BUY' ? '#22543d' : '#742a2a',
+                          fontSize: '11px',
+                          fontWeight: 'bold'
+                        }}>
+                          {action}
+                        </span>
+                      </td>
+                      <td style={{ padding: '10px', textAlign: 'right' }}>₹{entry.toFixed(2)}</td>
+                      <td style={{ padding: '10px', textAlign: 'right' }}>₹{current.toFixed(2)}</td>
+                      <td style={{
+                        padding: '10px',
+                        textAlign: 'right',
+                        fontWeight: '700',
+                        color: pnl >= 0 ? '#48bb78' : '#f56565'
+                      }}>
+                        {pnl >= 0 ? '+' : ''}₹{pnl.toLocaleString()}
+                      </td>
+                      <td style={{
+                        padding: '10px',
+                        textAlign: 'right',
+                        fontWeight: '600',
+                        color: pnlPct >= 0 ? '#48bb78' : '#f56565'
+                      }}>
+                        {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%
+                      </td>
+                      <td style={{ padding: '10px', textAlign: 'right' }}>{trade.quantity}</td>
+                      <td style={{ padding: '10px', fontSize: '11px', color: '#718096' }}>
+                        {trade.entry_time ? new Date(trade.entry_time).toLocaleString() : '-'}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       {/* Trade History */}
       {tradeHistory.length > 0 && (
@@ -905,124 +1165,6 @@ const AutoTradingDashboard = () => {
         </div>
       )}
       
-      {/* Show Demo Trades if available */}
-      {activeTrades.length === 0 && analysis && analysis.demo_trades && analysis.demo_trades.length > 0 && (
-        <div style={{
-          background: 'white',
-          borderRadius: '12px',
-          padding: '24px',
-          marginBottom: '24px',
-          border: '2px solid #4299e1'
-        }}>
-          <h4 style={{
-            margin: '0 0 16px 0',
-            color: '#2d3748',
-            fontSize: '18px',
-            fontWeight: 'bold',
-            display: 'flex',
-            alignItems: 'center',
-            gap: '8px'
-          }}>
-            🎯 Demo Trades - Expected Performance
-            <span style={{
-              fontSize: '12px',
-              padding: '3px 10px',
-              borderRadius: '12px',
-              background: '#4299e1',
-              color: 'white',
-              fontWeight: '600'
-            }}>
-              SIMULATED
-            </span>
-          </h4>
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '14px' }}>
-              <thead>
-                <tr style={{ background: '#f7fafc', borderBottom: '2px solid #e2e8f0' }}>
-                  <th style={{ padding: '12px', textAlign: 'left' }}>Symbol</th>
-                  <th style={{ padding: '12px', textAlign: 'left' }}>Action</th>
-                  <th style={{ padding: '12px', textAlign: 'right' }}>Entry</th>
-                  <th style={{ padding: '12px', textAlign: 'right' }}>Current</th>
-                  <th style={{ padding: '12px', textAlign: 'right' }}>Target</th>
-                  <th style={{ padding: '12px', textAlign: 'right' }}>Qty</th>
-                  <th style={{ padding: '12px', textAlign: 'right' }}>Current P&L</th>
-                  <th style={{ padding: '12px', textAlign: 'right' }}>Expected Profit</th>
-                  <th style={{ padding: '12px', textAlign: 'right' }}>Max Loss</th>
-                </tr>
-              </thead>
-              <tbody>
-                {analysis.demo_trades.map((trade, idx) => (
-                  <tr key={idx} style={{ borderBottom: '1px solid #e2e8f0' }}>
-                    <td style={{ padding: '12px', fontWeight: '600' }}>{trade.symbol}</td>
-                    <td style={{ padding: '12px' }}>
-                      <span style={{
-                        padding: '3px 8px',
-                        borderRadius: '4px',
-                        background: trade.action === 'BUY' ? '#48bb78' : '#f56565',
-                        color: 'white',
-                        fontSize: '12px',
-                        fontWeight: '600'
-                      }}>
-                        {trade.action}
-                      </span>
-                    </td>
-                    <td style={{ padding: '12px', textAlign: 'right' }}>₹{trade.entry_price}</td>
-                    <td style={{ padding: '12px', textAlign: 'right', fontWeight: '600' }}>₹{trade.current_price}</td>
-                    <td style={{ padding: '12px', textAlign: 'right' }}>₹{trade.target}</td>
-                    <td style={{ padding: '12px', textAlign: 'right' }}>{trade.quantity}</td>
-                    <td style={{
-                      padding: '12px',
-                      textAlign: 'right',
-                      fontWeight: 'bold',
-                      color: trade.unrealized_pnl >= 0 ? '#48bb78' : '#f56565'
-                    }}>
-                      ₹{trade.unrealized_pnl.toLocaleString()} ({trade.pnl_percentage >= 0 ? '+' : ''}{trade.pnl_percentage}%)
-                    </td>
-                    <td style={{
-                      padding: '12px',
-                      textAlign: 'right',
-                      fontWeight: 'bold',
-                      color: '#48bb78'
-                    }}>
-                      +₹{trade.target_profit.toLocaleString()}
-                    </td>
-                    <td style={{
-                      padding: '12px',
-                      textAlign: 'right',
-                      fontWeight: 'bold',
-                      color: '#f56565'
-                    }}>
-                      -₹{trade.max_loss.toLocaleString()}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-              <tfoot>
-                <tr style={{ background: '#f7fafc', borderTop: '2px solid #e2e8f0', fontWeight: 'bold' }}>
-                  <td colSpan="6" style={{ padding: '12px' }}>TOTAL</td>
-                  <td style={{
-                    padding: '12px',
-                    textAlign: 'right',
-                    color: analysis.demo_trades.reduce((sum, t) => sum + t.unrealized_pnl, 0) >= 0 ? '#48bb78' : '#f56565',
-                    fontSize: '16px'
-                  }}>
-                    ₹{analysis.demo_trades.reduce((sum, t) => sum + t.unrealized_pnl, 0).toLocaleString()}
-                  </td>
-                  <td style={{ padding: '12px', textAlign: 'right', color: '#48bb78', fontSize: '16px' }}>
-                    +₹{analysis.demo_trades.reduce((sum, t) => sum + t.target_profit, 0).toLocaleString()}
-                  </td>
-                  <td style={{ padding: '12px', textAlign: 'right', color: '#f56565', fontSize: '16px' }}>
-                    -₹{analysis.demo_trades.reduce((sum, t) => sum + t.max_loss, 0).toLocaleString()}
-                  </td>
-                </tr>
-              </tfoot>
-            </table>
-          </div>
-          <p style={{ margin: '16px 0 0 0', fontSize: '13px', color: '#718096', fontStyle: 'italic' }}>
-            💡 These are simulated trades using real market data. Enable auto-trading to execute real trades (in selected mode).
-          </p>
-        </div>
-      )}
 
       {activeTab === 'report' && (
         <div style={{
@@ -1212,32 +1354,6 @@ const AutoTradingDashboard = () => {
         </div>
       )}
       
-      {/* Paper Trading Performance Section */}
-      <div style={{ marginTop: '32px', marginBottom: '16px' }}>
-        <button
-          onClick={() => setShowPaperTrading(!showPaperTrading)}
-          style={{
-            width: '100%',
-            padding: '16px',
-            background: showPaperTrading ? 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)' : 'linear-gradient(135deg, #4299e1 0%, #3182ce 100%)',
-            color: 'white',
-            border: 'none',
-            borderRadius: '12px',
-            fontSize: '16px',
-            fontWeight: 'bold',
-            cursor: 'pointer',
-            boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
-            display: 'flex',
-            justifyContent: 'space-between',
-            alignItems: 'center'
-          }}
-        >
-          <span>📊 {showPaperTrading ? 'Hide' : 'Show'} Paper Trading Performance</span>
-          <span style={{ fontSize: '20px' }}>{showPaperTrading ? '▼' : '▶'}</span>
-        </button>
-      </div>
-      
-      {showPaperTrading && <PaperTradingDashboard />}
     </div>
   );
 }

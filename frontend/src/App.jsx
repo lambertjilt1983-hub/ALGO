@@ -401,8 +401,17 @@ export default function App() {
     <Routes>
       <Route path="/autotrading" element={
         <div>
-          <div style={{ padding: '20px', background: 'yellow', margin: '10px' }}>
-            🔍 AutoTradingDashboard Route Matched!
+          <div style={{ 
+            padding: '30px', 
+            background: '#dc2626', 
+            margin: '10px',
+            textAlign: 'center',
+            fontSize: '28px',
+            fontWeight: 'bold',
+            color: 'white',
+            borderRadius: '8px'
+          }}>
+            🚀 AutoTradingDashboard !
           </div>
           <AutoTradingDashboard />
         </div>

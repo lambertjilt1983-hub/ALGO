@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.strategies.market_intelligence import trend_analyzer
+from app.engine.option_signal_generator import generate_signals, select_best_signal
 from app.core.database import SessionLocal
 from app.models.trading import TradeReport
 from sqlalchemy import func
@@ -446,20 +447,58 @@ def _signal_from_index(symbol: str, data: Dict[str, any], instrument_type: str, 
 
 
 async def _live_signals(symbols: List[str], instrument_type: str, qty_override: Optional[int], balance: float) -> tuple[List[Dict], str]:
-    trends = await trend_analyzer.get_market_trends()
-    indices = trends.get("indices", {}) if trends else {}
-    data_source = "live"
+    print(f"[_live_signals] Generating signals for symbols: {symbols}, instrument: {instrument_type}")
+    data_source = "zerodha_option_chain"
+
+    option_signals = generate_signals()
+    if not option_signals:
+        return [], data_source
 
     signals: List[Dict] = []
-    for symbol in symbols:
-        data = indices.get(symbol)
-        if not data:
+    for raw in option_signals:
+        if raw.get("error"):
             continue
-        sig = _signal_from_index(symbol, data, instrument_type, qty_override, balance)
-        if sig:
-            sig["data_source"] = data_source
-            signals.append(sig)
+        index = (raw.get("index") or "").upper()
+        if symbols and index not in symbols:
+            continue
 
+        entry_price = float(raw.get("entry_price") or 0)
+        target = float(raw.get("target") or 0)
+        stop_loss = float(raw.get("stop_loss") or 0)
+        qty = int(qty_override or raw.get("quantity") or 1)
+        if entry_price <= 0 or target <= 0 or stop_loss <= 0:
+            continue
+
+        action = (raw.get("action") or "BUY").upper()
+        symbol = raw.get("symbol") or index
+        capital_required = round(entry_price * qty, 2)
+        target_points = round(target - entry_price, 2)
+
+        sig = {
+            "action": action,
+            "symbol": symbol,
+            "index": index,
+            "confidence": raw.get("confidence", 0),
+            "strategy": raw.get("strategy", "ATM Option"),
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "target": target,
+            "quantity": qty,
+            "capital_required": capital_required,
+            "potential_profit": round((target - entry_price) * qty, 2),
+            "risk": round((entry_price - stop_loss) * qty, 2),
+            "expiry": raw.get("expiry_date") or raw.get("expiry"),
+            "expiry_date": raw.get("expiry_date") or raw.get("expiry"),
+            "underlying_price": entry_price,
+            "target_points": target_points,
+            "data_source": data_source,
+        }
+        signals.append(sig)
+        print(f"[_live_signals] ✓ Signal generated for {index}: {action} {symbol} @ ₹{entry_price}")
+
+    # Sort by confidence so best is first for recommendation
+    signals.sort(key=lambda s: s.get("confidence", 0), reverse=True)
+    print(f"[_live_signals] ✓ Generated {len(signals)} signals total")
     return signals, data_source
 
 
@@ -545,6 +584,7 @@ async def analyze(
     quantity: Optional[int] = None,
     authorization: Optional[str] = Header(None),
 ):
+    print(f"\n[API /analyze] Called with: symbols={symbols}, balance={balance}, mode={'LIVE' if balance > 0 else 'DEMO'}")
     auto_demo = balance <= 0
     state["is_demo_mode"] = auto_demo
 
@@ -647,6 +687,9 @@ async def execute(
     state["is_demo_mode"] = auto_demo
     mode = "DEMO" if auto_demo else "LIVE"
 
+    print(f"\n[API /execute] Called - {mode} TRADE")
+    print(f"[API /execute] Symbol: {trade.symbol}, Side: {trade.side}, Price: {trade.price}, Qty: {trade.quantity or 1}")
+
     if not state.get("live_armed") and not auto_demo:
         raise HTTPException(status_code=400, detail="Live trading not armed. Call /autotrade/arm first.")
 
@@ -700,6 +743,8 @@ async def execute(
     # --- REAL ZERODHA ORDER PLACEMENT ---
     # Map your signal to the correct Zerodha symbol (tradingsymbol)
     zerodha_symbol = trade.symbol  # You may need to convert to e.g. 'BANKNIFTY24FEB48000CE'
+    print(f"[API /execute] ▶ Placing {mode} order to Zerodha...")
+    print(f"[API /execute] ▶ Order Details: {zerodha_symbol}, {trade.quantity or 1} qty, {trade.side} at ₹{trade.price}")
     real_order = place_zerodha_order(
         symbol=zerodha_symbol,
         quantity=trade.quantity or 1,
@@ -709,9 +754,11 @@ async def execute(
         exchange="NFO"  # Use 'NFO' for options
     )
     if real_order["success"]:
+        print(f"[API /execute] ✓ Zerodha order ACCEPTED - Order ID: {real_order.get('order_id', 'N/A')}")
         broker_response = real_order
         active_trades.append(trade_obj)
     else:
+        print(f"[API /execute] ✗ Zerodha order REJECTED - Error: {real_order.get('error', 'Unknown')}")
         return {
             "success": False,
             "message": real_order["error"],
@@ -733,6 +780,7 @@ async def execute(
 
 @router.get("/trades/active")
 async def get_active_trades(authorization: Optional[str] = Header(None)):
+    print(f"[API /trades/active] Returning {len(active_trades)} active trades from Zerodha")
     trades = active_trades
     return {"trades": trades, "is_demo_mode": False, "count": len(trades)}
 
@@ -885,16 +933,35 @@ async def trade_report(
 
 @router.get("/market/indices")
 async def market_indices():
+    """Return LIVE market indices from Zerodha (real broker connected)."""
+    print("\n[API /market/indices] Called - fetching LIVE data from Zerodha...")
     trends = await trend_analyzer.get_market_trends()
     indices = trends.get("indices", {}) if trends else {}
+    
+    if not indices:
+        print("[API /market/indices] ⚠ WARNING: No indices data - broker may not be connected!")
+    else:
+        print(f"[API /market/indices] ✓ Got indices: {list(indices.keys())}")
+    
     payload = [
-        {"symbol": sym, "price": data.get("current"), "change_pct": data.get("change_percent")}
+        {
+            "symbol": sym, 
+            "price": data.get("current"), 
+            "change_pct": data.get("change_percent"),
+            "trend": data.get("trend"),
+            "source": "zerodha_live"
+        }
         for sym, data in indices.items()
     ]
-    return {
+    
+    response = {
         "indices": payload,
         "timestamp": _now(),
+        "count": len(payload),
+        "source": "zerodha" if payload else "none"
     }
+    print(f"[API /market/indices] ✓ Response: indices={len(payload)}, timestamp={response['timestamp']}")
+    return response
 
 
 @router.post("/monitor")

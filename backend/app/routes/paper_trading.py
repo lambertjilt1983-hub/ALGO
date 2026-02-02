@@ -310,32 +310,89 @@ def close_all_open_trades(db: Session = Depends(get_db)):
 
 @router.post("/paper-trades/update-prices")
 def update_all_prices(db: Session = Depends(get_db)):
-    """Update current prices for all open paper trades and auto-close on SL/Target"""
-    import random
-    
+    """Update current prices for all open paper trades using LIVE Zerodha data."""
+    from app.engine.option_signal_generator import _get_kite
+
+    def _quote_symbol(trade_symbol: str, index_name: str | None = None) -> str:
+        if ":" in trade_symbol:
+            return trade_symbol
+        upper = trade_symbol.upper()
+        if upper.endswith("CE") or upper.endswith("PE"):
+            return f"NFO:{upper}"
+        if index_name:
+            idx = index_name.upper()
+            if idx == "BANKNIFTY":
+                return "NSE:NIFTY BANK"
+            if idx == "NIFTY":
+                return "NSE:NIFTY 50"
+            if idx == "FINNIFTY":
+                return "NSE:FINNIFTY"
+            if idx == "SENSEX":
+                return "BSE:SENSEX"
+        return f"NSE:{upper}"
+
+    kite = _get_kite()
+    if not kite:
+        return {
+            "success": False,
+            "message": "Zerodha credentials missing or invalid",
+            "updated_count": 0,
+            "closed_count": 0,
+            "total_open": 0,
+        }
+
     open_trades = db.query(PaperTrade).filter(PaperTrade.status == "OPEN").all()
     updated_count = 0
     closed_count = 0
-    
+
     for trade in open_trades:
         try:
-            # Realistic price movement - smaller increments (0-1%) for more frequent updates
-            entry_to_target = trade.target - trade.entry_price if trade.target else 0
-            entry_to_sl = trade.entry_price - trade.stop_loss if trade.side == "BUY" else trade.stop_loss - trade.entry_price
-            
-            # Weighted random walk - favors moving toward target
-            movement_factor = random.uniform(-0.005, 0.01)  # -0.5% to +1%
-            movement = movement_factor * abs(entry_to_target) if entry_to_target != 0 else movement_factor * trade.entry_price * 0.02
-            
-            new_price = trade.current_price + movement
-            
-            # Ensure price stays in reasonable range
-            min_bound = min(trade.stop_loss, trade.entry_price) * 0.99
-            max_bound = max(trade.target if trade.target else trade.entry_price, trade.entry_price) * 1.01
-            
-            # Check if we've hit SL FIRST (priority over target)
+            quote_symbol = _quote_symbol(trade.symbol, trade.index_name)
+            quote = kite.ltp([quote_symbol])
+            data = quote.get(quote_symbol) or {}
+            live_price = data.get("last_price")
+            if live_price is None:
+                continue
+
+            new_price = float(live_price)
+
+            # Implement trailing stop loss logic
+            # Move stop loss in favorable direction to lock in profits
             if trade.side == "BUY":
-                if new_price <= trade.stop_loss:
+                # For BUY trades: if price moves up, trail stop loss upward
+                if trade.stop_loss is not None:
+                    # Calculate profit points
+                    profit_points = new_price - trade.entry_price
+                    
+                    # If in profit by more than 10 points, activate trailing SL
+                    if profit_points > 10:
+                        # Trail SL at 50% of profit (lock in half the profit)
+                        new_trailing_sl = trade.entry_price + (profit_points * 0.5)
+                        
+                        # Only move SL up, never down
+                        if new_trailing_sl > trade.stop_loss:
+                            trade.stop_loss = round(new_trailing_sl, 2)
+                            print(f"📈 Trailing SL updated for trade {trade.id}: BUY {trade.symbol} - New SL: {trade.stop_loss}")
+            
+            else:  # SELL
+                # For SELL trades: if price moves down, trail stop loss downward
+                if trade.stop_loss is not None:
+                    # Calculate profit points (for SELL, profit when price goes down)
+                    profit_points = trade.entry_price - new_price
+                    
+                    # If in profit by more than 10 points, activate trailing SL
+                    if profit_points > 10:
+                        # Trail SL at 50% of profit
+                        new_trailing_sl = trade.entry_price - (profit_points * 0.5)
+                        
+                        # Only move SL down, never up (for SELL trades)
+                        if new_trailing_sl < trade.stop_loss:
+                            trade.stop_loss = round(new_trailing_sl, 2)
+                            print(f"📉 Trailing SL updated for trade {trade.id}: SELL {trade.symbol} - New SL: {trade.stop_loss}")
+
+            # Check SL/Target using live price
+            if trade.side == "BUY":
+                if trade.stop_loss is not None and new_price <= trade.stop_loss:
                     new_price = trade.stop_loss
                     trade.status = "SL_HIT"
                     trade.exit_price = trade.stop_loss
@@ -343,7 +400,7 @@ def update_all_prices(db: Session = Depends(get_db)):
                     trade.pnl = (trade.stop_loss - trade.entry_price) * trade.quantity
                     trade.pnl_percentage = (trade.pnl / (trade.entry_price * trade.quantity)) * 100
                     closed_count += 1
-                elif new_price >= trade.target:
+                elif trade.target is not None and new_price >= trade.target:
                     new_price = trade.target
                     trade.status = "TARGET_HIT"
                     trade.exit_price = trade.target
@@ -352,7 +409,7 @@ def update_all_prices(db: Session = Depends(get_db)):
                     trade.pnl_percentage = (trade.pnl / (trade.entry_price * trade.quantity)) * 100
                     closed_count += 1
             else:  # SELL
-                if new_price >= trade.stop_loss:
+                if trade.stop_loss is not None and new_price >= trade.stop_loss:
                     new_price = trade.stop_loss
                     trade.status = "SL_HIT"
                     trade.exit_price = trade.stop_loss
@@ -360,7 +417,7 @@ def update_all_prices(db: Session = Depends(get_db)):
                     trade.pnl = (trade.entry_price - trade.stop_loss) * trade.quantity
                     trade.pnl_percentage = (trade.pnl / (trade.entry_price * trade.quantity)) * 100
                     closed_count += 1
-                elif new_price <= trade.target:
+                elif trade.target is not None and new_price <= trade.target:
                     new_price = trade.target
                     trade.status = "TARGET_HIT"
                     trade.exit_price = trade.target
@@ -368,33 +425,29 @@ def update_all_prices(db: Session = Depends(get_db)):
                     trade.pnl = (trade.entry_price - trade.target) * trade.quantity
                     trade.pnl_percentage = (trade.pnl / (trade.entry_price * trade.quantity)) * 100
                     closed_count += 1
-            
-            # If not closed, keep price within bounds
-            if trade.status == "OPEN":
-                new_price = max(min_bound, min(new_price, max_bound))
-                trade.current_price = new_price
-                
-                # Calculate P&L while still open
-                if trade.side == "BUY":
-                    trade.pnl = (trade.current_price - trade.entry_price) * trade.quantity
-                else:
-                    trade.pnl = (trade.entry_price - trade.current_price) * trade.quantity
-                
-                trade.pnl_percentage = (trade.pnl / (trade.entry_price * trade.quantity)) * 100 if trade.entry_price > 0 else 0
-            
+
+            trade.current_price = new_price
+
+            # Calculate P&L while still open or at exit
+            if trade.side == "BUY":
+                trade.pnl = (trade.current_price - trade.entry_price) * trade.quantity
+            else:
+                trade.pnl = (trade.entry_price - trade.current_price) * trade.quantity
+
+            trade.pnl_percentage = (trade.pnl / (trade.entry_price * trade.quantity)) * 100 if trade.entry_price > 0 else 0
             updated_count += 1
         except Exception as e:
             print(f"Error updating paper trade {trade.id}: {e}")
             continue
-    
+
     db.commit()
-    
+
     return {
         "success": True,
         "updated_count": updated_count,
         "closed_count": closed_count,
         "total_open": len([t for t in open_trades if t.status == "OPEN"]),
-        "message": f"Updated {updated_count} trades, closed {closed_count}"
+        "message": f"Updated {updated_count} trades, closed {closed_count}",
     }
 
 
