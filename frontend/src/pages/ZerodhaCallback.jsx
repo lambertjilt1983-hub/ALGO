@@ -1,8 +1,6 @@
 import { useEffect } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-
-// Replace with your actual backend URL and broker_id
-const BACKEND_URL = "http://localhost:8000/api/tokens/refresh/1";
+import config from "../config/api";
 
 export default function ZerodhaCallback() {
   const [searchParams] = useSearchParams();
@@ -10,19 +8,28 @@ export default function ZerodhaCallback() {
 
   useEffect(() => {
     const requestToken = searchParams.get("request_token");
+    const state = searchParams.get("state");
+    const storedBrokerId = localStorage.getItem('zerodha_last_broker_id');
+    const parsedBrokerId = state?.includes(':') ? state.split(':')[1] : state;
+    const brokerId = parsedBrokerId || storedBrokerId;
     if (!requestToken) {
       alert("No request_token found in callback URL.");
       navigate("/");
       return;
     }
+    if (!brokerId) {
+      alert("Missing broker id for Zerodha token refresh. Please retry login from Brokers page.");
+      navigate("/brokers");
+      return;
+    }
+    const token = localStorage.getItem('access_token');
 
     // Send request_token to backend to refresh Zerodha access token
-    fetch(BACKEND_URL, {
+    fetch(`${config.API_BASE_URL}/api/tokens/refresh/${brokerId}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        // Add Authorization header if required
-        // "Authorization": `Bearer ${your_jwt_token}`,
+        "Authorization": `Bearer ${token}`,
       },
       body: JSON.stringify({ request_token: requestToken }),
     })

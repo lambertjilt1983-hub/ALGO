@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 load_dotenv('.env.qa')
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routes import auth, broker, orders, strategies, market_intelligence, auto_trading_simple, test_market, token_refresh, admin, option_signals, zerodha_postback
+from app.routes import auth, broker, orders, strategies, market_intelligence, auto_trading_simple, test_market, token_refresh, admin, option_signals, zerodha_postback, paper_trading
 from app.core.database import Base, engine, SessionLocal
 from app.core.config import get_settings
 from app.core.background_tasks import start_background_tasks, stop_background_tasks
@@ -75,6 +75,7 @@ app.include_router(auto_trading_simple.router)  # Using simplified version
 app.include_router(token_refresh.router)  # Token refresh and validation endpoints
 app.include_router(admin.router)  # Admin-only utilities
 app.include_router(zerodha_postback.router)  # Zerodha postback endpoint
+app.include_router(paper_trading.router)  # Paper trading performance tracking
 
 @app.get("/")
 async def root():

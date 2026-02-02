@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import PaperTradingDashboard from './PaperTradingDashboard';
 
 // Use environment-based API URL if available
 import config from '../config/api';
@@ -20,6 +21,11 @@ const AutoTradingDashboard = () => {
   const [livePrice, setLivePrice] = useState(null);
   const [activeTab, setActiveTab] = useState('trading');
   const [historySearch, setHistorySearch] = useState('');
+  const [lotMultiplier, setLotMultiplier] = useState(1); // For quantity adjustment
+  const [autoTradingActive, setAutoTradingActive] = useState(false);
+  const [hasActiveTrade, setHasActiveTrade] = useState(false);
+  const [showPaperTrading, setShowPaperTrading] = useState(false);
+  const [lastLoggedSignal, setLastLoggedSignal] = useState(null);
 
   // --- Professional Signal Integration ---
   const [professionalSignal, setProfessionalSignal] = useState(null);
@@ -100,13 +106,13 @@ const AutoTradingDashboard = () => {
     (!best || (curr.confidence > best.confidence)) ? curr : best, null
   );
 
-  // Auto-execute the best signal if available and not already executing
+  // Auto-execute the best signal if available and auto-trading is active
   useEffect(() => {
-    if (bestSignal && !executing) {
+    if (bestSignal && !executing && autoTradingActive && !hasActiveTrade) {
       executeAutoTrade(bestSignal);
     }
     // eslint-disable-next-line
-  }, [bestSignal]);
+  }, [bestSignal, autoTradingActive, hasActiveTrade]);
 
   // Remove legacy toggleAutoTrading logic (config references)
   const toggleAutoTrading = async () => {};
@@ -114,12 +120,23 @@ const AutoTradingDashboard = () => {
   // Implement auto trade execution using bestSignal
   const executeAutoTrade = async (signal) => {
     if (!signal || executing) return;
+    
+    // Check if auto-trading is active
+    if (!autoTradingActive) return;
+    
+    // Only allow one trade at a time
+    if (hasActiveTrade) {
+      console.log('Trade already active, skipping...');
+      return;
+    }
+    
     const token = localStorage.getItem('access_token');
     if (!token) {
       alert('No access token found. Please login.');
       return;
     }
-    const confirmMsg = `⚡ LIVE TRADE\n\nIndex: ${signal.index}\nSymbol: ${signal.symbol}\nAction: ${signal.action}\nStrike: ${signal.strike}\nQty: ${signal.quantity}\nEntry: ₹${signal.entry_price}\nTarget: ₹${signal.target}\nStop Loss: ₹${signal.stop_loss}\n\nProceed with auto trade?`;
+    const adjustedQuantity = signal.quantity * lotMultiplier;
+    const confirmMsg = `⚡ LIVE TRADE\n\nIndex: ${signal.index}\nSymbol: ${signal.symbol}\nAction: ${signal.action}\nStrike: ${signal.strike}\nQty: ${adjustedQuantity} (${lotMultiplier} lots)\nEntry: ₹${signal.entry_price}\nTarget: ₹${signal.target}\nStop Loss: ₹${signal.stop_loss}\n\nProceed with auto trade?`;
     if (!window.confirm(confirmMsg)) return;
     setExecuting(true);
     try {
@@ -128,7 +145,7 @@ const AutoTradingDashboard = () => {
         price: signal.entry_price,
         target: signal.target,
         stop_loss: signal.stop_loss,
-        quantity: signal.quantity,
+        quantity: adjustedQuantity,
         side: signal.action,
         expiry: signal.expiry_date,
         broker_id: 1,
@@ -140,6 +157,7 @@ const AutoTradingDashboard = () => {
       });
       if (response.ok) {
         const data = await response.json();
+        setHasActiveTrade(true);
         alert(data.message || 'Trade executed!');
       } else {
         let errorMsg = 'Failed to execute trade.';
@@ -180,6 +198,76 @@ const AutoTradingDashboard = () => {
       alert('Error arming live trading: ' + e.message);
     }
   };
+
+  // Log paper trade when signal appears (if not auto-trading)
+  const logPaperTrade = async (signal) => {
+    try {
+      // Check if there's an active open trade - if yes, don't log new signal
+      const activesResponse = await fetch(`${config.API_BASE_URL}/paper-trades/active`);
+      const activesData = await activesResponse.json();
+      
+      if (activesData.success && activesData.trades && activesData.trades.length > 0) {
+        console.log('Active trade exists. Waiting for it to close before logging new signal.');
+        return; // Don't log new signal if one is already active
+      }
+
+      const response = await fetch(`${config.API_BASE_URL}/paper-trades`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbol: signal.symbol,
+          index_name: signal.index || signal.index_name,
+          side: signal.action,
+          signal_type: signal.signal_type || signal.type,
+          quantity: signal.quantity * lotMultiplier,
+          entry_price: signal.entry_price,
+          stop_loss: signal.stop_loss,
+          target: signal.target,
+          strategy: signal.strategy || 'professional',
+          signal_data: signal
+        })
+      });
+      
+      if (response.ok) {
+        console.log('Paper trade logged successfully for', signal.symbol);
+      }
+    } catch (error) {
+      console.error('Failed to log paper trade:', error);
+    }
+  };
+
+  // Auto-log paper trade when new signal appears and auto-trading is OFF
+  useEffect(() => {
+    if (bestSignal && !autoTradingActive) {
+      // Create unique signal key with timestamp to avoid duplicates
+      const signalKey = `${bestSignal.symbol}-${bestSignal.entry_price}-${bestSignal.action}-${Math.floor(Date.now() / 5000)}`;
+      if (lastLoggedSignal !== signalKey) {
+        logPaperTrade(bestSignal);
+        setLastLoggedSignal(signalKey);
+      }
+    }
+    // eslint-disable-next-line
+  }, [bestSignal, autoTradingActive]);
+
+  // When a trade closes, immediately try to log the next trade
+  useEffect(() => {
+    const handleTradeClosed = () => {
+      console.log('Trade closed event received - attempting to log next trade');
+      setHasActiveTrade(false);
+      setLastLoggedSignal(null); // Reset to allow same signal to log again
+      
+      // If auto-trading is OFF and there's a signal, log it immediately
+      if (bestSignal && !autoTradingActive) {
+        setTimeout(() => {
+          console.log('Logging next trade after closure:', bestSignal.symbol);
+          logPaperTrade(bestSignal);
+        }, 1000); // 1 second delay to ensure backend state is updated
+      }
+    };
+    
+    window.addEventListener('tradeClosedEvent', handleTradeClosed);
+    return () => window.removeEventListener('tradeClosedEvent', handleTradeClosed);
+  }, [bestSignal, autoTradingActive]);
 
   useEffect(() => {
     fetchData();
@@ -247,6 +335,63 @@ const AutoTradingDashboard = () => {
     }}>
       {/* Header with Toggle */}
       {renderOptionSignalsTable()}
+      
+      {/* Professional Signal Display */}
+      {professionalSignal && !professionalSignal.error && (
+        <div style={{
+          background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+          borderRadius: '16px',
+          padding: '24px',
+          marginBottom: '24px',
+          color: 'white',
+          boxShadow: '0 10px 40px rgba(102, 126, 234, 0.3)'
+        }}>
+          <h3 style={{ margin: '0 0 16px 0', fontSize: '20px', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '8px' }}>
+            🎯 Professional Intraday Signal
+            <span style={{
+              fontSize: '12px',
+              padding: '4px 10px',
+              borderRadius: '12px',
+              background: 'rgba(255,255,255,0.2)',
+              fontWeight: '600'
+            }}>
+              LIVE
+            </span>
+          </h3>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '16px' }}>
+            <div>
+              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Symbol</div>
+              <div style={{ fontSize: '18px', fontWeight: 'bold' }}>{professionalSignal.symbol}</div>
+            </div>
+            <div>
+              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Action</div>
+              <div style={{ fontSize: '20px', fontWeight: 'bold' }}>
+                <span style={{
+                  padding: '6px 16px',
+                  borderRadius: '8px',
+                  background: professionalSignal.signal === 'buy' ? '#48bb78' : professionalSignal.signal === 'sell' ? '#f56565' : '#cbd5e0',
+                  color: 'white'
+                }}>
+                  {(professionalSignal.signal || 'HOLD').toUpperCase()}
+                </span>
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Entry Price</div>
+              <div style={{ fontSize: '18px', fontWeight: 'bold' }}>
+                ₹{professionalSignal.entry_price ? professionalSignal.entry_price.toFixed(2) : 'N/A'}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Stop Loss</div>
+              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#fed7d7' }}>
+                ₹{professionalSignal.stop_loss ? professionalSignal.stop_loss.toFixed(2) : 'N/A'}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      
       <div style={{
         display: 'flex',
         justifyContent: 'space-between',
@@ -295,6 +440,7 @@ const AutoTradingDashboard = () => {
             {livePrice && <span>📊 NIFTY: ₹{livePrice.toFixed(2)} • </span>}
             {'⚡ LIVE Mode - Real Trades Execution'}
             {' • '}Max {stats?.max_trades || 10} Concurrent Trades
+            {hasActiveTrade && <span style={{ color: '#f56565', fontWeight: '600' }}> • 🔒 ONE TRADE ACTIVE - Waiting to close...</span>}
           </p>
         </div>
         <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
@@ -413,28 +559,86 @@ const AutoTradingDashboard = () => {
                 </span>
                 <span><strong>Symbol:</strong> {bestSignal.symbol}</span>
                 <span><strong>Confidence:</strong> {bestSignal.confidence}%</span>
-                <span><strong>Quantity:</strong> {bestSignal.quantity}</span>
+                <span style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <strong>Quantity:</strong>
+                  <button
+                    onClick={() => setLotMultiplier(Math.max(1, lotMultiplier - 1))}
+                    style={{
+                      padding: '2px 8px',
+                      background: '#e2e8f0',
+                      border: '1px solid #cbd5e0',
+                      borderRadius: '4px',
+                      cursor: 'pointer',
+                      fontSize: '14px',
+                      fontWeight: 'bold'
+                    }}
+                  >
+                    −
+                  </button>
+                  <span style={{
+                    padding: '4px 12px',
+                    background: '#edf2f7',
+                    borderRadius: '6px',
+                    fontWeight: 'bold',
+                    minWidth: '80px',
+                    textAlign: 'center'
+                  }}>
+                    {bestSignal.quantity * lotMultiplier}
+                  </span>
+                  <button
+                    onClick={() => setLotMultiplier(lotMultiplier + 1)}
+                    style={{
+                      padding: '2px 8px',
+                      background: '#e2e8f0',
+                      border: '1px solid #cbd5e0',
+                      borderRadius: '4px',
+                      cursor: 'pointer',
+                      fontSize: '14px',
+                      fontWeight: 'bold'
+                    }}
+                  >
+                    +
+                  </button>
+                  <span style={{ fontSize: '12px', color: '#718096' }}>({lotMultiplier} lots)</span>
+                </span>
                 <span><strong>Expiry:</strong> {bestSignal.expiry_date || bestSignal.expiry}</span>
               </div>
             </div>
-            {enabled && (
+            <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
               <button
-                onClick={executeAutoTrade}
-                disabled={executing}
+                onClick={() => {
+                  setAutoTradingActive(!autoTradingActive);
+                  if (autoTradingActive) {
+                    setHasActiveTrade(false);
+                  }
+                }}
                 style={{
                   padding: '12px 24px',
-                  background: executing ? '#cbd5e0' : '#48bb78',
+                  background: autoTradingActive ? '#f56565' : '#48bb78',
                   color: 'white',
                   border: 'none',
                   borderRadius: '8px',
                   fontSize: '15px',
                   fontWeight: '600',
-                  cursor: executing ? 'not-allowed' : 'pointer'
+                  cursor: 'pointer',
+                  boxShadow: '0 4px 6px rgba(0,0,0,0.1)'
                 }}
               >
-                {executing ? '⏳ Executing...' : '⚡ Execute Trade'}
+                {autoTradingActive ? '🛑 Stop Auto-Trading' : '▶️ Start Auto-Trading'}
               </button>
-            )}
+              {autoTradingActive && (
+                <div style={{
+                  padding: '8px 16px',
+                  background: hasActiveTrade ? '#fed7d7' : '#c6f6d5',
+                  color: hasActiveTrade ? '#742a2a' : '#22543d',
+                  borderRadius: '6px',
+                  fontSize: '13px',
+                  fontWeight: '600'
+                }}>
+                  {hasActiveTrade ? '🔒 Trade Active (1/1)' : '✓ Ready to Trade'}
+                </div>
+              )}
+            </div>
           </div>
           <div style={{
             display: 'grid',
@@ -469,19 +673,19 @@ const AutoTradingDashboard = () => {
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Potential Profit</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#38a169' }}>
-                ₹{bestSignal.potential_profit?.toLocaleString() ?? '--'}
+                ₹{((bestSignal.target - bestSignal.entry_price) * bestSignal.quantity * lotMultiplier)?.toLocaleString() ?? '--'}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Max Risk</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#e53e3e' }}>
-                ₹{bestSignal.risk?.toLocaleString() ?? '--'}
+                ₹{((bestSignal.entry_price - bestSignal.stop_loss) * bestSignal.quantity * lotMultiplier)?.toLocaleString() ?? '--'}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Quantity</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#5a67d8' }}>
-                {bestSignal.quantity}
+                {bestSignal.quantity * lotMultiplier}
               </div>
             </div>
             <div>
@@ -1007,6 +1211,33 @@ const AutoTradingDashboard = () => {
           )}
         </div>
       )}
+      
+      {/* Paper Trading Performance Section */}
+      <div style={{ marginTop: '32px', marginBottom: '16px' }}>
+        <button
+          onClick={() => setShowPaperTrading(!showPaperTrading)}
+          style={{
+            width: '100%',
+            padding: '16px',
+            background: showPaperTrading ? 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)' : 'linear-gradient(135deg, #4299e1 0%, #3182ce 100%)',
+            color: 'white',
+            border: 'none',
+            borderRadius: '12px',
+            fontSize: '16px',
+            fontWeight: 'bold',
+            cursor: 'pointer',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center'
+          }}
+        >
+          <span>📊 {showPaperTrading ? 'Hide' : 'Show'} Paper Trading Performance</span>
+          <span style={{ fontSize: '20px' }}>{showPaperTrading ? '▼' : '▶'}</span>
+        </button>
+      </div>
+      
+      {showPaperTrading && <PaperTradingDashboard />}
     </div>
   );
 }

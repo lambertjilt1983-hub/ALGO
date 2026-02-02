@@ -63,28 +63,45 @@ def generate_signals(df, capital=0):
     for i in range(21, len(df)):
         price = df['close'][i]
         above_vwap = price > df['VWAP'][i]
-        ema_cross_up = df['EMA9'][i-1] < df['EMA21'][i-1] and df['EMA9'][i] > df['EMA21'][i]
-        ema_cross_down = df['EMA9'][i-1] > df['EMA21'][i-1] and df['EMA9'][i] < df['EMA21'][i]
+        ema9 = df['EMA9'][i]
+        ema21 = df['EMA21'][i]
+        ema9_prev = df['EMA9'][i-1]
+        ema21_prev = df['EMA21'][i-1]
+        
+        # More sensitive trend detection
+        ema_bullish = ema9 > ema21 and (ema9 - ema9_prev) > 0
+        ema_bearish = ema9 < ema21 and (ema9 - ema9_prev) < 0
+        ema_cross_up = ema9_prev <= ema21_prev and ema9 > ema21
+        ema_cross_down = ema9_prev >= ema21_prev and ema9 < ema21
+        
         rsi_val = df['RSI'][i]
         macd_hist = df['MACD_hist'][i]
+        macd_hist_prev = df['MACD_hist'][i-1]
+        macd_rising = macd_hist > macd_hist_prev
+        macd_falling = macd_hist < macd_hist_prev
         supertrend_val = df['Supertrend'][i]
-        # Long Entry
-        if (above_vwap and ema_cross_up and 40 < rsi_val < 70 and macd_hist > 0):
+        
+        # Long Entry (relaxed conditions for more signals)
+        if (above_vwap and (ema_cross_up or ema_bullish) and 30 < rsi_val < 75 and (macd_hist > 0 or macd_rising)):
             df.at[df.index[i], 'Signal'] = 'LONG'
             last_signal = 'LONG'
-        # Short Entry
-        elif (not above_vwap and ema_cross_down and 30 < rsi_val < 60 and macd_hist < 0):
+        # Short Entry (relaxed conditions)
+        elif ((not above_vwap) and (ema_cross_down or ema_bearish) and 25 < rsi_val < 70 and (macd_hist < 0 or macd_falling)):
             df.at[df.index[i], 'Signal'] = 'SHORT'
             last_signal = 'SHORT'
         # Exit
-        elif last_signal == 'LONG' and price < supertrend_val:
+        elif last_signal == 'LONG' and (price < supertrend_val or rsi_val > 75):
             df.at[df.index[i], 'Signal'] = 'EXIT LONG'
             last_signal = None
-        elif last_signal == 'SHORT' and price > supertrend_val:
+        elif last_signal == 'SHORT' and (price > supertrend_val or rsi_val < 25):
             df.at[df.index[i], 'Signal'] = 'EXIT SHORT'
             last_signal = None
-        # Debug info
-        df.at[df.index[i], 'Debug'] = f"VWAP={above_vwap}, EMA9={df['EMA9'][i]:.2f}, EMA21={df['EMA21'][i]:.2f}, RSI={rsi_val:.2f}, MACD_hist={macd_hist:.2f}, Supertrend={supertrend_val:.2f}, Signal={df.at[df.index[i], 'Signal']}"
+        # Debug info with more details
+        debug_msg = f"Price={price:.2f}, VWAP={df['VWAP'][i]:.2f}, above_vwap={above_vwap}, "
+        debug_msg += f"EMA9={ema9:.2f}, EMA21={ema21:.2f}, ema_bullish={ema_bullish}, ema_bearish={ema_bearish}, "
+        debug_msg += f"RSI={rsi_val:.2f}, MACD_hist={macd_hist:.4f}, macd_rising={macd_rising}, "
+        debug_msg += f"Supertrend={supertrend_val:.2f}, Signal={df.at[df.index[i], 'Signal']}"
+        df.at[df.index[i], 'Debug'] = debug_msg
     return df
 
 # --- Backtesting Module ---

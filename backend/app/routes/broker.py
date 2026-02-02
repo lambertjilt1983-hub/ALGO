@@ -7,10 +7,59 @@ from app.models.schemas import BrokerCredentialCreate, BrokerCredentialResponse
 from app.models.auth import BrokerCredential, User
 from app.core.database import get_db
 from app.core.token_manager import token_manager
+from app.core.security import encryption_manager
 from app.core.config import get_settings
 import urllib.parse
 
 router = APIRouter(prefix="/brokers", tags=["brokers"])
+
+
+def _safe_decrypt(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return encryption_manager.decrypt_credentials(value)
+    except Exception:
+        return value
+
+
+def _api_key_preview(value: str | None) -> str | None:
+    if not value:
+        return None
+    return f"{value[:8]}..." if len(value) > 8 else value
+
+
+def _build_broker_response(credential: BrokerCredential) -> dict:
+    api_key = _safe_decrypt(getattr(credential, "api_key", None))
+    has_access_token = bool(getattr(credential, "access_token", None))
+    token_status = None
+    requires_reauth = None
+
+    if credential.broker_name and "zerodha" in credential.broker_name.lower():
+        if has_access_token:
+            is_valid = token_manager.validate_zerodha_token(credential)
+            token_status = "valid" if is_valid else "expired"
+            requires_reauth = not is_valid
+        else:
+            token_status = "missing"
+            requires_reauth = True
+    else:
+        token_status = "unknown"
+        requires_reauth = False
+
+    return {
+        "id": credential.id,
+        "broker_name": credential.broker_name,
+        "is_active": credential.is_active,
+        "created_at": credential.created_at,
+        "updated_at": credential.updated_at,
+        "api_key_preview": _api_key_preview(api_key),
+        "has_access_token": has_access_token,
+        "token_expiry": credential.token_expiry,
+        "token_status": token_status,
+        "requires_reauth": requires_reauth,
+        "last_used": credential.updated_at,
+    }
 
 @router.post("/credentials", response_model=BrokerCredentialResponse)
 async def add_broker_credentials(
@@ -41,7 +90,7 @@ async def add_broker_credentials(
         api_secret=credentials.api_secret,
         db=db
     )
-    return broker_cred
+    return _build_broker_response(broker_cred)
 
 @router.get("/credentials", response_model=List[BrokerCredentialResponse])
 async def list_broker_credentials(
@@ -67,7 +116,7 @@ async def list_broker_credentials(
             print(f"    Token: {cred.access_token[:50]}...")
     print(f"{'='*60}\n")
     
-    return credentials
+    return [_build_broker_response(cred) for cred in credentials]
 
 @router.get("/credentials/{broker_name}", response_model=BrokerCredentialResponse)
 async def get_broker_credentials(
@@ -84,7 +133,7 @@ async def get_broker_credentials(
         broker_name=broker_name,
         db=db
     )
-    return credential
+    return _build_broker_response(credential)
 
 @router.delete("/credentials/{broker_name}")
 async def delete_broker_credentials(
@@ -164,7 +213,6 @@ async def zerodha_oauth_login(
         )
     
     # Decrypt API key before using it
-    from app.core.security import encryption_manager
     try:
         decrypted_api_key = encryption_manager.decrypt_credentials(credential.api_key)
     except Exception as e:
@@ -182,7 +230,8 @@ async def zerodha_oauth_login(
     state = f"{user_id}:{broker_id}"
     
     # Zerodha login URL (redirect URL is configured in the developer console)
-    login_url = f"https://kite.zerodha.com/connect/login?api_key={decrypted_api_key}&v=3"
+    encoded_state = urllib.parse.quote(state)
+    login_url = f"https://kite.zerodha.com/connect/login?api_key={decrypted_api_key}&v=3&state={encoded_state}"
     
     return {
         "login_url": login_url,
@@ -282,7 +331,8 @@ async def zerodha_oauth_callback(
         
         # Update credential with access token - CRITICAL: Save to DB immediately
         print(f"Saving access token to broker ID: {credential.id}")
-        credential.access_token = access_token
+        safe_access_token = access_token.strip() if isinstance(access_token, str) else access_token
+        credential.access_token = encryption_manager.encrypt_credentials(safe_access_token)
         db.add(credential)  # Explicitly add to session
         db.commit()
         

@@ -45,6 +45,13 @@ class BrokerCredentialResponse(BaseModel):
     broker_name: str
     is_active: bool
     created_at: datetime
+    updated_at: Optional[datetime] = None
+    api_key_preview: Optional[str] = None
+    has_access_token: bool = False
+    token_expiry: Optional[datetime] = None
+    token_status: Optional[str] = None
+    requires_reauth: Optional[bool] = None
+    last_used: Optional[datetime] = None
     
     class Config:
         from_attributes = True

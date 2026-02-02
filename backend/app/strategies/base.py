@@ -225,25 +225,89 @@ class IntradayProfessionalStrategy(Strategy):
         return all(col in data.columns for col in required_cols)
 
     def generate_signal(self, data: pd.DataFrame) -> Signal:
-        self.data = data
-        df = professional_generate_signals(data, self.capital)
+        self.data = professional_generate_signals(data, self.capital)
+        df = self.data  # Use the enriched dataframe
+        
         # Find the last non-empty signal
-        last_row = df[df['Signal'] != ''].iloc[-1] if (df['Signal'] != '').any() else None
-        if last_row is not None:
-            return Signal(
-                timestamp=last_row.name if hasattr(last_row, 'name') else datetime.now(),
-                symbol=self.parameters.get('symbol', ''),
-                action=last_row['Signal'],
-                strength=1.0,
-                entry_price=last_row['close'],
-                stop_loss=last_row.get('Supertrend', None),
-                take_profit=None
-            )
+        signals_df = df[df['Signal'] != '']
+        
+        if not signals_df.empty:
+            last_row = signals_df.iloc[-1]
+            signal_idx = signals_df.index[-1]
+            current_idx = df.index[-1]
+            
+            # If signal is very recent (within last 5 candles), use it
+            if current_idx - signal_idx <= 5:
+                action = last_row['Signal'].lower()
+                if 'long' in action:
+                    action = 'buy'
+                elif 'short' in action:
+                    action = 'sell'
+                elif 'exit' in action:
+                    action = 'hold'
+                    
+                return Signal(
+                    timestamp=datetime.now(),
+                    symbol=self.parameters.get('symbol', ''),
+                    action=action,
+                    strength=1.0,
+                    entry_price=df['close'].iloc[-1],
+                    stop_loss=df['Supertrend'].iloc[-1] if 'Supertrend' in df.columns else None,
+                    take_profit=None
+                )
+        
+        # No recent signal - determine current market bias
+        last_row = df.iloc[-1]
+        price = last_row['close']
+        ema9 = last_row['EMA9']
+        ema21 = last_row['EMA21']
+        rsi = last_row['RSI']
+        macd_hist = last_row['MACD_hist']
+        vwap = last_row['VWAP']
+        
+        # Count bullish/bearish indicators
+        bullish_count = 0
+        bearish_count = 0
+        
+        if price > vwap:
+            bullish_count += 1
+        else:
+            bearish_count += 1
+            
+        if ema9 > ema21:
+            bullish_count += 1
+        else:
+            bearish_count += 1
+            
+        if macd_hist > 0:
+            bullish_count += 1
+        else:
+            bearish_count += 1
+            
+        if rsi > 50:
+            bullish_count += 1
+        elif rsi < 50:
+            bearish_count += 1
+        
+        # Determine action based on majority
+        if bullish_count >= 3:
+            action = 'buy'
+            strength = bullish_count / 4.0
+        elif bearish_count >= 3:
+            action = 'sell'
+            strength = bearish_count / 4.0
+        else:
+            action = 'hold'
+            strength = 0
+        
         return Signal(
             timestamp=datetime.now(),
             symbol=self.parameters.get('symbol', ''),
-            action="hold",
-            strength=0
+            action=action,
+            strength=strength,
+            entry_price=price,
+            stop_loss=last_row['Supertrend'] if 'Supertrend' in df.columns else None,
+            take_profit=None
         )
 
 class StrategyFactory:

@@ -54,14 +54,28 @@ async def get_live_professional_signal(
         raw_access_token = getattr(cred, 'access_token', None)
         print(f"[DEBUG] Raw DB api_key: {raw_api_key}")
         print(f"[DEBUG] Raw DB access_token: {raw_access_token}")
+        # Normalize and migrate plaintext/whitespace access tokens
+        if isinstance(raw_access_token, str):
+            cleaned_access_token = raw_access_token.strip()
+            is_encrypted = cleaned_access_token.startswith("gAAAA")
+            if cleaned_access_token and (cleaned_access_token != raw_access_token or not is_encrypted):
+                cred.access_token = (
+                    encryption_manager.encrypt_credentials(cleaned_access_token)
+                    if not is_encrypted
+                    else cleaned_access_token
+                )
+                db.add(cred)
+                db.commit()
+                db.refresh(cred)
+                raw_access_token = cred.access_token
         def _dec(val):
             if not val:
                 return None
             try:
-                return encryption_manager.decrypt_credentials(val)
-            except Exception as e:
-                print(f"[DEBUG] Decryption failed: {e}")
-                return val
+                decrypted = encryption_manager.decrypt_credentials(val)
+            except Exception:
+                decrypted = val
+            return decrypted.strip() if isinstance(decrypted, str) else decrypted
         api_key = _dec(raw_api_key)
         access_token = _dec(raw_access_token)
         print(f"[DEBUG] Decrypted api_key: {api_key}")
@@ -164,8 +178,29 @@ async def get_live_professional_signal(
         print("DEBUG: Strategy created")
         signal = strat.generate_signal(df)
         print(f"DEBUG: Signal generated: {signal}")
-        debug = df[['close', 'Signal', 'Debug']].tail(20).to_dict(orient='records') if 'Debug' in df.columns else None
-        print(f"DEBUG: Debug info: {debug}")
+        
+        # Get the enriched DataFrame with indicators from the strategy
+        df_with_indicators = strat.data if hasattr(strat, 'data') else df
+        print(f"DEBUG: DataFrame columns after signal generation: {df_with_indicators.columns.tolist()}")
+        
+        # Initialize debug variable
+        debug = []
+        
+        # Show last few rows with indicators
+        if 'Debug' in df_with_indicators.columns:
+            debug = df_with_indicators[['close', 'Signal', 'Debug']].tail(5).to_dict(orient='records')
+            print(f"DEBUG: Last 5 rows with indicators:")
+            for i, row in enumerate(debug, 1):
+                print(f"  Row {i}: {row}")
+        else:
+            print("DEBUG: No Debug column found")
+            
+        # Show latest indicator values
+        if len(df_with_indicators) > 0:
+            last = df_with_indicators.iloc[-1]
+            print(f"DEBUG: Latest indicators - Price: {last['close']:.2f}, "
+                  f"EMA9: {last.get('EMA9', 'N/A')}, EMA21: {last.get('EMA21', 'N/A')}, "
+                  f"RSI: {last.get('RSI', 'N/A')}, VWAP: {last.get('VWAP', 'N/A')}")
         return {
             "symbol": symbol,
             "signal": signal.action,

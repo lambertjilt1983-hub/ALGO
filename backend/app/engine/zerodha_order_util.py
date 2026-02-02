@@ -1,18 +1,41 @@
 # Zerodha order placement utility for backend integration
-from kiteconnect import KiteConnect, KiteTicker
-import os
-from app.brokers.zerodha import get_zerodha_access_token
+from kiteconnect import KiteConnect
+from app.core.database import SessionLocal
+from app.models.auth import BrokerCredential
+from app.core.security import encryption_manager
 
-# Load your API key/secret and access token from environment or config
-KITE_API_KEY = os.getenv("ZERODHA_API_KEY")
-KITE_API_SECRET = os.getenv("ZERODHA_API_SECRET", "your_api_secret")
-KITE_ACCESS_TOKEN = get_zerodha_access_token()  # Fetch from DB/config
 
-kite = KiteConnect(api_key=KITE_API_KEY)
-kite.set_access_token(KITE_ACCESS_TOKEN)
+def _load_zerodha_credentials():
+    """Load Zerodha credentials from database"""
+    db = SessionLocal()
+    try:
+        cred = (
+            db.query(BrokerCredential)
+            .filter(
+                BrokerCredential.broker_name.ilike("%zerodha%"),
+                BrokerCredential.is_active == True
+            )
+            .order_by(BrokerCredential.updated_at.desc())
+            .first()
+        )
+        if not cred:
+            return None, None
+        
+        def _safe_decrypt(val):
+            if not val:
+                return None
+            try:
+                decrypted = encryption_manager.decrypt_credentials(val)
+            except Exception:
+                decrypted = val
+            return decrypted.strip() if isinstance(decrypted, str) else decrypted
+        
+        api_key = _safe_decrypt(getattr(cred, 'api_key', None))
+        access_token = _safe_decrypt(getattr(cred, 'access_token', None))
+        return api_key, access_token
+    finally:
+        db.close()
 
-print(f"[ZERODHA DEBUG] API_KEY: {KITE_API_KEY}")
-print(f"[ZERODHA DEBUG] ACCESS_TOKEN: {KITE_ACCESS_TOKEN}")
 
 def place_zerodha_order(symbol, quantity, side, order_type="MARKET", product="MIS", exchange="NSE"):
     """
@@ -24,6 +47,15 @@ def place_zerodha_order(symbol, quantity, side, order_type="MARKET", product="MI
     product: 'MIS' (intraday) or 'NRML' (overnight)
     exchange: 'NSE' or 'NFO' (for options)
     """
+    # Load credentials from database
+    api_key, access_token = _load_zerodha_credentials()
+    
+    if not api_key or not access_token:
+        return {"success": False, "error": "Zerodha credentials not found in database. Please configure broker credentials."}
+    
+    kite = KiteConnect(api_key=api_key)
+    kite.set_access_token(access_token)
+    
     try:
         order_id = kite.place_order(
             variety=kite.VARIETY_REGULAR,

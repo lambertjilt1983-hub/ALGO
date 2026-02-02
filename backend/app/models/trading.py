@@ -87,3 +87,30 @@ class TradeReport(Base):
     exit_time = Column(DateTime, default=datetime.utcnow, index=True)
     trading_date = Column(Date, default=func.current_date(), index=True)
     meta = Column(JSON, nullable=True)
+
+
+class PaperTrade(Base):
+    """Paper trading log to track signal performance without real execution."""
+    __tablename__ = "paper_trades"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True, default=1)
+    symbol = Column(String, index=True)
+    index_name = Column(String, nullable=True)  # NIFTY, BANKNIFTY, etc.
+    side = Column(String)  # BUY, SELL
+    signal_type = Column(String)  # CE, PE, or equity
+    quantity = Column(Float)
+    entry_price = Column(Float)
+    current_price = Column(Float, nullable=True)
+    stop_loss = Column(Float, nullable=True)
+    target = Column(Float, nullable=True)
+    status = Column(String, default="OPEN", index=True)  # OPEN, TARGET_HIT, SL_HIT, EXPIRED
+    exit_price = Column(Float, nullable=True)  # Price at which trade exited
+    pnl = Column(Float, nullable=True)
+    pnl_percentage = Column(Float, nullable=True)
+    strategy = Column(String, default="professional")
+    signal_data = Column(JSON, nullable=True)  # Store full signal details
+    entry_time = Column(DateTime, default=datetime.utcnow, index=True)
+    exit_time = Column(DateTime, nullable=True)
+    trading_date = Column(Date, default=func.current_date(), index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

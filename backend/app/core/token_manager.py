@@ -126,9 +126,10 @@ class TokenManager:
         if not value:
             return None
         try:
-            return encryption_manager.decrypt_credentials(value)
+            decrypted = encryption_manager.decrypt_credentials(value)
         except Exception:
-            return value
+            decrypted = value
+        return decrypted.strip() if isinstance(decrypted, str) else decrypted
     
     @staticmethod
     def get_balance_with_fallback(broker_id: int, db: Session, user_id: int) -> dict:

@@ -56,8 +56,12 @@ function Dashboard() {
     console.log('🔍 Status:', status, 'Request Token:', requestToken);
     
     if (status === 'success' && requestToken) {
+      const state = urlParams.get('state');
+      const storedBrokerId = localStorage.getItem('zerodha_last_broker_id');
+      const parsedBrokerId = state?.includes(':') ? state.split(':')[1] : state;
+      const brokerId = parsedBrokerId || storedBrokerId;
       console.log('✅ Zerodha redirect detected, exchanging token...');
-      handleZerodhaCallback(requestToken);
+      handleZerodhaCallback(requestToken, brokerId);
       return;
     }
     
@@ -77,19 +81,25 @@ function Dashboard() {
     }
   }, []);
 
-  const handleZerodhaCallback = async (requestToken) => {
+  const handleZerodhaCallback = async (requestToken, brokerId) => {
     try {
       const token = localStorage.getItem('access_token');
+
+      if (!brokerId) {
+        alert('Missing broker id for Zerodha token refresh. Please retry login from Brokers page.');
+        return;
+      }
       
       console.log('🔄 Exchanging Zerodha request token:', requestToken);
       
       // Call backend to exchange request token for access token
-      const response = await fetch(`${config.API_BASE_URL}/brokers/zerodha/callback?request_token=${requestToken}&status=success`, {
-        method: 'GET',
+      const response = await fetch(`${config.API_BASE_URL}/api/tokens/refresh/${brokerId}`, {
+        method: 'POST',
         headers: {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json'
-        }
+        },
+        body: JSON.stringify({ request_token: requestToken })
       });
       
       console.log('📥 Callback response status:', response.status);
@@ -191,11 +201,7 @@ function Dashboard() {
         
         // If token is expired, trigger re-authentication flow
         if (balanceData.status === 'token_expired' || balanceData.requires_reauth) {
-          console.warn(`Token expired for broker ${brokerId}, triggering re-auth`);
-          // Automatically redirect to Zerodha login
-          setTimeout(() => {
-            handleZerodhaLogin(brokerId);
-          }, 1000);
+          console.warn(`Token expired for broker ${brokerId}, showing reconnect prompt`);
         }
         
         setBrokerBalances(prev => ({
@@ -354,6 +360,7 @@ function Dashboard() {
     
     try {
       window.zerodhaLoginInProgress = true;
+      localStorage.setItem('zerodha_last_broker_id', String(brokerId));
       const token = localStorage.getItem('access_token');
       const response = await fetch(`${config.API_BASE_URL}/brokers/zerodha/login/${brokerId}`, {
         headers: {
@@ -754,7 +761,7 @@ function Dashboard() {
                   </div>
                   
                   {/* Zerodha OAuth Button */}
-                  {broker.broker_name.toLowerCase().includes('zerodha') && !broker.access_token && (
+                  {broker.broker_name.toLowerCase().includes('zerodha') && (broker.requires_reauth || !broker.has_access_token) && (
                     <button
                       onClick={() => handleZerodhaLogin(broker.id)}
                       style={{
@@ -770,7 +777,7 @@ function Dashboard() {
                         marginBottom: '12px'
                       }}
                     >
-                      🔐 Login to Zerodha to Get Access Token
+                      🔐 Reconnect Zerodha
                     </button>
                   )}
                   

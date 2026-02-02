@@ -23,12 +23,18 @@ export default function App() {
 
   useEffect(() => {
     const token = localStorage.getItem('access_token');
+    console.log('[App] Checking auth token:', !!token);
     if (token) {
       setIsLoggedIn(true);
+      console.log('[App] User is logged in');
+    } else {
+      console.log('[App] No token found, showing login');
     }
     setLoading(false);
   }, []);
 
+  console.log('[App] Rendering - isLoggedIn:', isLoggedIn, 'loading:', loading);
+  
   if (loading) {
     return <div style={{ textAlign: 'center', padding: '50px' }}>Loading...</div>;
   }
@@ -390,9 +396,17 @@ export default function App() {
   }
 
   // If logged in, use routes
+  console.log('[App] Rendering routes for logged in user');
   return (
     <Routes>
-      <Route path="/autotrading" element={<AutoTradingDashboard />} />
+      <Route path="/autotrading" element={
+        <div>
+          <div style={{ padding: '20px', background: 'yellow', margin: '10px' }}>
+            🔍 AutoTradingDashboard Route Matched!
+          </div>
+          <AutoTradingDashboard />
+        </div>
+      } />
       <Route path="/*" element={<Dashboard />} />
     </Routes>
   );
