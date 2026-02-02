@@ -1,13 +1,16 @@
 """
 Background tasks for token validation and refresh
 Runs periodically to check token validity and trigger refresh if needed
+Also handles market closing time exit for all open trades
 """
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy.orm import sessionmaker
 from app.core.database import engine
 from app.models.auth import BrokerCredential
+from app.models.trading import PaperTrade
 from app.core.token_manager import token_manager
 from app.core.logger import logger
+from datetime import datetime, time
 
 # Create a session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -40,30 +43,74 @@ def validate_all_tokens():
     finally:
         db.close()
 
+def close_market_close_trades():
+    """Close all open trades at market closing time (3:25 PM IST)"""
+    db = SessionLocal()
+    try:
+        # Get current time in IST (India Standard Time)
+        current_time = datetime.now()
+        
+        # Market closing time: 3:25 PM (15:25)
+        market_close = time(15, 25)
+        
+        # Check if current time is within market close window (3:25 PM - 3:30 PM)
+        current_time_only = current_time.time()
+        if market_close <= current_time_only <= time(15, 30):
+            # Close all open trades
+            open_trades = db.query(PaperTrade).filter(PaperTrade.status == "OPEN").all()
+            
+            closed_count = 0
+            for trade in open_trades:
+                trade.status = "EXPIRED"
+                trade.exit_time = datetime.utcnow()
+                closed_count += 1
+            
+            if closed_count > 0:
+                db.commit()
+                logger.log_error("Market close - Trades auto-exited", {
+                    "closed_count": closed_count,
+                    "time": current_time.isoformat(),
+                    "reason": "Market closing time (3:25 PM IST)"
+                })
+    
+    except Exception as e:
+        db.rollback()
+        logger.log_error("Market close exit task failed", {"error": str(e)})
+    finally:
+        db.close()
+
 def start_background_tasks():
     """Initialize and start background scheduler"""
     try:
-        # Disabled for now - background scheduler causing shutdown issues
-        # To re-enable: uncomment the code below
-        logger.log_error("Background tasks disabled (scheduler)", {})
-        return
-        
         # Remove any existing jobs
-        # if scheduler.running:
-        #     scheduler.shutdown(wait=False)
-        # 
-        # # Add token validation task - runs every 30 minutes
-        # scheduler.add_job(
-        #     validate_all_tokens,
-        #     'interval',
-        #     minutes=30,
-        #     id='validate_tokens',
-        #     name='Validate all broker tokens',
-        #     replace_existing=True
-        # )
-        # 
-        # scheduler.start()
-        # logger.log_error("Background tasks started", {"jobs": len(scheduler.get_jobs())})
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+        
+        # Add token validation task - runs every 30 minutes
+        scheduler.add_job(
+            validate_all_tokens,
+            'interval',
+            minutes=30,
+            id='validate_tokens',
+            name='Validate all broker tokens',
+            replace_existing=True
+        )
+        
+        # Add market close exit task - runs every 1 minute (checks if it's 3:30-3:35 PM)
+        scheduler.add_job(
+            close_market_close_trades,
+            'interval',
+            minutes=1,
+            id='market_close_exit',
+            name='Auto-exit open trades at market close',
+            replace_existing=True
+        )
+        
+        scheduler.start()
+        logger.log_error("Background tasks started", {
+            "jobs": len(scheduler.get_jobs()),
+            "market_close_time": "3:25 PM IST (3:25-3:30 PM IST window)"
+        })
         
     except Exception as e:
         logger.log_error("Failed to start background tasks", {"error": str(e)})

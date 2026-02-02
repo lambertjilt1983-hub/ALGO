@@ -98,6 +98,9 @@ class AuthService:
     @staticmethod
     def login_user(user_data: UserLogin, db: Session) -> dict:
         """Authenticate user and return tokens"""
+        import logging
+        logger = logging.getLogger("auth")
+        
         user = db.query(User).filter(User.username == user_data.username).first()
         
         if not user or not encryption_manager.verify_password(user_data.password, user.hashed_password):
@@ -106,15 +109,25 @@ class AuthService:
                 detail="Invalid credentials"
             )
 
-        # Admin is allowed to sign in without OTP friction
-        if user.is_admin and (not user.is_email_verified or not user.is_mobile_verified):
+
+        # Require OTP for non-admin users
+        if not user.is_admin:
+            if not user_data.otp:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="OTP required")
+            if not user.otp_code or str(user_data.otp).strip() != str(user.otp_code).strip():
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid OTP")
             user.is_email_verified = True
             user.is_mobile_verified = True
+            user.otp_code = None
+            user.otp_expires_at = None
             db.commit()
             db.refresh(user)
-
-        if not (user.is_email_verified and user.is_mobile_verified):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="OTP verification required")
+        else:
+            if not user.is_email_verified or not user.is_mobile_verified:
+                user.is_email_verified = True
+                user.is_mobile_verified = True
+                db.commit()
+                db.refresh(user)
 
         access_token = AuthService.create_access_token({"sub": str(user.id)})
         refresh_token = AuthService.create_refresh_token(user.id)

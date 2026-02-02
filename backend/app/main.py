@@ -40,9 +40,19 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
         logger.info("[STARTUP] Database session closed.")
+    
+    # Start background tasks
+    logger.info("[STARTUP] Starting background tasks...")
+    start_background_tasks()
+    logger.info("[STARTUP] Background tasks started.")
+    
     yield
+    
     # Shutdown
     logger.info("[SHUTDOWN] FastAPI shutdown event triggered.")
+    logger.info("[SHUTDOWN] Stopping background tasks...")
+    stop_background_tasks()
+    logger.info("[SHUTDOWN] Background tasks stopped.")
 
 # Single app instance with all config
 app = FastAPI(

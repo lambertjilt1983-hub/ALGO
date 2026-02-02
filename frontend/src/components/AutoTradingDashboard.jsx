@@ -641,7 +641,7 @@ const AutoTradingDashboard = () => {
           </div>
           <div style={{
             padding: '20px',
-            background: 'linear-gradient(135deg, #9f7aea 0%, #805ad5 100%)',
+            background: 'linear-gradient(135deg, #939BA3 0%, #7a8289 100%)',
             borderRadius: '12px',
             color: 'white',
             textAlign: 'center'

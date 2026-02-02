@@ -16,8 +16,17 @@ async def register(user_data: UserCreate, db: Session = Depends(get_db)):
 @router.post("/login", response_model=TokenResponse)
 async def login(user_data: UserLogin, db: Session = Depends(get_db)):
     """Login user and get tokens"""
-    tokens = AuthService.login_user(user_data, db)
-    return tokens
+    import logging
+    import traceback
+    logger = logging.getLogger("login")
+    logger.info(f"Login attempt: username={user_data.username}")
+    try:
+        tokens = AuthService.login_user(user_data, db)
+        logger.info(f"Login successful: username={user_data.username}")
+        return tokens
+    except Exception as e:
+        logger.error(f"Login failed: username={user_data.username}, error={str(e)}, traceback={traceback.format_exc()}")
+        raise
 
 
 @router.post("/verify-otp", response_model=TokenResponse)

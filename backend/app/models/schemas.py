@@ -12,6 +12,7 @@ class UserCreate(BaseModel):
 class UserLogin(BaseModel):
     username: str
     password: str
+    otp: Optional[str] = None
 
 
 class OtpVerify(BaseModel):

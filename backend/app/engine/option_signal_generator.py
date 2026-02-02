@@ -9,6 +9,7 @@ from app.core.database import SessionLocal
 from app.models.auth import BrokerCredential
 from app.core.security import encryption_manager
 from app.strategies.market_intelligence import news_analyzer, trend_analyzer
+from app.engine.technical_indicators import calculate_comprehensive_signals
 
 # Example: You would replace this with actual NSE/BSE/3rd party API endpoints
 OPTION_CHAIN_URLS = {
@@ -82,11 +83,11 @@ def _build_kite(api_key: str, access_token: str) -> KiteConnect:
 
 def _validate_signal_quality(signal: dict, kite: KiteConnect, quote_data: dict) -> dict:
     """
-    Validate signal quality based on multiple factors:
+    Enhanced signal quality validation with technical indicators:
     - Volume: High/rising vs Low/stagnant
     - Trend Context: At support/reversal vs Random
     - Candle Close: Near day's high vs Near day's low
-    - Indicator Support: RSI, MACD confirm vs No confirmation
+    - Technical Indicators: RSI, MACD, Bollinger Bands
     - Market Sentiment: Broad market bullish vs weak
     """
     quality_score = 0
@@ -102,57 +103,123 @@ def _validate_signal_quality(signal: dict, kite: KiteConnect, quote_data: dict) 
         volume = quote_data.get("volume", 0)
         avg_volume = quote_data.get("average_price", 0)  # Approximate
         
+        # Try to get historical data for technical indicators
+        try:
+            # Get underlying index symbol
+            index_symbol = signal.get("index", "NIFTY")
+            symbol_map = {
+                "BANKNIFTY": "NSE:NIFTY BANK",
+                "NIFTY": "NSE:NIFTY 50",
+                "SENSEX": "BSE:SENSEX",
+                "FINNIFTY": "NSE:NIFTY FIN SERVICE"
+            }
+            underlying_symbol = symbol_map.get(index_symbol, "NSE:NIFTY 50")
+            
+            # Get historical data (last 100 candles for indicators)
+            from datetime import datetime, timedelta
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=30)
+            
+            historical = kite.historical_data(
+                instrument_token=kite.ltp(underlying_symbol)[underlying_symbol]["instrument_token"],
+                from_date=start_date,
+                to_date=end_date,
+                interval="5minute"
+            )
+            
+            if historical and len(historical) > 20:
+                prices = [candle["close"] for candle in historical]
+                highs = [candle["high"] for candle in historical]
+                lows = [candle["low"] for candle in historical]
+                volumes = [candle["volume"] for candle in historical]
+                
+                # Calculate comprehensive technical indicators
+                tech_analysis = calculate_comprehensive_signals(prices, highs, lows, volumes)
+                
+                # Store technical indicators in signal
+                signal["technical_indicators"] = {
+                    "rsi": tech_analysis.get("rsi", 50),
+                    "macd": tech_analysis.get("macd", {}),
+                    "bollinger": tech_analysis.get("bollinger_bands", {}),
+                    "volatility": tech_analysis.get("volatility", 0),
+                    "recommendation": tech_analysis.get("recommendation", "HOLD")
+                }
+                
+                # Enhanced scoring with technical indicators
+                # Factor 1: RSI (0-20 points)
+                rsi = tech_analysis.get("rsi", 50)
+                if 30 <= rsi <= 70:
+                    quality_score += 20
+                    quality_factors.append(f"✓ RSI healthy ({rsi:.1f})")
+                elif rsi < 30:
+                    quality_score += 15
+                    quality_factors.append(f"~ RSI oversold ({rsi:.1f})")
+                elif rsi > 70:
+                    quality_factors.append(f"⚠️ RSI overbought ({rsi:.1f})")
+                
+                # Factor 2: MACD (0-20 points)
+                macd = tech_analysis.get("macd", {})
+                if macd.get("crossover") == "bullish":
+                    quality_score += 20
+                    quality_factors.append("✓ MACD bullish crossover")
+                elif macd.get("histogram", 0) > 0:
+                    quality_score += 10
+                    quality_factors.append("~ MACD positive")
+                
+                # Factor 3: Bollinger Bands (0-20 points)
+                bb = tech_analysis.get("bollinger_bands", {})
+                bb_position = bb.get("position", 0.5)
+                if bb_position < 0.3:
+                    quality_score += 20
+                    quality_factors.append("✓ At lower BB (reversal)")
+                elif 0.4 <= bb_position <= 0.6:
+                    quality_score += 10
+                    quality_factors.append("~ Mid-range BB")
+                
+                # Factor 4: Overall Technical Recommendation (0-20 points)
+                recommendation = tech_analysis.get("recommendation", "HOLD")
+                if recommendation in ["STRONG BUY", "BUY"]:
+                    quality_score += 20
+                    quality_factors.append(f"✓ Tech signal: {recommendation}")
+                elif recommendation == "HOLD":
+                    quality_score += 10
+                    quality_factors.append(f"~ Tech signal: {recommendation}")
+                
+        except Exception as tech_error:
+            # Fallback to basic analysis if technical indicators fail
+            print(f"Technical indicators failed: {tech_error}, using basic analysis")
+            pass
+        
+        # Basic factors (when technical indicators unavailable)
         # Factor 1: Volume Analysis (0-25 points)
         if volume > avg_volume * 1.5:
-            quality_score += 25
+            quality_score += 10
             quality_factors.append("✓ High volume")
         elif volume > avg_volume * 1.2:
-            quality_score += 15
+            quality_score += 5
             quality_factors.append("~ Rising volume")
-        else:
-            quality_factors.append("✗ Low volume")
         
         # Factor 2: Candle Close Position (0-25 points)
         if high > low:
             close_position = (close - low) / (high - low)
             if close_position > 0.7:  # Close near high (bullish)
-                quality_score += 25
+                quality_score += 10
                 quality_factors.append("✓ Close near high")
             elif close_position > 0.5:
-                quality_score += 15
+                quality_score += 5
                 quality_factors.append("~ Close above mid")
-            else:
-                quality_factors.append("✗ Close near low")
         
         # Factor 3: Trend Context (0-25 points)
         change_pct = quote_data.get("net_change", 0)
         if abs(change_pct) > 1:  # Strong trend
-            quality_score += 25
+            quality_score += 10
             quality_factors.append("✓ Strong trend")
         elif abs(change_pct) > 0.5:
-            quality_score += 15
+            quality_score += 5
             quality_factors.append("~ Moderate trend")
-        else:
-            quality_factors.append("✗ Weak/no trend")
-        
-        # Factor 4: Simple RSI calculation (0-25 points)
-        # For real RSI, we'd need historical data - simplified version
-        price_change = close - open_price
-        if signal.get("option_type") == "CE":
-            if price_change > 0:  # Price rising for CE
-                quality_score += 20
-                quality_factors.append("✓ Price momentum aligned")
-            else:
-                quality_factors.append("✗ Price momentum weak")
-        else:  # PE
-            if price_change < 0:  # Price falling for PE
-                quality_score += 20
-                quality_factors.append("✓ Price momentum aligned")
-            else:
-                quality_factors.append("✗ Price momentum weak")
         
         # Update signal with quality assessment
-        signal["quality_score"] = quality_score
+        signal["quality_score"] = min(100, quality_score)  # Cap at 100
         signal["quality_factors"] = quality_factors
         signal["is_high_quality"] = quality_score >= 60  # 60+ is good signal
         
