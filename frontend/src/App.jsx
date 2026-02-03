@@ -11,6 +11,7 @@ export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [isLogin, setIsLogin] = useState(true);
   const [pendingOtpUser, setPendingOtpUser] = useState('');
+  const [otpMode, setOtpMode] = useState(null);
   const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
   const [mobile, setMobile] = useState('');
@@ -83,6 +84,7 @@ export default function App() {
           alert('✓ Registration successful! Enter the OTP sent to your email/mobile.');
           setPendingOtpUser(username);
           setOtp('');
+          setOtpMode('register');
           setIsLogin(false);
           setSubmitting(false);
           return;
@@ -90,6 +92,7 @@ export default function App() {
       } else if (response.status === 403 && data.detail && data.detail.toLowerCase().includes('otp')) {
         setPendingOtpUser(username);
         setOtp('');
+        setOtpMode('login');
         setError('Enter the OTP sent to your email/mobile to continue.');
         setSubmitting(false);
         return;
@@ -108,9 +111,18 @@ export default function App() {
     setError('');
     setSubmitting(true);
     try {
-      const response = await config.authFetch(config.endpoints.auth.verifyOtp || '/auth/verify-otp', {
+      const otpPayload = { username: pendingOtpUser || username, otp };
+      const otpEndpoint = otpMode === 'login'
+        ? config.endpoints.auth.login
+        : (config.endpoints.auth.verifyOtp || '/auth/verify-otp');
+
+      const response = await config.authFetch(otpEndpoint, {
         method: 'POST',
-        body: JSON.stringify({ username: pendingOtpUser || username, otp }),
+        body: JSON.stringify(
+          otpMode === 'login'
+            ? { ...otpPayload, password }
+            : otpPayload
+        ),
       });
 
       const data = await response.json();
@@ -118,6 +130,7 @@ export default function App() {
         localStorage.setItem('access_token', data.access_token);
         localStorage.setItem('refresh_token', data.refresh_token);
         setIsLoggedIn(true);
+        setOtpMode(null);
       } else {
         setError(data.detail || 'Invalid OTP');
       }

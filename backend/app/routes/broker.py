@@ -105,17 +105,6 @@ async def list_broker_credentials(
         BrokerCredential.user_id == user_id
     ).all()
     
-    # Debug: Print what's in database
-    print(f"\n{'='*60}")
-    print(f"DEBUG: User {user_id} credentials")
-    for cred in credentials:
-        print(f"  Broker {cred.id}: {cred.broker_name}")
-        print(f"    Has API Key: {bool(cred.api_key)}")
-        print(f"    Has Access Token: {bool(cred.access_token)}")
-        if cred.access_token:
-            print(f"    Token: {cred.access_token[:50]}...")
-    print(f"{'='*60}\n")
-    
     return [_build_broker_response(cred) for cred in credentials]
 
 @router.get("/credentials/{broker_name}", response_model=BrokerCredentialResponse)
@@ -169,18 +158,6 @@ async def get_broker_balance(
         (BrokerCredential.id == broker_id) &
         (BrokerCredential.user_id == user_id)
     ).first()
-    
-    if credential:
-        print(f"\n{'='*60}")
-        print(f"DEBUG: Broker credential found")
-        print(f"  ID: {credential.id}")
-        print(f"  User ID: {user_id}")
-        print(f"  Broker: {credential.broker_name}")
-        print(f"  Has API Key: {bool(credential.api_key)}")
-        print(f"  Has Access Token: {bool(credential.access_token)}")
-        if credential.access_token:
-            print(f"  Token Preview: {credential.access_token[:30]}...")
-        print(f"{'='*60}\n")
     
     # Use automated token manager to handle token refresh and fallback
     result = token_manager.get_balance_with_fallback(broker_id, db, user_id)

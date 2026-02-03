@@ -32,6 +32,8 @@ function AdminPanel({ user }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [updatingUserId, setUpdatingUserId] = useState(null);
+  const [deletingUserId, setDeletingUserId] = useState(null);
+  const [deletingBrokerId, setDeletingBrokerId] = useState(null);
   const [profileForm, setProfileForm] = useState({ username: '', email: '', mobile: '', password: '' });
   const [profileSaving, setProfileSaving] = useState(false);
 
@@ -130,6 +132,60 @@ function AdminPanel({ user }) {
       setError(err.message);
     } finally {
       setProfileSaving(false);
+    }
+  };
+
+  const deleteUser = async (targetId) => {
+    if (!window.confirm('Delete this user permanently?')) return;
+    setDeletingUserId(targetId);
+    setError('');
+    try {
+      const response = await config.authFetch(config.endpoints.admin.deleteUser(targetId), {
+        method: 'DELETE',
+      });
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(detail || 'Failed to delete user');
+      }
+      setSnapshot((prev) =>
+        prev
+          ? {
+              ...prev,
+              users: prev.users.filter((u) => u.id !== targetId),
+            }
+          : prev
+      );
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setDeletingUserId(null);
+    }
+  };
+
+  const deleteBroker = async (brokerId) => {
+    if (!window.confirm('Delete these broker credentials permanently?')) return;
+    setDeletingBrokerId(brokerId);
+    setError('');
+    try {
+      const response = await config.authFetch(config.endpoints.admin.deleteBroker(brokerId), {
+        method: 'DELETE',
+      });
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(detail || 'Failed to delete broker credentials');
+      }
+      setSnapshot((prev) =>
+        prev
+          ? {
+              ...prev,
+              brokers: prev.brokers.filter((b) => b.id !== brokerId),
+            }
+          : prev
+      );
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setDeletingBrokerId(null);
     }
   };
 
@@ -465,6 +521,21 @@ function AdminPanel({ user }) {
                       Verify User
                     </button>
                   ) : null}
+                  <button
+                    onClick={() => deleteUser(row.id)}
+                    disabled={deletingUserId === row.id}
+                    style={{
+                      padding: '6px 10px',
+                      borderRadius: '8px',
+                      border: 'none',
+                      background: '#dc2626',
+                      color: 'white',
+                      fontWeight: 700,
+                      cursor: deletingUserId === row.id ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    {deletingUserId === row.id ? 'Deleting...' : 'Delete'}
+                  </button>
                 </div>
               ),
             },
@@ -477,6 +548,27 @@ function AdminPanel({ user }) {
             { key: 'is_active', label: 'Active' },
             { key: 'created_at', label: 'Created' },
             { key: 'updated_at', label: 'Updated' },
+            {
+              key: 'actions',
+              label: 'Actions',
+              render: (row) => (
+                <button
+                  onClick={() => deleteBroker(row.id)}
+                  disabled={deletingBrokerId === row.id}
+                  style={{
+                    padding: '6px 10px',
+                    borderRadius: '8px',
+                    border: 'none',
+                    background: '#dc2626',
+                    color: 'white',
+                    fontWeight: 700,
+                    cursor: deletingBrokerId === row.id ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  {deletingBrokerId === row.id ? 'Deleting...' : 'Delete'}
+                </button>
+              ),
+            },
           ])}
 
           {renderTable('Orders', snapshot.orders, [

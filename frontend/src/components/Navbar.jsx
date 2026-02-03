@@ -12,8 +12,8 @@ export default function Navbar() {
   useEffect(() => {
     if (user) {
       fetchIndices();
-      // Refresh indices every 5 seconds
-      const interval = setInterval(fetchIndices, 5000);
+      // Refresh indices every 10 seconds
+      const interval = setInterval(fetchIndices, 10000);
       return () => clearInterval(interval);
     }
   }, [user]);

@@ -187,7 +187,8 @@ def _validate_signal_quality(signal: dict, kite: KiteConnect, quote_data: dict) 
                 
         except Exception as tech_error:
             # Fallback to basic analysis if technical indicators fail
-            print(f"Technical indicators failed: {tech_error}, using basic analysis")
+            # Silently fall back to basic analysis if technical indicators fail
+            pass
             pass
         
         # Basic factors (when technical indicators unavailable)
@@ -499,8 +500,8 @@ def analyze_option_chain(chain: Dict) -> Dict:
 _signals_cache = None
 _signals_cache_time = 0
 _signals_cache_lock = threading.Lock()
-_signals_cache_ttl = 30  # seconds
-_signals_rate_limit = 10  # seconds between calls
+_signals_cache_ttl = 60  # seconds - increased from 30 to reduce API calls
+_signals_rate_limit = 5  # seconds between calls - reduced from 10
 _signals_last_call = 0
 
 def generate_signals(user_id: int | None = None) -> List[Dict]:

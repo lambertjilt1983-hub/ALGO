@@ -101,8 +101,8 @@ const PaperTradingDashboard = () => {
   useEffect(() => {
     loadData();
     
-    // Update prices EVERY 1 SECOND - Real-time SL/Target detection
-    const priceUpdateInterval = setInterval(updatePrices, 1000);
+    // Update prices every 3 seconds for real-time SL/Target detection
+    const priceUpdateInterval = setInterval(updatePrices, 3000);
     
     return () => {
       clearInterval(priceUpdateInterval);
@@ -340,7 +340,10 @@ const PaperTradingDashboard = () => {
                   <th style={{ padding: '12px', textAlign: 'right' }}>Stop Loss</th>
                   <th style={{ padding: '12px', textAlign: 'right' }}>P&L</th>
                   <th style={{ padding: '12px', textAlign: 'right' }}>P&L %</th>
-                  <th style={{ padding: '12px', textAlign: 'left' }}>Entry Time</th>                  <th style={{ padding: '12px', textAlign: 'center' }}>Action</th>                </tr>
+                  <th style={{ padding: '12px', textAlign: 'center' }}>SL Status</th>
+                  <th style={{ padding: '12px', textAlign: 'left' }}>Entry Time</th>
+                  <th style={{ padding: '12px', textAlign: 'center' }}>Action</th>
+                </tr>
               </thead>
               <tbody>
                 {activeTrades.map((trade) => (
@@ -379,6 +382,44 @@ const PaperTradingDashboard = () => {
                       color: getPnLColor(trade.pnl)
                     }}>
                       {trade.pnl_percentage !== null && trade.pnl_percentage !== undefined ? (trade.pnl_percentage > 0 ? '+' : '') + trade.pnl_percentage.toFixed(2) + '%' : (trade.current_price && trade.entry_price && trade.entry_price > 0 ? (((trade.side === 'BUY' ? trade.current_price - trade.entry_price : trade.entry_price - trade.current_price) / trade.entry_price) * 100).toFixed(2) + '%' : '--')}
+                    </td>
+                    {/* Trailing SL Status */}
+                    <td style={{ padding: '12px', textAlign: 'center' }}>
+                      {(() => {
+                        const profit = trade.side === 'BUY' ? (trade.current_price || trade.entry_price) - trade.entry_price : trade.entry_price - (trade.current_price || trade.entry_price);
+                        
+                        // Check if target reached
+                        const targetReached = trade.target && (
+                          (trade.side === 'BUY' && (trade.current_price || trade.entry_price) >= trade.target) ||
+                          (trade.side === 'SELL' && (trade.current_price || trade.entry_price) <= trade.target)
+                        );
+                        
+                        // Target reached - 5pt trailing SL active (don't close, keep trailing)
+                        if (targetReached) {
+                          return (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', alignItems: 'center' }}>
+                              <span style={{ padding: '4px 8px', borderRadius: '4px', background: '#a78bfa', color: '#ffffff', fontWeight: '600', fontSize: '11px' }}>🚀 TRAILING +5PT</span>
+                              <span style={{ fontSize: '10px', color: '#666', fontWeight: '600' }}>Target hit! Let it run...</span>
+                            </div>
+                          );
+                        } else if (profit > 15) {
+                          return (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', alignItems: 'center' }}>
+                              <span style={{ padding: '4px 8px', borderRadius: '4px', background: '#c6f6d5', color: '#22543d', fontWeight: '600', fontSize: '11px' }}>🔄 TRAILING</span>
+                              <span style={{ fontSize: '10px', color: '#666' }}>+{profit.toFixed(0)}pts</span>
+                            </div>
+                          );
+                        } else if (profit > 5) {
+                          return (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', alignItems: 'center' }}>
+                              <span style={{ padding: '4px 8px', borderRadius: '4px', background: '#feebc8', color: '#92400e', fontWeight: '600', fontSize: '11px' }}>📌 BREAKEVEN</span>
+                              <span style={{ fontSize: '10px', color: '#666' }}>+{profit.toFixed(1)}pts</span>
+                            </div>
+                          );
+                        } else {
+                          return <span style={{ padding: '4px 8px', borderRadius: '4px', background: '#bee3f8', color: '#2c5282', fontWeight: '600', fontSize: '11px' }}>🎯 NORMAL</span>;
+                        }
+                      })()}
                     </td>
                     <td style={{ padding: '12px', fontSize: '12px', color: '#718096' }}>
                       {trade.entry_time ? new Date(trade.entry_time).toLocaleString() : '--'}

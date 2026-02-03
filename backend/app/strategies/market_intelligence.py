@@ -23,7 +23,7 @@ class NewsAnalyzer:
         self.news_sources = {
             'economic_times': 'https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms',
             'moneycontrol': 'https://www.moneycontrol.com/rss/marketreports.xml',
-            'business_standard': 'https://www.business-standard.com/rss/markets-106.rss'
+            # Removed business_standard - returns 403 Forbidden
         }
         self.request_timeout = 6
         
@@ -233,34 +233,27 @@ class MarketTrendAnalyzer:
         market_data: Dict[str, Dict[str, Any]] = {}
 
         # PRIMARY: Zerodha (Real broker connection)
-        print("[MarketIntelligence] Attempting Zerodha fetch (LIVE)...")
         zerodha_rows = self._fetch_zerodha_quotes()
         if zerodha_rows:
-            print(f"[MarketIntelligence] ✓ Zerodha data fetched: {list(zerodha_rows.keys())}")
             market_data.update(zerodha_rows)
             return market_data  # RETURN ONLY ZERODHA DATA - NO FALLBACKS
         
-        print("[MarketIntelligence] ⚠ Zerodha unavailable, trying NSE...")
         # SECONDARY: NSE direct feed (only if Zerodha failed)
         missing_indices = [idx for idx in self.indices if idx not in market_data]
         if missing_indices:
             nse_rows = self._fetch_nse_indices(missing_indices)
             if nse_rows:
-                print(f"[MarketIntelligence] ✓ NSE data fetched: {list(nse_rows.keys())}")
                 market_data.update(nse_rows)
                 return market_data  # Return NSE data - no further fallbacks
 
         # TERTIARY: Moneycontrol (last resort)
-        print("[MarketIntelligence] ⚠ NSE unavailable, trying Moneycontrol...")
         missing_indices = [idx for idx in self.indices if idx not in market_data]
         if missing_indices:
             mc_rows = self._fetch_moneycontrol_quotes(missing_indices)
             if mc_rows:
-                print(f"[MarketIntelligence] ✓ Moneycontrol data fetched: {list(mc_rows.keys())}")
                 market_data.update(mc_rows)
                 return market_data
 
-        print("[MarketIntelligence] ⚠ No live data available - returning empty")
         return market_data
 
     def _fetch_zerodha_quotes(self) -> Dict[str, Dict[str, Any]]:
@@ -271,7 +264,6 @@ class MarketTrendAnalyzer:
         self._hydrate_tokens_from_db()
 
         if not self.kite_api_key or not self.kite_access_token:
-            print("[MarketIntelligence] ✗ Zerodha: No API key or access token configured")
             return {}
 
         mapping = {
@@ -282,16 +274,12 @@ class MarketTrendAnalyzer:
         }
 
         try:
-            print("[MarketIntelligence] ▶ Connecting to Zerodha Kite API...")
             kite = KiteConnect(api_key=self.kite_api_key)
             kite.set_access_token(self.kite_access_token)
             instruments = [sym for sym in mapping.values() if sym]
-            print(f"[MarketIntelligence] ▶ Fetching LTP for: {instruments}")
             quotes = kite.ltp(instruments)
-            print(f"[MarketIntelligence] ✓ Zerodha LTP Response received: {list(quotes.keys()) if quotes else 'empty'}")
         except Exception as exc:
-            err = str(exc)
-            print(f"[MarketIntelligence] ✗ Zerodha quote fetch FAILED: {err}")
+            # Silently fail and fallback to NSE if Zerodha credentials invalid
             return {}
 
         rows: Dict[str, Dict[str, Any]] = {}

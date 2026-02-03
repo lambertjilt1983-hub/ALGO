@@ -93,6 +93,7 @@ export const config = {
       overview: '/admin/overview',
       updateUser: (id) => `/admin/users/${id}`,
       deleteUser: (id) => `/admin/users/${id}`,
+      deleteBroker: (id) => `/admin/brokers/${id}`,
     },
   },
   

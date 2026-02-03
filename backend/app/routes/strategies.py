@@ -39,6 +39,9 @@ async def get_live_professional_signal(
         "signal": action,
         "entry_price": best.get("entry_price"),
         "stop_loss": best.get("stop_loss"),
+        "target": best.get("target"),
+        "index": best.get("index"),
+        "option_type": best.get("option_type"),
         "source": "zerodha_option_chain",
     }
 

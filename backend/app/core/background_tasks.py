@@ -10,6 +10,7 @@ from app.models.auth import BrokerCredential
 from app.models.trading import PaperTrade
 from app.core.token_manager import token_manager
 from app.core.logger import logger
+from app.engine.paper_trade_updater import update_open_paper_trades
 from datetime import datetime, time
 
 # Create a session factory
@@ -79,6 +80,17 @@ def close_market_close_trades():
     finally:
         db.close()
 
+
+def update_open_paper_trades_task():
+    """Periodically update open paper trades to enforce SL even if frontend is idle."""
+    db = SessionLocal()
+    try:
+        update_open_paper_trades(db)
+    except Exception as e:
+        logger.log_error("Paper trade update task failed", {"error": str(e)})
+    finally:
+        db.close()
+
 def start_background_tasks():
     """Initialize and start background scheduler"""
     try:
@@ -105,9 +117,19 @@ def start_background_tasks():
             name='Auto-exit open trades at market close',
             replace_existing=True
         )
+
+        # Add paper trade price updates - runs every 10 seconds
+        scheduler.add_job(
+            update_open_paper_trades_task,
+            'interval',
+            seconds=10,
+            id='paper_trade_updates',
+            name='Update open paper trades (SL enforcement)',
+            replace_existing=True
+        )
         
         scheduler.start()
-        logger.log_error("Background tasks started", {
+        logger.log_info("Background tasks started", {
             "jobs": len(scheduler.get_jobs()),
             "market_close_time": "3:25 PM IST (3:25-3:30 PM IST window)"
         })

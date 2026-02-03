@@ -51,8 +51,8 @@ export default function Dashboard() {
     fetchData();
     fetchIndices();
     
-    // Refresh indices every 5 seconds
-    const interval = setInterval(fetchIndices, 5000);
+    // Refresh indices every 10 seconds
+    const interval = setInterval(fetchIndices, 10000);
     return () => clearInterval(interval);
   }, []);
 

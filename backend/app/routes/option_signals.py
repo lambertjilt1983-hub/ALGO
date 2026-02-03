@@ -12,4 +12,17 @@ def get_intraday_option_signals():
 @router.get("/intraday-advanced")
 async def get_intraday_option_signals_advanced(mode: str = "balanced"):
     """Get intraday signals with trend/news confirmation and adaptive targets."""
-    return {"signals": await generate_signals_advanced(mode=mode)}
+    import asyncio
+    try:
+        # 15-second timeout for signal generation
+        signals = await asyncio.wait_for(
+            generate_signals_advanced(mode=mode),
+            timeout=15.0
+        )
+        return {"signals": signals}
+    except asyncio.TimeoutError:
+        # Return cached signals if generation times out
+        from app.engine.option_signal_generator import _signals_cache
+        return {"signals": _signals_cache or [], "status": "timeout_using_cache"}
+    except Exception as e:
+        return {"signals": [], "error": str(e)}
