@@ -81,19 +81,28 @@ def generate_signals(df, capital=0):
         macd_falling = macd_hist < macd_hist_prev
         supertrend_val = df['Supertrend'][i]
         
-        # Long Entry (relaxed conditions for more signals)
-        if (above_vwap and (ema_cross_up or ema_bullish) and 30 < rsi_val < 75 and (macd_hist > 0 or macd_rising)):
+        # IMPROVED Entry Logic - Stricter conditions for better win rate
+        # Long Entry - ALL conditions must align for high-probability setup
+        if (above_vwap and 
+            (ema_cross_up or (ema_bullish and ema9 > ema21 * 1.002)) and  # Stronger EMA separation
+            35 < rsi_val < 65 and  # Tighter RSI range to avoid extremes
+            macd_hist > 0 and macd_rising and  # Both MACD conditions required
+            price > supertrend_val):  # Price must be above Supertrend for confirmation
             df.at[df.index[i], 'Signal'] = 'LONG'
             last_signal = 'LONG'
-        # Short Entry (relaxed conditions)
-        elif ((not above_vwap) and (ema_cross_down or ema_bearish) and 25 < rsi_val < 70 and (macd_hist < 0 or macd_falling)):
+        # Short Entry - ALL conditions must align
+        elif (not above_vwap and 
+              (ema_cross_down or (ema_bearish and ema9 < ema21 * 0.998)) and  # Stronger EMA separation
+              35 < rsi_val < 65 and  # Tighter RSI range  
+              macd_hist < 0 and macd_falling and  # Both MACD conditions required
+              price < supertrend_val):  # Price must be below Supertrend for confirmation
             df.at[df.index[i], 'Signal'] = 'SHORT'
             last_signal = 'SHORT'
-        # Exit
-        elif last_signal == 'LONG' and (price < supertrend_val or rsi_val > 75):
+        # Exit with tighter conditions to lock profits
+        elif last_signal == 'LONG' and (price < supertrend_val or rsi_val > 70 or macd_hist < 0):
             df.at[df.index[i], 'Signal'] = 'EXIT LONG'
             last_signal = None
-        elif last_signal == 'SHORT' and (price > supertrend_val or rsi_val < 25):
+        elif last_signal == 'SHORT' and (price > supertrend_val or rsi_val < 30 or macd_hist > 0):
             df.at[df.index[i], 'Signal'] = 'EXIT SHORT'
             last_signal = None
         # Debug info with more details

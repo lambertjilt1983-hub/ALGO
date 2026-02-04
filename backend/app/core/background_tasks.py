@@ -18,8 +18,11 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 scheduler = BackgroundScheduler()
 
-def validate_all_tokens():
-    """Validate all broker tokens and log status"""
+def validate_and_refresh_tokens():
+    """
+    Validate all broker tokens and automatically attempt refresh if needed
+    Runs every 5 minutes to keep tokens alive and prevent login expiration
+    """
     db = SessionLocal()
     try:
         # Get all active Zerodha credentials
@@ -28,21 +31,84 @@ def validate_all_tokens():
             (BrokerCredential.is_active == True)
         ).all()
         
+        total_credentials = len(credentials)
+        valid_count = 0
+        refreshed_count = 0
+        failed_count = 0
+        
         for credential in credentials:
-            is_valid = token_manager.validate_zerodha_token(credential)
+            try:
+                # First, validate current token
+                is_valid = token_manager.validate_zerodha_token(credential)
+                
+                if is_valid:
+                    valid_count += 1
+                    logger.log_info("Token validation", {
+                        "broker_id": credential.id,
+                        "user_id": credential.user_id,
+                        "status": "valid"
+                    })
+                else:
+                    # Token invalid - attempt automatic refresh using stored refresh_token
+                    logger.log_info("Token invalid - attempting automatic refresh", {
+                        "broker_id": credential.id,
+                        "user_id": credential.user_id,
+                        "broker_name": credential.broker_name
+                    })
+                    
+                    refresh_result = token_manager.refresh_zerodha_token(
+                        broker_id=credential.id,
+                        db=db,
+                        request_token=None  # Use stored refresh_token
+                    )
+                    
+                    if refresh_result.get("status") == "success":
+                        refreshed_count += 1
+                        logger.log_info("Token automatically refreshed", {
+                            "broker_id": credential.id,
+                            "user_id": credential.user_id,
+                            "broker_name": credential.broker_name
+                        })
+                    elif refresh_result.get("status") == "requires_reauth":
+                        failed_count += 1
+                        logger.log_error("Token refresh requires re-authentication", {
+                            "broker_id": credential.id,
+                            "user_id": credential.user_id,
+                            "broker_name": credential.broker_name,
+                            "action": "user_must_login_via_zerodha"
+                        })
+                    else:
+                        failed_count += 1
+                        logger.log_error("Token refresh failed", {
+                            "broker_id": credential.id,
+                            "user_id": credential.user_id,
+                            "error": refresh_result.get("message")
+                        })
             
-            if not is_valid and credential.access_token:
-                logger.log_error("Token validation failed", {
+            except Exception as e:
+                failed_count += 1
+                logger.log_error("Token validation/refresh error", {
                     "broker_id": credential.id,
-                    "user_id": credential.user_id,
-                    "broker_name": credential.broker_name,
-                    "action": "user_should_re-authenticate"
+                    "error": str(e)
                 })
+        
+        # Log summary
+        logger.log_info("Token validation/refresh cycle completed", {
+            "total": total_credentials,
+            "valid": valid_count,
+            "refreshed": refreshed_count,
+            "failed": failed_count
+        })
     
     except Exception as e:
-        logger.log_error("Token validation task failed", {"error": str(e)})
+        logger.log_error("Token validation/refresh task failed", {"error": str(e)})
     finally:
         db.close()
+
+
+def validate_all_tokens():
+    """Legacy function - now calls the enhanced version"""
+    validate_and_refresh_tokens()
 
 def close_market_close_trades():
     """Close all open trades at market closing time (3:25 PM IST)"""
@@ -98,13 +164,13 @@ def start_background_tasks():
         if scheduler.running:
             scheduler.shutdown(wait=False)
         
-        # Add token validation task - runs every 30 minutes
+        # Add token validation & auto-refresh task - runs every 5 minutes
         scheduler.add_job(
-            validate_all_tokens,
+            validate_and_refresh_tokens,
             'interval',
-            minutes=30,
-            id='validate_tokens',
-            name='Validate all broker tokens',
+            minutes=5,
+            id='validate_and_refresh_tokens',
+            name='Validate and auto-refresh broker tokens every 5 minutes',
             replace_existing=True
         )
         

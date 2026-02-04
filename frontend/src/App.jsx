@@ -4,6 +4,7 @@ import { Routes, Route, useNavigate } from 'react-router-dom';
 import Dashboard from './Dashboard';
 import AutoTradingDashboard from './components/AutoTradingDashboard';
 import config from './config/api';
+import useTokenRefresh from './hooks/useTokenRefresh';
 import './App.css';
 
 
@@ -22,6 +23,9 @@ export default function App() {
   const [submitting, setSubmitting] = useState(false);
   const navigate = useNavigate();
 
+  // 🔄 AUTO TOKEN REFRESH - Prevents login expiration every 5 minutes
+  useTokenRefresh();
+
   useEffect(() => {
     const token = localStorage.getItem('access_token');
     console.log('[App] Checking auth token:', !!token);
@@ -36,10 +40,6 @@ export default function App() {
 
   console.log('[App] Rendering - isLoggedIn:', isLoggedIn, 'loading:', loading);
   
-  if (loading) {
-    return <div style={{ textAlign: 'center', padding: '50px' }}>Loading...</div>;
-  }
-
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
@@ -141,8 +141,7 @@ export default function App() {
     }
   };
 
-  if (!isLoggedIn) {
-    // Show login/register form
+  const renderLoginPage = () => {
     return (
       <div style={{ minHeight: '100vh', backgroundColor: '#f3f4f6' }}>
         {/* Navbar */}
@@ -406,13 +405,14 @@ export default function App() {
         </div>
       </div>
     );
-  }
+  };
 
-  // If logged in, use routes
-  console.log('[App] Rendering routes for logged in user');
+  // Use Routes for all navigation
+  console.log('[App] Rendering routes');
   return (
     <Routes>
-      <Route path="/autotrading" element={
+      <Route path="/" element={!isLoggedIn ? renderLoginPage() : <Dashboard />} />
+      <Route path="/autotrading" element={!isLoggedIn ? renderLoginPage() : (
         <div>
           <div style={{ 
             padding: '30px', 
@@ -428,8 +428,8 @@ export default function App() {
           </div>
           <AutoTradingDashboard />
         </div>
-      } />
-      <Route path="/*" element={<Dashboard />} />
+      )} />
+      <Route path="/*" element={!isLoggedIn ? renderLoginPage() : <Dashboard />} />
     </Routes>
   );
 }

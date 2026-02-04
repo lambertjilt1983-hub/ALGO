@@ -222,15 +222,18 @@ def _validate_signal_quality(signal: dict, kite: KiteConnect, quote_data: dict) 
         # Update signal with quality assessment
         signal["quality_score"] = min(100, quality_score)  # Cap at 100
         signal["quality_factors"] = quality_factors
-        signal["is_high_quality"] = quality_score >= 60  # 60+ is good signal
+        signal["is_high_quality"] = quality_score >= 70  # Raised from 60 to 70 for stricter quality
         
-        # Adjust confidence based on quality
-        if quality_score >= 80:
-            signal["confidence"] = min(95, signal.get("confidence", 75) + 10)
-        elif quality_score >= 60:
+        # Adjust confidence based on quality - be more conservative
+        if quality_score >= 85:
+            signal["confidence"] = min(95, signal.get("confidence", 75) + 8)
+        elif quality_score >= 70:
             signal["confidence"] = signal.get("confidence", 75)
+        elif quality_score >= 55:
+            signal["confidence"] = max(60, signal.get("confidence", 75) - 10)
         else:
-            signal["confidence"] = max(50, signal.get("confidence", 75) - 15)
+            signal["confidence"] = max(50, signal.get("confidence", 75) - 20)
+            signal["is_high_quality"] = False  # Mark as low quality if score < 55
             
     except Exception as e:
         signal["quality_score"] = 0
@@ -569,10 +572,43 @@ def generate_signals(user_id: int | None = None) -> List[Dict]:
         return signals
 
 def select_best_signal(signals: List[Dict]) -> Dict | None:
+    """
+    Select the best signal based on quality score, confidence, and filters.
+    Now with stricter filtering to avoid low-quality signals that lead to losses.
+    """
+    # Filter out error signals and signals without required data
     viable = [s for s in signals if not s.get("error") and s.get("symbol") and s.get("entry_price")]
     if not viable:
         return None
-    return max(viable, key=lambda s: s.get("confirmation_score", s.get("confidence", 0)))
+    
+    # CRITICAL: Filter out low-quality signals (quality_score < 65)
+    # This prevents most losing trades by avoiding weak/choppy setups
+    high_quality = [s for s in viable if s.get("quality_score", 0) >= 65]
+    if high_quality:
+        viable = high_quality  # Prefer high-quality signals
+    else:
+        # If no high-quality signals, at least require quality_score >= 55
+        viable = [s for s in viable if s.get("quality_score", 0) >= 55]
+        if not viable:
+            return None  # No acceptable quality signals
+    
+    # Filter out signals with unfavorable risk:reward ratio (< 1.3:1)
+    def get_risk_reward(s):
+        entry = float(s.get("entry_price", 0) or 0)
+        target = float(s.get("target", 0) or 0)
+        sl = float(s.get("stop_loss", 0) or 0)
+        if entry and target and sl:
+            profit = abs(target - entry)
+            risk = abs(entry - sl)
+            return profit / risk if risk > 0 else 0
+        return 0
+    
+    good_rr = [s for s in viable if get_risk_reward(s) >= 1.3]
+    if good_rr:
+        viable = good_rr
+    
+    # Select best by confirmation score (with quality and confidence)
+    return max(viable, key=lambda s: s.get("confirmation_score", s.get("confidence", 0)) * (s.get("quality_score", 50) / 100))
 
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:

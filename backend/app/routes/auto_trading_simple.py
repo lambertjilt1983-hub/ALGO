@@ -12,6 +12,8 @@ async def reset_daily_loss(authorization: Optional[str] = Header(None)):
 """Auto Trading Engine wired to live market data (no mocks)."""
 
 import math
+import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -26,20 +28,30 @@ from app.engine.simple_momentum_strategy import SimpleMomentumStrategy
 
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
 
-MAX_TRADES = 6  # allow more intraday trades when signals align
-TARGET_PCT = 0.6  # target move in percent (slightly above stop for RR >= 1)
-STOP_PCT = 0.4    # stop move in percent (tighter risk)
-CONFIRM_MOMENTUM_PCT = 0.1  # very loose confirmation so signals appear on small moves
-MIN_WIN_RATE = 0.6          # suppress signals if recent hit-rate is below this
-MIN_WIN_SAMPLE = 8          # minimum closed trades before applying win-rate gate
+MAX_TRADES = 1  # 1 trade at a time - better loss control
+TARGET_PCT = 2.5  # 2.5% target (25 points on Nifty options)
+STOP_PCT = 0.06   # 10-point max stop loss to cap losses
+MAX_STOP_POINTS = 10  # Maximum 10 points stop loss
+CONFIRM_MOMENTUM_PCT = 0.5  # Strong momentum (0.5% minimum move)
+MIN_WIN_RATE = 0.70         # High win rate requirement (70%+)
+MIN_WIN_SAMPLE = 5          # Require 5 trades to assess win rate
+EMERGENCY_STOP_MULTIPLIER = 0.65  # Emergency exit at 65% of stop (6.5 points) to prevent slippage
+MAX_LOSS_PER_TRADE_PCT = 1.0  # Never lose more than 1% per trade on capital
 
-# Risk controls (can be made configurable later)
+# AGGRESSIVE LOSS MANAGEMENT: 3000 daily loss limit, 10000 profit limit
 risk_config = {
-    "max_daily_loss": 5000.0,         # hard stop on daily drawdown
-    "max_position_pct": 0.15,         # 15% per position so a single options lot fits on 100k balance
-    "max_portfolio_pct": 0.45,        # allow multiple lots while keeping portfolio cap
-    "cooldown_minutes": 5,            # cooldown after a stop (placeholder)
-    "min_momentum_pct": 0.05,         # very low floor so quiet sessions still signal
+    "max_daily_loss": 5000.0,        # ₹5000 max daily loss (hardstop to protect capital)
+    "max_daily_profit": 10000.0,     # ₹10000 daily profit target (auto-stop at profit)
+    "max_per_trade_loss": 600.0,     # ₹600 max loss per trade (prevent single trade disaster)
+    "max_consecutive_losses": 0,     # NO consecutive loss limit - immediate loss checking
+    "max_position_pct": 0.10,        # 10% max per position
+    "max_portfolio_pct": 0.10,       # 10% total exposure
+    "cooldown_minutes": 0,           # NO COOLDOWN - trade immediately if conditions met
+    "min_momentum_pct": 0.5,         # Very strong momentum (0.5%) - avoid weak entries
+    "min_trend_strength": 0.8,       # HIGH trend strength (80%) required - quality only
+    "require_trend_confirmation": True,  # STRICT: Confirm trend before entry
+    "min_win_rate_threshold": 0.70,  # Only trade if win rate > 70%
+    "avoid_high_volatility": True,   # Skip trades in extremely volatile markets
 }
 
 trade_window = {
@@ -49,13 +61,23 @@ trade_window = {
 
 trail_config = {
     "enabled": True,
-    "trigger_pct": 0.2,   # start trailing earlier to lock gains
-    "step_pct": 0.1,      # move stop every additional +0.1% move
-    "buffer_pct": 0.05,   # keep a small buffer from entry when arming
+    "trigger_pct": 0.3,   # Start trailing at 0.3% profit to lock in gains
+    "step_pct": 0.15,     # Move stop every additional +0.15% move (wider steps)
+    "buffer_pct": 0.1,    # Keep 0.1% buffer to avoid premature exits
 }
-BREAKEVEN_TRIGGER_PCT = 0.2  # move stop to breakeven once price moves this much in favor
+BREAKEVEN_TRIGGER_PCT = 0.4  # Move stop to breakeven at 0.4% profit (lock in gains earlier)
 
-state = {"is_demo_mode": False, "live_armed": True, "daily_loss": 0.0, "daily_date": datetime.now().date()}
+state = {
+    "is_demo_mode": False,
+    "live_armed": True,
+    "daily_loss": 0.0,
+    "daily_profit": 0.0,  # NEW: Track daily profit
+    "daily_date": datetime.now().date(),
+    "consecutive_losses": 0,
+    "last_loss_time": None,
+    "trading_paused": False,  # NEW: Pause if profit/loss limits hit
+    "pause_reason": None,  # NEW: Why trading is paused
+}
 active_trades: List[Dict] = []
 history: List[Dict] = []
 broker_logs: List[Dict] = []
@@ -75,6 +97,11 @@ def _reset_daily_if_needed():
     if state.get("daily_date") != today:
         state["daily_date"] = today
         state["daily_loss"] = 0.0
+        state["daily_profit"] = 0.0  # Reset daily profit
+        state["consecutive_losses"] = 0
+        state["last_loss_time"] = None
+        state["trading_paused"] = False  # Reset pause flag
+        state["pause_reason"] = None
 
 
 def _recent_win_rate(limit: int = 20) -> Tuple[float, int]:
@@ -110,6 +137,201 @@ def _within_trade_window() -> bool:
     start = now.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
     end = now.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
     return start <= now <= end
+
+
+def _analyze_trend_strength(symbol: str) -> Dict[str, float]:
+    """
+    Advanced AI-based trend analysis with multiple indicators
+    Returns trend strength score (0-1) and directional bias
+    """
+    try:
+        import yfinance as yf
+        import pandas as pd
+        import numpy as np
+        
+        # Fetch multi-timeframe data for comprehensive analysis
+        ticker = yf.Ticker(symbol)
+        df_5m = ticker.history(period="1d", interval="5m")
+        df_15m = ticker.history(period="5d", interval="15m")
+        df_1h = ticker.history(period="1mo", interval="1h")
+        
+        if df_5m.empty or df_15m.empty or df_1h.empty:
+            return {"strength": 0.0, "direction": 0, "quality": "poor"}
+        
+        scores = []
+        
+        # 1. Moving Average Alignment (30% weight)
+        for df, weight in [(df_5m, 0.3), (df_15m, 0.4), (df_1h, 0.3)]:
+            if len(df) < 20:
+                continue
+            df['MA5'] = df['Close'].rolling(5).mean()
+            df['MA10'] = df['Close'].rolling(10).mean()
+            df['MA20'] = df['Close'].rolling(20).mean()
+            
+            last = df.iloc[-1]
+            # Check alignment: MA5 > MA10 > MA20 (bullish) or reverse (bearish)
+            if last['Close'] > last['MA5'] > last['MA10'] > last['MA20']:
+                scores.append(weight * 1.0)  # Strong bullish alignment
+            elif last['Close'] < last['MA5'] < last['MA10'] < last['MA20']:
+                scores.append(weight * 1.0)  # Strong bearish alignment
+            elif last['Close'] > last['MA5'] > last['MA10']:
+                scores.append(weight * 0.7)  # Moderate bullish
+            elif last['Close'] < last['MA5'] < last['MA10']:
+                scores.append(weight * 0.7)  # Moderate bearish
+            else:
+                scores.append(0.0)  # Mixed/choppy
+        
+        # 2. RSI Momentum (20% weight)
+        df_close = df_5m['Close']
+        delta = df_close.diff()
+        gain = delta.where(delta > 0, 0).rolling(14).mean()
+        loss = -delta.where(delta < 0, 0).rolling(14).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        last_rsi = rsi.iloc[-1]
+        
+        # RSI between 40-60 = weak/choppy, >70 or <30 = strong trend
+        if last_rsi > 70 or last_rsi < 30:
+            scores.append(0.2 * 1.0)  # Strong momentum
+        elif last_rsi > 60 or last_rsi < 40:
+            scores.append(0.2 * 0.6)  # Moderate
+        else:
+            scores.append(0.0)  # Neutral/choppy
+        
+        # 3. Volume Confirmation (20% weight)
+        avg_vol = df_5m['Volume'].rolling(20).mean().iloc[-1]
+        recent_vol = df_5m['Volume'].iloc[-5:].mean()
+        if recent_vol > avg_vol * 1.2:
+            scores.append(0.2 * 1.0)  # Strong volume surge
+        elif recent_vol > avg_vol:
+            scores.append(0.2 * 0.5)  # Moderate volume
+        else:
+            scores.append(0.0)  # Weak volume
+        
+        # 4. Price Action Consistency (30% weight)
+        last_5_candles = df_5m.iloc[-5:]
+        bullish_candles = sum(1 for _, row in last_5_candles.iterrows() if row['Close'] > row['Open'])
+        bearish_candles = 5 - bullish_candles
+        
+        if bullish_candles >= 4:
+            scores.append(0.3 * 1.0)  # Strong bullish consistency
+        elif bearish_candles >= 4:
+            scores.append(0.3 * 1.0)  # Strong bearish consistency
+        elif bullish_candles == 3:
+            scores.append(0.3 * 0.6)  # Moderate bullish
+        elif bearish_candles == 3:
+            scores.append(0.3 * 0.6)  # Moderate bearish
+        else:
+            scores.append(0.0)  # Choppy/mixed
+        
+        # Compute final strength score
+        total_strength = sum(scores)
+        
+        # Determine direction
+        current_price = df_5m['Close'].iloc[-1]
+        ma20_5m = df_5m['Close'].rolling(20).mean().iloc[-1]
+        direction = 1 if current_price > ma20_5m else -1
+        
+        # Quality assessment
+        if total_strength >= 0.7:
+            quality = "excellent"
+        elif total_strength >= 0.5:
+            quality = "good"
+        elif total_strength >= 0.3:
+            quality = "fair"
+        else:
+            quality = "poor"
+        
+        return {
+            "strength": round(total_strength, 2),
+            "direction": direction,
+            "quality": quality,
+            "rsi": round(last_rsi, 2),
+            "volume_ratio": round(recent_vol / avg_vol, 2) if avg_vol > 0 else 0
+        }
+    
+    except Exception as e:
+        print(f"[TREND ANALYSIS ERROR] {symbol}: {e}")
+        return {"strength": 0.0, "direction": 0, "quality": "error"}
+
+
+def _detect_market_regime(symbol: str) -> Dict[str, any]:
+    """
+    AI-based market regime detection to determine optimal trading conditions
+    Identifies: TRENDING, RANGING, VOLATILE, QUIET
+    """
+    try:
+        import yfinance as yf
+        import numpy as np
+        
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period="5d", interval="5m")
+        
+        if df.empty or len(df) < 50:
+            return {"regime": "UNKNOWN", "score": 0.0, "tradeable": False}
+        
+        # Calculate ATR (Average True Range) for volatility
+        high_low = df['High'] - df['Low']
+        high_close = abs(df['High'] - df['Close'].shift())
+        low_close = abs(df['Low'] - df['Close'].shift())
+        true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        atr = true_range.rolling(14).mean().iloc[-1]
+        avg_price = df['Close'].iloc[-1]
+        atr_pct = (atr / avg_price) * 100
+        
+        # Calculate ADX (Average Directional Index) for trend strength
+        high = df['High']
+        low = df['Low']
+        close = df['Close']
+        
+        plus_dm = high.diff()
+        minus_dm = -low.diff()
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm < 0] = 0
+        
+        tr = true_range
+        atr_14 = tr.rolling(14).mean()
+        
+        plus_di = 100 * (plus_dm.rolling(14).mean() / atr_14)
+        minus_di = 100 * (minus_dm.rolling(14).mean() / atr_14)
+        
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+        adx = dx.rolling(14).mean().iloc[-1]
+        
+        # Detect regime
+        regime = "UNKNOWN"
+        tradeable = False
+        score = 0.0
+        
+        if adx > 25 and atr_pct > 0.3:
+            regime = "TRENDING"
+            tradeable = True  # Best for our strategy
+            score = min(1.0, adx / 40)
+        elif adx < 20 and atr_pct < 0.2:
+            regime = "RANGING"
+            tradeable = False  # Avoid choppy markets
+            score = 0.2
+        elif atr_pct > 0.5:
+            regime = "VOLATILE"
+            tradeable = False  # Too risky for 10-point stops
+            score = 0.1
+        else:
+            regime = "QUIET"
+            tradeable = False  # Not enough momentum
+            score = 0.3
+        
+        return {
+            "regime": regime,
+            "adx": round(adx, 2),
+            "atr_pct": round(atr_pct, 3),
+            "tradeable": tradeable,
+            "score": round(score, 2),
+            "recommendation": "ENTER" if tradeable and score > 0.6 else "WAIT"
+        }
+    
+    except Exception as e:
+        print(f"[REGIME DETECTION ERROR] {symbol}: {e}")
+        return {"regime": "ERROR", "score": 0.0, "tradeable": False}
 
 
 @router.post("/toggle")
@@ -202,7 +424,23 @@ def _close_trade(trade: Dict[str, any], exit_price: float) -> None:
         "pnl": round(pnl, 2),
     })
     history.append(trade.copy())
+    
+    # Track daily P&L (both loss and profit)
     state["daily_loss"] += pnl
+    state["daily_profit"] = state.get("daily_profit", 0.0) + max(0, pnl)  # Track only wins
+    
+    print(f"\n[TRADE CLOSED] P&L: ₹{pnl:.2f}")
+    print(f"  Daily Loss: ₹{state['daily_loss']:.2f} / ₹{risk_config['max_daily_loss']}")
+    print(f"  Daily Profit: ₹{state['daily_profit']:.2f} / ₹{risk_config['max_daily_profit']}")
+    
+    # Track consecutive losses for risk management (NO COOLDOWN - just log)
+    if pnl < 0:
+        state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
+        state["last_loss_time"] = datetime.now()
+        print(f"  ⚠️ Consecutive losses: {state['consecutive_losses']}")
+    else:
+        state["consecutive_losses"] = 0
+        print(f"  ✅ Win! Resetting consecutive loss counter")
 
     # Persist closed trade to database for reporting
     try:
@@ -236,15 +474,31 @@ def _close_trade(trade: Dict[str, any], exit_price: float) -> None:
 
 
 def _stop_hit(trade: Dict[str, any], price: float) -> bool:
+    """Check if stop loss is hit, with emergency stop buffer to prevent slippage losses"""
     side = trade.get("side", "BUY").upper()
     stop_loss = trade.get("stop_loss")
     trail_stop = trade.get("trail_stop") if trade.get("trail_active") else None
     if stop_loss is None:
         return False
+    
     effective_stop = trail_stop if trail_stop is not None else stop_loss
+    entry_price = trade.get("price", 0)
+    
+    # Calculate emergency stop (slightly before actual stop to prevent slippage)
+    if entry_price > 0:
+        stop_distance = abs(entry_price - effective_stop)
+        emergency_distance = stop_distance * EMERGENCY_STOP_MULTIPLIER
+        if side == "BUY":
+            emergency_stop = entry_price - emergency_distance
+        else:
+            emergency_stop = entry_price + emergency_distance
+    else:
+        emergency_stop = effective_stop
+    
+    # Check emergency stop first (tighter), then regular stop
     if side == "BUY":
-        return price <= effective_stop
-    return price >= effective_stop
+        return price <= emergency_stop or price <= effective_stop
+    return price >= emergency_stop or price >= effective_stop
 
 
 def _calc_weekly_expiry(today: datetime) -> datetime:
@@ -333,15 +587,28 @@ def _signal_from_index(symbol: str, data: Dict[str, any], instrument_type: str, 
     support = data.get("support")
     resistance = data.get("resistance")
 
+    # Require minimum momentum confirmation
     if abs_change < CONFIRM_MOMENTUM_PCT:
         return None
-
-    # Relaxed confirmations to surface signals even on choppy days
-    if direction == "BUY":
-        if rsi < 45 or rsi > 85:
+    
+    # Additional quality filters for better win rate
+    # Require decent volume - avoid low liquidity signals
+    if volume_bucket.lower() == "low":
+        return None
+    
+    # For strong directional moves, prefer strong strength confirmation
+    if abs_change > 0.5:  # Significant move
+        if strength.lower() not in ["strong", "moderate"]:
             return None
-    else:
-        if rsi > 55 or rsi < 15:
+
+    # Stricter RSI filters to avoid extreme conditions and improve win rate
+    if direction == "BUY":
+        # For BUY: RSI should be 40-70 (avoid overbought and extreme oversold)
+        if rsi < 40 or rsi > 70:
+            return None
+    else:  # SELL
+        # For SELL: RSI should be 30-60 (avoid oversold and extreme overbought)
+        if rsi > 60 or rsi < 30:
             return None
 
     target_move = price * (TARGET_PCT / 100)
@@ -569,6 +836,12 @@ async def status(authorization: Optional[str] = Header(None)):
         "win_rate": round(win_rate * 100, 2),
         "win_sample": win_sample,
         "daily_pnl": state.get("daily_loss", 0.0),
+        "daily_loss": state.get("daily_loss", 0.0),
+        "daily_loss_limit": risk_config["max_daily_loss"],
+        "daily_profit": state.get("daily_profit", 0.0),
+        "daily_profit_limit": risk_config["max_daily_profit"],
+        "trading_paused": state.get("trading_paused", False),
+        "pause_reason": state.get("pause_reason"),
         "capital_in_use": round(capital_in_use, 2),
         "timestamp": _now(),
     }
@@ -594,6 +867,30 @@ async def analyze(
     _reset_daily_if_needed()
     if state.get("daily_loss", 0) <= -risk_config["max_daily_loss"]:
         raise HTTPException(status_code=403, detail="Daily loss limit breached; trading locked for the day.")
+    
+    # Check consecutive losses - prevent trading after multiple losses
+    if state.get("consecutive_losses", 0) >= risk_config["max_consecutive_losses"]:
+        last_loss = state.get("last_loss_time")
+        cooldown_minutes = risk_config.get("cooldown_minutes", 15)
+        if last_loss:
+            elapsed = (datetime.now() - last_loss).total_seconds() / 60
+            if elapsed < cooldown_minutes:
+                raise HTTPException(
+                    status_code=403, 
+                    detail=f"Consecutive loss limit reached ({risk_config['max_consecutive_losses']}). Cooling down for {int(cooldown_minutes - elapsed)} more minutes."
+                )
+            else:
+                # Reset after cooldown period
+                state["consecutive_losses"] = 0
+                state["last_loss_time"] = None
+    
+    # Check per-trade loss limit before entry
+    potential_loss = abs(trade.price - (trade.stop_loss or (trade.price * (1 - STOP_PCT/100)))) * (trade.quantity or 1)
+    if potential_loss > risk_config.get("max_per_trade_loss", 500):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Potential loss ₹{potential_loss:.2f} exceeds per-trade limit ₹{risk_config['max_per_trade_loss']}"
+        )
 
     # Enforce live trading window.
     if not _within_trade_window():
@@ -694,8 +991,82 @@ async def execute(
         raise HTTPException(status_code=400, detail="Live trading not armed. Call /autotrade/arm first.")
 
     _reset_daily_if_needed()
+    
+    # ═══════════════════════════════════════════════════════════════
+    # LOSS & PROFIT LIMIT CHECKS (NEW)
+    # ═══════════════════════════════════════════════════════════════
+    
+    # Check if daily loss limit breached
     if state.get("daily_loss", 0) <= -risk_config["max_daily_loss"]:
-        raise HTTPException(status_code=403, detail="Daily loss limit breached; trading locked for the day.")
+        state["trading_paused"] = True
+        state["pause_reason"] = f"Daily loss limit (₹{risk_config['max_daily_loss']}) breached"
+        raise HTTPException(
+            status_code=403,
+            detail=f"🛑 Daily loss limit ₹{risk_config['max_daily_loss']} breached. Trading locked for protection."
+        )
+    
+    # Check if daily profit target reached (NEW!)
+    if state.get("daily_profit", 0) >= risk_config["max_daily_profit"]:
+        state["trading_paused"] = True
+        state["pause_reason"] = f"Daily profit target (₹{risk_config['max_daily_profit']}) reached"
+        raise HTTPException(
+            status_code=403,
+            detail=f"🎉 Daily profit target ₹{risk_config['max_daily_profit']} reached! Trading paused. Enjoy your profits!"
+        )
+    
+    # Check if trading is paused due to limits
+    if state.get("trading_paused", False):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Trading paused: {state.get('pause_reason', 'System pause')}"
+        )
+    
+    # ═══════════════════════════════════════════════════════════════
+    # ADVANCED AI-BASED ENTRY VALIDATION (NEW)
+    # ═══════════════════════════════════════════════════════════════
+    
+    if not auto_demo and risk_config.get("require_trend_confirmation", True):
+        # Step 1: Market Regime Detection
+        print(f"[AI ANALYSIS] Detecting market regime for {trade.symbol}...")
+        regime = _detect_market_regime(trade.symbol)
+        print(f"[AI ANALYSIS] Regime: {regime['regime']} | ADX: {regime.get('adx', 0)} | Tradeable: {regime['tradeable']}")
+        
+        if not regime["tradeable"]:
+            raise HTTPException(
+                status_code=403, 
+                detail=f"Market regime '{regime['regime']}' not suitable for trading. Recommendation: {regime.get('recommendation', 'WAIT')}"
+            )
+        
+        # Step 2: Trend Strength Analysis
+        print(f"[AI ANALYSIS] Analyzing trend strength for {trade.symbol}...")
+        trend = _analyze_trend_strength(trade.symbol)
+        print(f"[AI ANALYSIS] Trend Strength: {trend['strength']} | Quality: {trend['quality']} | Direction: {trend['direction']}")
+        
+        min_trend = risk_config.get("min_trend_strength", 0.7)
+        if trend["strength"] < min_trend:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Trend strength {trend['strength']} below minimum {min_trend}. Quality: {trend['quality']}"
+            )
+        
+        # Step 3: Direction Confirmation
+        expected_direction = 1 if trade.side.upper() == "BUY" else -1
+        if trend["direction"] != expected_direction:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Trend direction mismatch: {trade.side} signal but trend is {'DOWN' if trend['direction'] < 0 else 'UP'}"
+            )
+        
+        # Step 4: Volume & RSI Validation
+        if trend.get("volume_ratio", 0) < 1.0:
+            print(f"[AI WARNING] Low volume ({trend['volume_ratio']}x avg) - proceed with caution")
+        
+        if trend.get("rsi", 50) > 75 or trend.get("rsi", 50) < 25:
+            print(f"[AI WARNING] Extreme RSI ({trend['rsi']}) - potential reversal risk")
+        
+        print(f"[AI ANALYSIS] ✓ ALL CHECKS PASSED - Trade approved with {trend['quality']} setup quality")
+    
+    # ═══════════════════════════════════════════════════════════════
 
     # Enforce live trading window.
     if not _within_trade_window() and not auto_demo:
@@ -705,6 +1076,10 @@ async def execute(
     if len(active_trades) >= MAX_TRADES and not auto_demo:
         raise HTTPException(status_code=429, detail="Max active trades reached")
 
+    # ═══════════════════════════════════════════════════════════════
+    # 10-POINT MAX STOP LOSS VALIDATION (NEW)
+    # ═══════════════════════════════════════════════════════════════
+    
     pct = STOP_PCT / 100
     derived_stop = trade.stop_loss
     if derived_stop is None:
@@ -712,6 +1087,29 @@ async def execute(
             derived_stop = round(trade.price * (1 - pct), 2)
         else:
             derived_stop = round(trade.price * (1 + pct), 2)
+    
+    # Calculate stop loss in points
+    stop_points = abs(trade.price - derived_stop)
+    if stop_points > MAX_STOP_POINTS and not auto_demo:
+        # Adjust to exactly 10 points
+        if trade.side.upper() == "BUY":
+            derived_stop = trade.price - MAX_STOP_POINTS
+        else:
+            derived_stop = trade.price + MAX_STOP_POINTS
+        print(f"[RISK CONTROL] Stop loss adjusted to {MAX_STOP_POINTS} points: ₹{derived_stop:.2f}")
+    
+    # Validate max loss amount
+    qty = trade.quantity or 1
+    potential_loss = stop_points * qty
+    max_loss_allowed = risk_config.get("max_per_trade_loss", 650)
+    
+    if potential_loss > max_loss_allowed and not auto_demo:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Potential loss ₹{potential_loss:.2f} exceeds limit ₹{max_loss_allowed}. Reduce qty or tighten stop."
+        )
+    
+    # ═══════════════════════════════════════════════════════════════
 
     derived_target = trade.target
     if derived_target is None:

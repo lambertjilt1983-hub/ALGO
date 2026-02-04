@@ -38,12 +38,16 @@ const PAPER_TRADES_ACTIVE_API = `${config.API_BASE_URL}/paper-trades/active`;
 const PAPER_TRADES_HISTORY_API = `${config.API_BASE_URL}/paper-trades/history`;
 const PAPER_TRADES_PERFORMANCE_API = `${config.API_BASE_URL}/paper-trades/performance`;
 const PAPER_TRADES_CREATE_API = `${config.API_BASE_URL}/paper-trades`;
+const AUTO_TRADE_STATUS_API = `${config.API_BASE_URL}/autotrade/status`;
 
-// === STRICT LOSS PROTECTION (user request: no loss, only profit) ===
-// Stop trading immediately after any loss.
-const MAX_DAILY_LOSS = 500; // ₹500 daily loss limit
-const MIN_SIGNAL_CONFIDENCE = 90; // Only very high-confidence entries
-const MIN_RR = 3.0; // Minimum risk-reward ratio (1:3)
+// === AGGRESSIVE LOSS MANAGEMENT SYSTEM ===
+const DEFAULT_DAILY_LOSS_LIMIT = 5000; // ₹5000 max daily loss - hardstop
+const DEFAULT_DAILY_PROFIT_TARGET = 10000; // ₹10000 profit target - auto-stop at profit
+const MIN_SIGNAL_CONFIDENCE = 80; // 80%+ confidence (AI adjusts dynamically)
+const MAX_STOP_POINTS = 10; // 10-point max stop loss
+const MIN_TREND_STRENGTH = 0.8; // 80%+ trend strength
+const MIN_REGIME_SCORE = 0.6; // Market regime quality
+const MIN_TRADE_QUALITY_SCORE = 0.75; // Minimum 75% quality threshold (AI calculated)
 
 // === MARKET HOURS (IST) ===
 const MARKET_OPEN_HOUR = 9;
@@ -101,9 +105,10 @@ const releaseWakeLock = async () => {
 
 const AutoTradingDashboard = () => {
   const [enabled, setEnabled] = useState(false);
-  // Force LIVE mode only
-  const isDemoMode = false;
+  const [isLiveMode, setIsLiveMode] = useState(false); // Starts in DEMO mode
   const [loading, setLoading] = useState(true);
+  const [armingInProgress, setArmingInProgress] = useState(false);
+  const [armError, setArmError] = useState(null);
   const [stats, setStats] = useState(null);
   const [activeTrades, setActiveTrades] = useState([]);
   const [tradeHistory, setTradeHistory] = useState([]);
@@ -119,22 +124,100 @@ const AutoTradingDashboard = () => {
   const [hasActiveTrade, setHasActiveTrade] = useState(false);
   const [lastPaperSignalSymbol, setLastPaperSignalSymbol] = useState(null);
   const [confirmationMode, setConfirmationMode] = useState('balanced');
-  const [historyStartDate, setHistoryStartDate] = useState(() => new Date().toISOString().slice(0, 10));
-  const [historyEndDate, setHistoryEndDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [historyStartDate, setHistoryStartDate] = useState(() => new Date().toLocaleDateString('en-CA'));
+  const [historyEndDate, setHistoryEndDate] = useState(() => new Date().toLocaleDateString('en-CA'));
   const [selectedSignalSymbol, setSelectedSignalSymbol] = useState(() => {
     if (typeof window === 'undefined') return null;
     return localStorage.getItem('selectedSignalSymbol');
   });
   const [signalsLoaded, setSignalsLoaded] = useState(false);
   const [wakeLockActive, setWakeLockActive] = useState(false);
+  const [lossLimit, setLossLimit] = useState(() => {
+    if (typeof window === 'undefined') return DEFAULT_DAILY_LOSS_LIMIT;
+    const saved = Number(localStorage.getItem('dailyLossLimit'));
+    return Number.isFinite(saved) && saved > 0 ? saved : DEFAULT_DAILY_LOSS_LIMIT;
+  });
+  const [profitTarget, setProfitTarget] = useState(() => {
+    if (typeof window === 'undefined') return DEFAULT_DAILY_PROFIT_TARGET;
+    const saved = Number(localStorage.getItem('dailyProfitTarget'));
+    return Number.isFinite(saved) && saved > 0 ? saved : DEFAULT_DAILY_PROFIT_TARGET;
+  });
+  // AI dynamically calculates optimal RR based on market conditions
+  const calculateOptimalRR = (signal, winRate = 0.5) => {
+    // Base RR from signal quality
+    const confidence = Number(signal.confirmation_score ?? signal.confidence ?? 0);
+    const riskReward = Math.abs(Number(signal.target ?? 0) - Number(signal.entry_price ?? 0)) / 
+                      Math.abs(Number(signal.entry_price ?? 0) - Number(signal.stop_loss ?? 0));
+    
+    // AI adjustment factors
+    const confidenceBoost = confidence > 90 ? 0.15 : confidence > 85 ? 0.1 : 0;
+    const winRateAdjust = Math.max(0, (winRate - 0.5) * 0.2); // Better win rate = lower RR needed
+    
+    // Dynamic threshold based on conditions
+    const optimalRR = Math.max(1.0, 1.8 - confidenceBoost - winRateAdjust);
+    return { rr: riskReward, optimalRR, meets: riskReward >= optimalRR };
+  };
+
+  // Calculate trade quality score (0-100)
+  const calculateTradeQuality = (signal, winRate = 0.5) => {
+    const confidence = Number(signal.confirmation_score ?? signal.confidence ?? 0);
+    const { rr, optimalRR } = calculateOptimalRR(signal, winRate);
+    
+    // Quality components (each 0-25 points)
+    const confidenceScore = Math.min(25, (confidence / 100) * 25); // Confidence: 0-25
+    const rrScore = Math.min(25, (rr / optimalRR) * 25); // RR ratio: 0-25
+    const winRateScore = Math.min(25, winRate * 25); // Win rate: 0-25
+    const riskScore = 25; // Risk management: 25 (if all passes)
+    
+    const totalScore = (confidenceScore + rrScore + winRateScore + riskScore) / 4;
+    const quality = Math.round(totalScore);
+    
+    return {
+      quality,
+      isExcellent: quality >= 85,
+      isGood: quality >= 75,
+      factors: {
+        confidenceScore,
+        rrScore,
+        winRateScore,
+        riskScore
+      }
+    };
+  };
   
   // Track previous active trades count to detect exits
   const prevActiveTradesCount = React.useRef(0);
+  const didAutoStart = React.useRef(false);
 
   const isLossLimitHit = () => {
-    const dailyPnl = Number(stats?.daily_pnl ?? 0);
-    return dailyPnl < -Math.abs(MAX_DAILY_LOSS);
+    const dailyLoss = Number(stats?.daily_loss ?? 0);
+    const dailyProfit = Number(stats?.daily_profit ?? 0);
+    return dailyLoss <= -lossLimit || dailyProfit >= profitTarget;
   };
+
+  const getTradingStatus = () => {
+    const dailyLoss = Number(stats?.daily_loss ?? 0);
+    const dailyProfit = Number(stats?.daily_profit ?? 0);
+    
+    if (dailyProfit >= profitTarget) {
+      return { status: 'PROFIT_TARGET_HIT', message: `🎉 Profit target (₹${profitTarget}) reached!` };
+    }
+    if (dailyLoss <= -lossLimit) {
+      return { status: 'LOSS_LIMIT_HIT', message: `🛑 Loss limit (₹${lossLimit}) breached!` };
+    }
+    return { status: 'NORMAL', message: 'Trading active' };
+  };
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem('dailyLossLimit', String(lossLimit));
+  }, [lossLimit]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem('dailyProfitTarget', String(profitTarget));
+  }, [profitTarget]);
+
 
   // --- Professional Signal Integration ---
   const [professionalSignal, setProfessionalSignal] = useState(null);
@@ -143,8 +226,15 @@ const AutoTradingDashboard = () => {
       try {
         const res = await config.authFetch(PROFESSIONAL_SIGNAL_API);
         const data = await res.json();
-        setProfessionalSignal(data);
+        // Check if API returned an error (detail field indicates error)
+        if (data.detail || data.error) {
+          console.log('⚠️ Professional signal error:', data.detail || data.error);
+          setProfessionalSignal({ error: data.detail || data.error });
+        } else {
+          setProfessionalSignal(data);
+        }
       } catch (err) {
+        console.error('❌ Failed to fetch professional signal:', err);
         setProfessionalSignal({ error: err.message });
       }
     };
@@ -169,21 +259,24 @@ const AutoTradingDashboard = () => {
         new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), ms))
       ]);
 
-      const [activeRes, historyRes, perfRes] = await Promise.all([
+      const [activeRes, historyRes, perfRes, statusRes] = await Promise.all([
         timeoutPromise(config.authFetch(PAPER_TRADES_ACTIVE_API), 15000),
         timeoutPromise(config.authFetch(`${PAPER_TRADES_HISTORY_API}?days=7&limit=100`), 15000),
         timeoutPromise(config.authFetch(`${PAPER_TRADES_PERFORMANCE_API}?days=30`), 15000),
+        timeoutPromise(config.authFetch(AUTO_TRADE_STATUS_API), 15000),
       ]).catch(e => {
         // Silent timeout - will use empty defaults
-        return [{ ok: false }, { ok: false }, null];
+        return [{ ok: false }, { ok: false }, null, { ok: false }];
       });
 
       const activeData = activeRes?.ok ? await activeRes.json() : { trades: [] };
       const historyData = historyRes?.ok ? await historyRes.json() : { trades: [] };
       const perfData = perfRes?.ok ? await perfRes.json() : null;
+      const statusData = statusRes?.ok ? await statusRes.json() : {};
 
       const active = activeData.trades || [];
       const history = historyData.trades || [];
+      const backendStatus = statusData.status || statusData;
 
       setActiveTrades(active);
       setTradeHistory(history);
@@ -192,13 +285,14 @@ const AutoTradingDashboard = () => {
 
       // Compute daily P&L from closed trades
       const todayLabel = new Date().toDateString();
-      const dailyPnl = history
-        .filter((t) => {
-          const ts = t.exit_time || t.entry_time;
-          if (!ts) return false;
-          return new Date(ts).toDateString() === todayLabel;
-        })
-        .reduce((acc, t) => acc + Number(t.pnl ?? t.profit_loss ?? 0), 0);
+      const dailyTrades = history.filter((t) => {
+        const ts = t.exit_time || t.entry_time;
+        if (!ts) return false;
+        return new Date(ts).toDateString() === todayLabel;
+      });
+      const dailyPnl = dailyTrades.reduce((acc, t) => acc + Number(t.pnl ?? t.profit_loss ?? 0), 0);
+      const winCount = dailyTrades.filter(t => (t.pnl ?? t.profit_loss ?? 0) > 0).length;
+      const lossCount = dailyTrades.filter(t => (t.pnl ?? t.profit_loss ?? 0) < 0).length;
 
       const capitalInUse = active.reduce((acc, t) => acc + Number(t.entry_price ?? 0) * Number(t.quantity ?? 0), 0);
 
@@ -208,10 +302,20 @@ const AutoTradingDashboard = () => {
 
       setStats({
         daily_pnl: dailyPnl,
+        daily_loss: Number(backendStatus?.daily_loss ?? 0),
+        daily_profit: Number(backendStatus?.daily_profit ?? 0),
+        daily_loss_limit: Number(backendStatus?.daily_loss_limit ?? 5000),
+        daily_profit_limit: Number(backendStatus?.daily_profit_limit ?? 10000),
         active_trades_count: active.length,
         max_trades: 2,
         target_points_per_trade: Math.round(targetPoints),
         capital_in_use: capitalInUse,
+        win_rate: backendStatus?.win_rate ?? 0,
+        win_sample: backendStatus?.win_sample ?? 0,
+        today_wins: winCount,
+        today_losses: lossCount,
+        trading_paused: backendStatus?.trading_paused ?? false,
+        pause_reason: backendStatus?.pause_reason,
         remaining_capital: null,
         portfolio_cap: null,
       });
@@ -341,7 +445,7 @@ const AutoTradingDashboard = () => {
       }
 
       // Step 5: Refresh option signals with timeout
-      let freshSignals = optionSignals; // Use existing signals as fallback
+      let freshSignals = []; // Start with empty array, no fallback to old signals
       try {
         const signalTimeout = new Promise((_, reject) => 
           setTimeout(() => reject(new Error('Signal generation timeout')), 10000) // 10s max wait
@@ -349,28 +453,42 @@ const AutoTradingDashboard = () => {
         const signalFetch = fetch(`${OPTION_SIGNALS_API}?mode=${encodeURIComponent(confirmationMode)}`);
         const sigRes = await Promise.race([signalFetch, signalTimeout]);
         const sigData = await sigRes.json();
-        freshSignals = sigData.signals || optionSignals;
+        
+        // Check for API errors
+        if (sigData.detail || sigData.error) {
+          console.warn('⚠️ API returned error:', sigData.detail || sigData.error);
+          freshSignals = [];
+        } else {
+          freshSignals = sigData.signals || [];
+        }
         setOptionSignals(freshSignals);
       } catch (err) {
-        console.warn('⚠️ Signal generation timed out (>10s) - using last known signals:', err.message);
-        // Continue with existing signals instead of blocking
-        if (optionSignals.length === 0) return;
+        console.warn('⚠️ Signal generation timed out (>10s):', err.message);
+        freshSignals = [];
+        setOptionSignals([]);
+      }
+      
+      // Exit if no signals available
+      if (freshSignals.length === 0) {
+        console.log('⏸️ No signals available - cannot proceed with trade');
+        return;
       }
 
-      // Step 6: Apply strict filtering with momentum alignment
+      // Step 6: Apply filtering with momentum alignment
+      // NOTE: This is for DISPLAYING signals - stricter filter for EXECUTION is applied later
       const validSignals = freshSignals.filter(s => {
         // Basic validation
         if (s.error || !s.symbol || !s.entry_price || s.entry_price <= 0) return false;
         if (!s.target || s.target <= 0 || !s.stop_loss || s.stop_loss <= 0) return false;
         
-        // Quality filters - only high confidence signals
+        // Display filter - show signals with 60%+ confidence for monitoring
         const confidence = s.confirmation_score ?? s.confidence ?? 0;
-        if (confidence < 80) return false; // Increased to 80% minimum
+        if (confidence < 60) return false; // Low threshold for visibility
         
-        // Risk-reward ratio check (minimum 1:1.5 for better odds)
+        // Basic risk-reward check
         const risk = Math.abs(s.entry_price - s.stop_loss);
         const reward = Math.abs(s.target - s.entry_price);
-        if (reward / risk < 1.5) return false;
+        if (reward / risk < 1.2) return false;
         
         // Price sanity check
         if (s.entry_price > 250) return false; // Reduced max to avoid expensive options
@@ -482,14 +600,24 @@ const AutoTradingDashboard = () => {
         return { ...signal, finalScore, scoringFactors, indexMomentum };
       });
 
-      // Step 8: Select ONLY signals with very high score (95+) AND strong momentum
-      const highQualitySignals = scoredSignals.filter(s => 
-        s.finalScore >= 95 && s.indexMomentum && s.indexMomentum.score >= 75
-      );
+      // Step 8: EXECUTION FILTER - ONLY trade signals with 80%+ base confidence AND high final score
+      // This ensures we only ENTER quality trades, even though we DISPLAY more signals
+      const highQualitySignals = scoredSignals.filter(s => {
+        const baseConfidence = s.confirmation_score ?? s.confidence ?? 0;
+        // CRITICAL: Must have 80%+ base confidence to execute
+        if (baseConfidence < 80) return false;
+        // Must have high final score (100+) after all factors
+        if (s.finalScore < 100) return false;
+        // Must have strong momentum
+        if (!s.indexMomentum || s.indexMomentum.score < 75) return false;
+        return true;
+      });
       
       if (highQualitySignals.length === 0) {
-        console.log('❌ No signals meet strict quality threshold (95+ score, 75+ momentum)');
+        console.log('❌ No signals meet EXECUTION criteria (80%+ confidence, 100+ score, 75+ momentum)');
+        console.log('   Signals visible but below quality threshold for trading');
         console.log('   Best available:', scoredSignals.length > 0 ? 
+          `Confidence ${Math.max(...scoredSignals.map(s => s.confirmation_score ?? s.confidence ?? 0)).toFixed(1)}%, ` +
           `Score ${Math.max(...scoredSignals.map(s => s.finalScore)).toFixed(1)}, ` +
           `Momentum ${Math.max(...scoredSignals.map(s => s.indexMomentum?.score || 0))}` : 'None');
         return;
@@ -513,14 +641,48 @@ const AutoTradingDashboard = () => {
       console.log(`   Factors: ${bestSignal.scoringFactors.join(', ')}`);
       console.log(`   Entry: ₹${bestSignal.entry_price} | Target: ₹${bestSignal.target} | SL: ₹${bestSignal.stop_loss}`);
 
-      // Step 9: Execute trade (when auto-trading is active OR when manually analyzing)
-      if (autoTradingActive || activeTrades.length === 0) {
-        console.log('💰 Creating paper trade...');
+      // ═══════════════════════════════════════════════════════════════
+      // ENHANCED PRE-EXECUTION VALIDATION WITH 10-POINT MAX STOP LOSS
+      // ═══════════════════════════════════════════════════════════════
+      
+      // Validate stop loss is within 10-point limit
+      const stopPoints = Math.abs(bestSignal.entry_price - bestSignal.stop_loss);
+      if (stopPoints > MAX_STOP_POINTS) {
+        console.warn(`⚠️ REJECTED: Stop loss ${stopPoints.toFixed(1)} points exceeds ${MAX_STOP_POINTS} point limit`);
+        return;
+      }
+      
+      // Validate minimum risk:reward ratio
+      const targetPoints = Math.abs(bestSignal.target - bestSignal.entry_price);
+      const riskRewardRatio = targetPoints / stopPoints;
+      if (riskRewardRatio < MIN_RR) {
+        console.warn(`⚠️ REJECTED: Risk:Reward ${riskRewardRatio.toFixed(2)} below minimum ${MIN_RR}`);
+        return;
+      }
+      
+      // Validate signal confidence/quality
+      const signalQuality = bestSignal.confirmation_score || bestSignal.confidence || 0;
+      if (signalQuality < MIN_SIGNAL_CONFIDENCE) {
+        console.warn(`⚠️ REJECTED: Signal confidence ${signalQuality}% below minimum ${MIN_SIGNAL_CONFIDENCE}%`);
+        return;
+      }
+      
+      console.log(`✅ PRE-EXECUTION VALIDATION PASSED:`);
+      console.log(`   Stop Loss: ${stopPoints.toFixed(1)} points (max ${MAX_STOP_POINTS})`);
+      console.log(`   Risk:Reward: 1:${riskRewardRatio.toFixed(2)} (min ${MIN_RR})`);
+      console.log(`   Signal Quality: ${signalQuality}% (min ${MIN_SIGNAL_CONFIDENCE}%)`);
+
+      // Step 9: Execute LIVE trade when auto-trading is ENABLED, otherwise create PAPER trade for review
+      if (autoTradingActive) {
+        console.log('🚀 AUTO-TRADING ENABLED - Executing LIVE trade...');
+        await executeAutoTrade(bestSignal);
+        await fetchData();
+        console.log('✅ Live trade executed!');
+      } else {
+        console.log('📊 AUTO-TRADING DISABLED - Creating PAPER trade for review...');
         await createPaperTradeFromSignal(bestSignal);
         await fetchData();
-        console.log('✅ Trade created successfully!');
-      } else {
-        console.log('⏸️ Skipping trade creation - auto-trading inactive and trades exist');
+        console.log('✅ Paper trade created - Review quality and click "Start Auto-Trading" to go live!');
       }
     } catch (error) {
       console.error('Error analyzing market:', error);
@@ -538,9 +700,20 @@ const AutoTradingDashboard = () => {
       try {
         const res = await fetch(`${OPTION_SIGNALS_API}?mode=${encodeURIComponent(confirmationMode)}`);
         const data = await res.json();
-        setOptionSignals(data.signals || []);
+        
+        // Check if API returned an error or detail message
+        if (data.detail || data.error) {
+          console.log('⚠️ No option signals available:', data.detail || data.error);
+          setOptionSignals([]);  // Clear old signals
+        } else if (Array.isArray(data.signals) && data.signals.length > 0) {
+          setOptionSignals(data.signals);
+        } else {
+          console.log('⚠️ No signals returned from API');
+          setOptionSignals([]);  // Clear old signals
+        }
       } catch (e) {
-        setOptionSignals([]);
+        console.error('❌ Failed to fetch option signals:', e);
+        setOptionSignals([]);  // Clear on error
       } finally {
         setSignalsLoaded(true);
       }
@@ -607,8 +780,26 @@ const AutoTradingDashboard = () => {
     <div style={{ margin: '32px 0' }}>
       <h3>📊 Intraday Option Signals (CE vs PE)</h3>
       {Object.keys(groupedSignals).length === 0 && signalsLoaded && (
-        <div style={{ padding: '20px', background: '#fff3cd', border: '1px solid #ffc107', borderRadius: '4px', marginBottom: '16px' }}>
-          <strong>⚠️ No signals available</strong> - API may not have returned any data or all signals have errors.
+        <div style={{ 
+          padding: '20px', 
+          background: '#fff3cd', 
+          border: '2px solid #ffc107', 
+          borderRadius: '8px', 
+          marginBottom: '16px',
+          textAlign: 'center'
+        }}>
+          <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#856404', marginBottom: '8px' }}>
+            ⚠️ No Live Signals Available
+          </div>
+          <div style={{ fontSize: '14px', color: '#856404' }}>
+            The API did not return any valid signals. This could be due to:
+            <ul style={{ textAlign: 'left', margin: '10px auto', maxWidth: '500px' }}>
+              <li>Market conditions not meeting signal criteria</li>
+              <li>All signals filtered out due to low quality scores</li>
+              <li>API connection issues</li>
+              <li>Market closed or low volatility</li>
+            </ul>
+          </div>
         </div>
       )}
       {!signalsLoaded && (
@@ -718,13 +909,17 @@ const AutoTradingDashboard = () => {
     }
   }, [selectedSignalSymbol]);
 
-  // Auto-execute the selected/best signal if available and auto-trading is active
+  // Auto-execute the selected/best signal when it arrives (demo or live mode)
   useEffect(() => {
-    if (activeSignal && !executing && autoTradingActive && !hasActiveTrade) {
-      executeAutoTrade(activeSignal);
+    if (activeSignal && !executing && !hasActiveTrade) {
+      // Execute automatically in DEMO mode, or if user explicitly enabled LIVE mode
+      if (!isLiveMode || autoTradingActive) {
+        console.log(`🚀 SIGNAL RECEIVED - Executing in ${isLiveMode ? 'LIVE' : 'DEMO'} mode`);
+        executeAutoTrade(activeSignal);
+      }
     }
     // eslint-disable-next-line
-  }, [activeSignal, autoTradingActive, hasActiveTrade]);
+  }, [activeSignal, isLiveMode, autoTradingActive, hasActiveTrade]);
 
   // Remove legacy toggleAutoTrading logic (config references)
   const toggleAutoTrading = async () => {};
@@ -733,8 +928,8 @@ const AutoTradingDashboard = () => {
   const executeAutoTrade = async (signal) => {
     if (!signal || executing) return;
     
-    // Check if auto-trading is active
-    if (!autoTradingActive) return;
+    // In DEMO mode, always execute. In LIVE mode, only if autoTradingActive
+    if (isLiveMode && !autoTradingActive) return;
 
     // Hard stop: no trades after any daily loss
     if (isLossLimitHit()) {
@@ -749,14 +944,22 @@ const AutoTradingDashboard = () => {
       return;
     }
 
-    // Strict entry filters (high confidence + minimum RR)
+    // Strict entry filters with AI quality assessment
     const confidence = Number(signal.confirmation_score ?? signal.confidence ?? 0);
     const risk = Math.abs(Number(signal.entry_price) - Number(signal.stop_loss));
     const reward = Math.abs(Number(signal.target) - Number(signal.entry_price));
     const rr = risk > 0 ? reward / risk : 0;
+    
+    // Calculate AI optimal thresholds
+    const winRate = stats?.win_rate ? (stats.win_rate / 100) : 0.5;
+    const { rr: actualRR, optimalRR } = calculateOptimalRR(signal, winRate);
+    const tradeQuality = calculateTradeQuality(signal, winRate);
+    
+    console.log(`📊 Trade Quality Analysis: ${tradeQuality.quality}% | Confidence: ${confidence.toFixed(1)}% | RR: ${actualRR.toFixed(2)} vs Optimal: ${optimalRR.toFixed(2)}`);
 
-    if (confidence < MIN_SIGNAL_CONFIDENCE || rr < MIN_RR) {
-      console.log(`⏸️ Entry blocked: confidence ${confidence.toFixed(1)}% / RR ${rr.toFixed(2)} below thresholds`);
+    // AI-based approval logic
+    if (tradeQuality.quality < MIN_TRADE_QUALITY_SCORE * 100) {
+      console.log(`\u26a0\ufe0f Entry blocked: Trade quality ${tradeQuality.quality}% below ${MIN_TRADE_QUALITY_SCORE * 100}% threshold | Factors: Conf=${confidence.toFixed(1)}%, RR=${actualRR.toFixed(2)}`);
       return;
     }
     
@@ -765,10 +968,13 @@ const AutoTradingDashboard = () => {
       alert('No access token found. Please login.');
       return;
     }
-    const adjustedQuantity = signal.quantity * lotMultiplier;
-    const confirmMsg = `⚡ LIVE TRADE\n\nIndex: ${signal.index}\nSymbol: ${signal.symbol}\nAction: ${signal.action}\nStrike: ${signal.strike}\nQty: ${adjustedQuantity} (${lotMultiplier} lots)\nEntry: ₹${signal.entry_price}\nTarget: ₹${signal.target}\nStop Loss: ₹${signal.stop_loss}\n\nProceed with auto trade?`;
-    if (!window.confirm(confirmMsg)) return;
+    
     setExecuting(true);
+    const mode = isLiveMode ? 'LIVE' : 'DEMO';
+    console.log(`🚀 AUTO-EXECUTING ${mode} TRADE: ${signal.symbol} ${signal.action} at ₹${signal.entry_price}`);
+    
+    const adjustedQuantity = signal.quantity * lotMultiplier;
+    
     try {
       const params = {
         symbol: signal.symbol,
@@ -779,7 +985,7 @@ const AutoTradingDashboard = () => {
         side: signal.action,
         expiry: signal.expiry_date,
         broker_id: 1,
-        balance: 50000
+        balance: isLiveMode ? 50000 : 0  // 0 = demo mode, positive = live mode
       };
       const response = await config.authFetch(config.endpoints.autoTrade.execute, {
         method: 'POST',
@@ -788,18 +994,62 @@ const AutoTradingDashboard = () => {
       if (response.ok) {
         const data = await response.json();
         setHasActiveTrade(true);
-        alert(data.message || 'Trade executed!');
+        console.log(`✅ ${mode} TRADE EXECUTED: ${signal.symbol} - ${data.message || 'Success!'}`);
+        // Don't show alert for auto-trades, just log
       } else {
         let errorMsg = 'Failed to execute trade.';
+        let shouldStopAutoTrading = true;
+        let cooldownMinutes = 0;
+        
         try {
           const errData = await response.json();
           if (errData.message) errorMsg += '\nReason: ' + errData.message;
-          if (errData.detail) errorMsg += '\nDetail: ' + errData.detail;
+          if (errData.detail) {
+            errorMsg += '\nDetail: ' + errData.detail;
+            
+            // Check if it's a cooldown/consecutive loss error (temporary - don't stop auto-trading)
+            const detailLower = errData.detail.toLowerCase();
+            if (detailLower.includes('cooldown') || detailLower.includes('consecutive loss')) {
+              shouldStopAutoTrading = false;
+              
+              // Extract cooldown minutes from error message
+              const cooldownMatch = errData.detail.match(/(\d+)\s*more\s*minutes/i);
+              if (cooldownMatch) {
+                cooldownMinutes = parseInt(cooldownMatch[1]);
+                console.log(`⏸️ COOLDOWN ACTIVE: Waiting ${cooldownMinutes} minutes before next trade attempt`);
+              } else {
+                console.log(`⏸️ CONSECUTIVE LOSS LIMIT: Waiting for cooldown period to complete`);
+              }
+            }
+            
+            // Check if it's a daily loss limit (permanent - stop auto-trading)
+            if (detailLower.includes('daily loss') || detailLower.includes('trading locked')) {
+              shouldStopAutoTrading = true;
+              console.error(`🛑 DAILY LOSS LIMIT REACHED: Auto-trading stopped for the day`);
+              alert('⛔ Daily loss limit breached. Auto-trading locked for the day to protect capital.');
+            }
+            
+            // Check if it's a trend/regime rejection (temporary - keep trying)
+            if (detailLower.includes('regime') || detailLower.includes('trend') || detailLower.includes('market')) {
+              shouldStopAutoTrading = false;
+              console.log(`📊 MARKET CONDITIONS: ${errData.detail}`);
+            }
+          }
         } catch {}
-        alert(errorMsg);
+        
+        console.error(`❌ TRADE EXECUTION FAILED: ${errorMsg}`);
+        
+        // Only stop auto-trading for critical errors (not cooldowns or market conditions)
+        if (shouldStopAutoTrading) {
+          setAutoTradingActive(false);
+        } else {
+          console.log(`♻️ AUTO-TRADING REMAINS ACTIVE: Will retry when conditions improve`);
+        }
       }
     } catch (e) {
-      alert('Error executing trade: ' + e.message);
+      console.error(`❌ TRADE EXECUTION ERROR: ${e.message}`);
+      // Don't auto-stop on network errors - keep retrying when network recovers
+      console.log(`♻️ AUTO-TRADING REMAINS ACTIVE: Will retry when connection recovers`);
     } finally {
       setExecuting(false);
     }
@@ -807,8 +1057,6 @@ const AutoTradingDashboard = () => {
 
   const createPaperTradeFromSignal = async (signal) => {
     if (!signal || !signal.symbol) return;
-    if (autoTradingActive) return;
-    if (activeTrades.length > 0) return;
     if (lastPaperSignalSymbol === signal.symbol) return;
 
     // Hard stop: no paper trades after any daily loss
@@ -858,26 +1106,46 @@ const AutoTradingDashboard = () => {
   };
 
   // Arm live trading
-  const armLiveTrading = async () => {
+  const armLiveTrading = async (silent = false) => {
+    setArmingInProgress(true);
+    setArmError(null);
     const token = localStorage.getItem('access_token');
     if (!token) {
-      alert('No access token found. Please login.');
-      return;
+      const msg = 'No access token found. Please login.';
+      setArmError(msg);
+      console.error('❌ ARM FAILED:', msg);
+      setArmingInProgress(false);
+      return false;
     }
     try {
-      const response = await config.authFetch(config.endpoints.autoTrade.arm || '/autotrade/arm', {
+      const armEndpoint = config.endpoints.autoTrade.arm || '/autotrade/arm';
+      console.log('🔄 Calling arm endpoint:', armEndpoint);
+      const response = await config.authFetch(armEndpoint, {
         method: 'POST',
         body: JSON.stringify(true)
       });
+      console.log('✅ Arm response status:', response.status);
       if (response.ok) {
         const data = await response.json();
-        alert('Live trading armed!');
+        console.log('✅ LIVE TRADING ARMED:', data);
         setEnabled(true);
-      } else {
-        alert('Failed to arm live trading.');
+        setIsLiveMode(true);  // Switch to LIVE mode
+        setArmError(null);
+        setArmingInProgress(false);
+        return true;
       }
+      const errData = await response.text();
+      const msg = `Failed to arm live trading (${response.status}): ${errData}`;
+      setArmError(msg);
+      console.error('❌ ARM FAILED:', msg);
+      setArmingInProgress(false);
+      return false;
     } catch (e) {
-      alert('Error arming live trading: ' + e.message);
+      const msg = 'Error arming live trading: ' + e.message;
+      setArmError(msg);
+      console.error('❌ ARM ERROR:', msg, e);
+      setArmingInProgress(false);
+      return false;
     }
   };
 
@@ -956,6 +1224,13 @@ const AutoTradingDashboard = () => {
     };
   }, [enabled, autoTradingActive, activeTrades.length]);
 
+  // Default: auto-trading OFF on load (paper trades only until user clicks Start)
+  useEffect(() => {
+    if (didAutoStart.current) return;
+    didAutoStart.current = true;
+    setAutoTradingActive(false);
+  }, []);
+
   // Detect when activeTrades changes from 1+ to 0
   useEffect(() => {
     const prevCount = prevActiveTradesCount.current;
@@ -995,6 +1270,7 @@ const AutoTradingDashboard = () => {
 
   useEffect(() => {
     if (!autoTradingActive && activeSignal && signalsLoaded) {
+      // Create paper trades when auto-trading is OFF (for user review)
       createPaperTradeFromSignal(activeSignal);
     }
   }, [autoTradingActive, activeSignal, signalsLoaded, activeTrades.length, lotMultiplier]);
@@ -1077,7 +1353,7 @@ const AutoTradingDashboard = () => {
   const dateFilteredHistory = tradeHistory.filter((trade) => {
     const ts = trade.exit_time || trade.entry_time || trade.timestamp;
     if (!ts) return false;
-    const tradeDate = new Date(ts).toISOString().slice(0, 10);
+    const tradeDate = new Date(ts).toLocaleDateString('en-CA');
     if (historyStartDate && tradeDate < historyStartDate) return false;
     if (historyEndDate && tradeDate > historyEndDate) return false;
     return true;
@@ -1245,21 +1521,21 @@ const AutoTradingDashboard = () => {
               fontSize: '14px',
               padding: '4px 12px',
               borderRadius: '20px',
-              background: enabled ? '#48bb78' : '#cbd5e0',
+              background: autoTradingActive ? '#48bb78' : enabled ? '#ed8936' : '#cbd5e0',
               color: 'white',
               fontWeight: '600'
             }}>
-              {enabled ? 'ACTIVE' : 'DISABLED'}
+              {autoTradingActive ? 'ACTIVE' : enabled ? '⏸️ STANDBY' : 'DISABLED'}
             </span>
             <span style={{
               fontSize: '14px',
               padding: '4px 12px',
               borderRadius: '20px',
-              background: isDemoMode ? '#4299e1' : '#f56565',
+              background: isLiveMode ? '#22c55e' : '#f59e0b',
               color: 'white',
               fontWeight: '600'
             }}>
-              {'⚡ LIVE'}
+              {isLiveMode ? '🔴 LIVE TRADES' : '⚪ DEMO MODE'}
             </span>
             <span style={{
               fontSize: '14px',
@@ -1279,26 +1555,93 @@ const AutoTradingDashboard = () => {
             fontSize: '14px'
           }}>
             {livePrice && <span>📊 NIFTY: ₹{livePrice.toFixed(2)} • </span>}
-            {'⚡ LIVE Mode - Real Trades Execution'}
+            {isLiveMode ? '🔴 REAL Trades Execution' : '⚪ DEMO Mode - Test Trades'}
             {' • '}Max {stats?.max_trades || 10} Concurrent Trades
             {hasActiveTrade && <span style={{ color: '#f56565', fontWeight: '600' }}> • 🔒 ONE TRADE ACTIVE - Waiting to close...</span>}
           </p>
         </div>
         <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
-          <button
-            onClick={toggleMode}
-            style={{
-              padding: '10px 20px'
-            }}>
-            <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Daily P&L</div>
+          <div style={{
+            padding: '20px',
+            background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+            borderRadius: '12px',
+            color: 'white',
+            textAlign: 'center'
+          }}>
+            <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Daily Loss</div>
             <div style={{
-              fontSize: '28px',
+              fontSize: '24px',
               fontWeight: 'bold',
-              color: (stats?.daily_pnl ?? 0) >= 0 ? '#c6f6d5' : '#fed7d7'
+              color: (stats?.daily_loss ?? 0) >= 0 ? '#c6f6d5' : '#fed7d7'
             }}>
-                ₹{(stats?.daily_pnl ?? 0).toLocaleString()}
+              ₹{(stats?.daily_loss ?? 0).toLocaleString()}
             </div>
-          </button>
+            <div style={{ fontSize: '11px', marginTop: '6px', opacity: 0.8 }}>
+              Limit: ₹{lossLimit}
+            </div>
+            <div style={{ marginTop: '8px', display: 'flex', gap: '6px', alignItems: 'center', justifyContent: 'center' }}>
+              <span style={{ fontSize: '10px', opacity: 0.9 }}>Set</span>
+              <input
+                type="number"
+                min="1"
+                step="100"
+                value={lossLimit}
+                onChange={(e) => {
+                  const next = Number(e.target.value);
+                  if (Number.isFinite(next) && next > 0) setLossLimit(next);
+                }}
+                style={{
+                  width: '90px',
+                  padding: '4px 6px',
+                  borderRadius: '6px',
+                  border: 'none',
+                  fontSize: '11px',
+                  textAlign: 'center'
+                }}
+              />
+            </div>
+          </div>
+          
+          <div style={{
+            padding: '20px',
+            background: 'linear-gradient(135deg, #48bb78 0%, #38a169 100%)',
+            borderRadius: '12px',
+            color: 'white',
+            textAlign: 'center'
+          }}>
+            <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Daily Profit</div>
+            <div style={{
+              fontSize: '24px',
+              fontWeight: 'bold',
+              color: '#c6f6d5'
+            }}>
+              ₹{(stats?.daily_profit ?? 0).toLocaleString()}
+            </div>
+            <div style={{ fontSize: '11px', marginTop: '6px', opacity: 0.8 }}>
+              Target: ₹{profitTarget}
+            </div>
+            <div style={{ marginTop: '8px', display: 'flex', gap: '6px', alignItems: 'center', justifyContent: 'center' }}>
+              <span style={{ fontSize: '10px', opacity: 0.9 }}>Set</span>
+              <input
+                type="number"
+                min="1"
+                step="100"
+                value={profitTarget}
+                onChange={(e) => {
+                  const next = Number(e.target.value);
+                  if (Number.isFinite(next) && next > 0) setProfitTarget(next);
+                }}
+                style={{
+                  width: '90px',
+                  padding: '4px 6px',
+                  borderRadius: '6px',
+                  border: 'none',
+                  fontSize: '11px',
+                  textAlign: 'center'
+                }}
+              />
+            </div>
+          </div>
           <div style={{
             padding: '20px',
             background: 'linear-gradient(135deg, #ed8936 0%, #dd6b20 100%)',
@@ -1337,6 +1680,75 @@ const AutoTradingDashboard = () => {
               <div style={{ fontSize: '24px', fontWeight: 'bold' }}>₹{(stats?.capital_in_use ?? 0).toLocaleString()}</div>
               <div style={{ fontSize: '12px', opacity: 0.85, marginTop: '6px' }}>
                 Remaining: ₹{(stats?.remaining_capital ?? 0).toLocaleString()} / Cap: ₹{(stats?.portfolio_cap ?? 0).toLocaleString()}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Performance Summary */}
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
+          gap: '12px',
+          padding: '0',
+          marginBottom: '24px'
+        }}>
+          <div style={{
+            padding: '16px',
+            background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+            borderRadius: '12px',
+            color: 'white',
+            textAlign: 'center'
+          }}>
+            <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '6px' }}>Today Trades</div>
+            <div style={{ fontSize: '28px', fontWeight: 'bold' }}>{(stats?.today_wins ?? 0) + (stats?.today_losses ?? 0)}</div>
+            <div style={{ fontSize: '11px', marginTop: '6px', opacity: 0.8 }}>
+              ✓ {stats?.today_wins ?? 0} | ✗ {stats?.today_losses ?? 0}
+            </div>
+          </div>
+
+          <div style={{
+            padding: '16px',
+            background: 'linear-gradient(135deg, #48bb78 0%, #38a169 100%)',
+            borderRadius: '12px',
+            color: 'white',
+            textAlign: 'center'
+          }}>
+            <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '6px' }}>Win Rate</div>
+            <div style={{ fontSize: '28px', fontWeight: 'bold' }}>{(stats?.win_rate ?? 0).toFixed(1)}%</div>
+            <div style={{ fontSize: '11px', marginTop: '6px', opacity: 0.8 }}>
+              ({stats?.win_sample ?? 0} recent)
+            </div>
+          </div>
+
+          <div style={{
+            padding: '16px',
+            background: 'linear-gradient(135deg, #f6ad55 0%, #ed8936 100%)',
+            borderRadius: '12px',
+            color: 'white',
+            textAlign: 'center'
+          }}>
+            <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '6px' }}>Daily P&L</div>
+            <div style={{
+              fontSize: '28px',
+              fontWeight: 'bold',
+              color: (stats?.daily_pnl ?? 0) >= 0 ? '#c6f6d5' : '#fed7d7'
+            }}>
+              ₹{(stats?.daily_pnl ?? 0).toLocaleString()}
+            </div>
+          </div>
+
+          {stats?.trading_paused && (
+            <div style={{
+              padding: '16px',
+              background: 'linear-gradient(135deg, #f56565 0%, #e53e3e 100%)',
+              borderRadius: '12px',
+              color: 'white',
+              textAlign: 'center'
+            }}>
+              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '6px' }}>⏸️ PAUSED</div>
+              <div style={{ fontSize: '11px', marginTop: '6px', lineHeight: '1.4' }}>
+                {stats?.pause_reason || 'Trading paused'}
               </div>
             </div>
           )}
@@ -1453,41 +1865,85 @@ const AutoTradingDashboard = () => {
                   </button>
                   <span style={{ fontSize: '12px', color: '#718096' }}>({lotMultiplier} lots)</span>
                 </span>
+                {(() => {
+                  const winRate = stats?.win_rate ? (stats.win_rate / 100) : 0.5;
+                  const quality = calculateTradeQuality(activeSignal, winRate);
+                  const { rr, optimalRR } = calculateOptimalRR(activeSignal, winRate);
+                  return (
+                    <span style={{ 
+                      display: 'flex', 
+                      alignItems: 'center', 
+                      gap: '8px',
+                      padding: '8px 12px',
+                      background: quality.quality >= 85 ? '#c6f6d5' : quality.quality >= 75 ? '#feebc8' : '#fed7d7',
+                      borderRadius: '6px',
+                      borderLeft: `4px solid ${quality.quality >= 85 ? '#22c55e' : quality.quality >= 75 ? '#f59e0b' : '#ef4444'}`
+                    }}>
+                      <strong>🤖 Quality:</strong>
+                      <span style={{ fontWeight: 'bold', fontSize: '13px' }}>{quality.quality}%</span>
+                      <span style={{ fontSize: '11px', opacity: 0.8 }}>• RR: {rr.toFixed(2)} (✓{optimalRR.toFixed(2)})</span>
+                    </span>
+                  );
+                })()}
                 <span><strong>Expiry:</strong> {activeSignal.expiry_date || activeSignal.expiry}</span>
               </div>
             </div>
             <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
               <button
-                onClick={() => {
-                  setAutoTradingActive(!autoTradingActive);
+                onClick={async () => {
                   if (autoTradingActive) {
+                    setAutoTradingActive(false);
                     setHasActiveTrade(false);
+                    setArmError(null);
+                    return;
+                  }
+                  const armed = await armLiveTrading(false);
+                  if (armed) {
+                    setAutoTradingActive(true);
+                    console.log('🚀 AUTO-TRADING ACTIVATED!');
+                  } else {
+                    console.log('❌ AUTO-TRADING ACTIVATION FAILED');
                   }
                 }}
+                disabled={armingInProgress}
                 style={{
                   padding: '12px 24px',
-                  background: autoTradingActive ? '#f56565' : '#48bb78',
+                  background: armingInProgress ? '#cbd5e0' : autoTradingActive ? '#f56565' : '#48bb78',
                   color: 'white',
                   border: 'none',
                   borderRadius: '8px',
                   fontSize: '15px',
                   fontWeight: '600',
-                  cursor: 'pointer',
-                  boxShadow: '0 4px 6px rgba(0,0,0,0.1)'
+                  cursor: armingInProgress ? 'wait' : 'pointer',
+                  boxShadow: '0 4px 6px rgba(0,0,0,0.1)',
+                  opacity: armingInProgress ? 0.7 : 1
                 }}
               >
-                {autoTradingActive ? '🛑 Stop Auto-Trading' : '▶️ Start Auto-Trading'}
+                {armingInProgress ? '⏳ Arming...' : autoTradingActive ? '🛑 Stop Auto-Trading' : '▶️ Start Auto-Trading'}
               </button>
+              {armError && (
+                <div style={{
+                  padding: '12px 16px',
+                  background: '#fed7d7',
+                  color: '#742a2a',
+                  borderRadius: '6px',
+                  fontSize: '13px',
+                  fontWeight: '600',
+                  maxWidth: '300px'
+                }}>
+                  ❌ {armError}
+                </div>
+              )}
               {autoTradingActive && (
                 <div style={{
                   padding: '8px 16px',
-                  background: hasActiveTrade ? '#fed7d7' : '#c6f6d5',
-                  color: hasActiveTrade ? '#742a2a' : '#22543d',
+                  background: isLiveMode ? '#c6f6d5' : '#feebc8',
+                  color: isLiveMode ? '#22543d' : '#78350f',
                   borderRadius: '6px',
                   fontSize: '13px',
                   fontWeight: '600'
                 }}>
-                  {hasActiveTrade ? '🔒 Trade Active (1/1)' : '✓ Ready to Trade'}
+                  {isLiveMode ? '🔴 REAL TRADES' : '⚪ DEMO MODE'} {hasActiveTrade ? '(Trade Active)' : '(Ready)'}
                 </div>
               )}
             </div>
