@@ -117,12 +117,12 @@ def close_market_close_trades():
         # Get current time in IST (India Standard Time)
         current_time = datetime.now()
         
-        # Market closing time: 3:25 PM (15:25)
+        # Market closing time: 3:25 PM (15:25) - exit before close
         market_close = time(15, 25)
         
-        # Check if current time is within market close window (3:25 PM - 3:30 PM)
+        # Check if current time is after market close (3:25 PM IST)
         current_time_only = current_time.time()
-        if market_close <= current_time_only <= time(15, 30):
+        if current_time_only >= market_close:
             # Close all open trades
             open_trades = db.query(PaperTrade).filter(PaperTrade.status == "OPEN").all()
             
@@ -139,6 +139,19 @@ def close_market_close_trades():
                     "time": current_time.isoformat(),
                     "reason": "Market closing time (3:25 PM IST)"
                 })
+
+            # Close all live active trades (auto-trading)
+            try:
+                from app.routes.auto_trading_simple import close_all_active_trades
+                live_closed = close_all_active_trades(reason="Market close (3:25 PM IST)")
+                if live_closed > 0:
+                    logger.log_error("Market close - Live trades auto-exited", {
+                        "closed_count": live_closed,
+                        "time": current_time.isoformat(),
+                        "reason": "Market closing time (3:25 PM IST)"
+                    })
+            except Exception as e:
+                logger.log_error("Market close live-exit failed", {"error": str(e)})
     
     except Exception as e:
         db.rollback()
@@ -174,7 +187,7 @@ def start_background_tasks():
             replace_existing=True
         )
         
-        # Add market close exit task - runs every 1 minute (checks if it's 3:30-3:35 PM)
+        # Add market close exit task - runs every 1 minute (checks if it's 3:30-3:31 PM)
         scheduler.add_job(
             close_market_close_trades,
             'interval',

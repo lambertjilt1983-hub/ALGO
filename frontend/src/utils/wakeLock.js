@@ -13,6 +13,10 @@ let keepAliveInterval = null;
  */
 export const requestWakeLock = async () => {
   try {
+    if (typeof document !== 'undefined' && document.hidden) {
+      console.warn('⚠️ Wake Lock request skipped: page is not visible');
+      return false;
+    }
     if ('wakeLock' in navigator) {
       wakeLock = await navigator.wakeLock.request('screen');
       console.log('✅ Screen Wake Lock activated');
@@ -65,15 +69,7 @@ export const startKeepAliveHeartbeat = () => {
       document.title = `🚀 Auto Trading - Alive ${now}`;
     }
     
-    // Periodic fetch to keep network activity
-    try {
-      navigator.sendBeacon('/api/health', JSON.stringify({ 
-        timestamp: new Date().toISOString(),
-        status: 'trading-active'
-      }));
-    } catch (e) {
-      // Silently fail if endpoint doesn't exist
-    }
+    // Optional network activity (avoid hardcoded endpoints)
   }, 30000); // Every 30 seconds
   
   console.log('✅ Keep-alive heartbeat started (30s interval)');
@@ -96,8 +92,8 @@ export const stopKeepAliveHeartbeat = () => {
 export const initializeWakeLock = async () => {
   console.log('🔧 Initializing browser wake lock mechanisms...');
   
-  // Try modern API first
-  const hasModernAPI = await requestWakeLock();
+  // Try modern API first (only if page visible)
+  const hasModernAPI = !document.hidden ? await requestWakeLock() : false;
   
   // Always start heartbeat as fallback
   startKeepAliveHeartbeat();

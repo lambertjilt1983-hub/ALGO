@@ -10,8 +10,8 @@ import React, { useState, useEffect } from 'react';
  *    - Professional signals: 60 seconds
  * 
  * 2. TAB VISIBILITY DETECTION
- *    - Skips all fetches when tab is hidden
- *    - Prevents wasted API calls on background tabs
+ *    - Trade data now refreshes even when tab is hidden
+ *    - Ensures trades stay updated anytime
  * 
  * 3. REQUEST DEDUPLICATION
  *    - Added fetchData.isRunning flag to prevent concurrent calls
@@ -30,7 +30,7 @@ import React, { useState, useEffect } from 'react';
 
 // Use environment-based API URL if available
 import config from '../config/api';
-import { initializeWakeLock, getWakeLockStatus } from '../utils/wakeLock';
+import { initializeWakeLock, getWakeLockStatus, releaseWakeLock, startKeepAliveHeartbeat, stopKeepAliveHeartbeat } from '../utils/wakeLock';
 
 const OPTION_SIGNALS_API = `${config.API_BASE_URL}/option-signals/intraday-advanced`;
 const PROFESSIONAL_SIGNAL_API = `${config.API_BASE_URL}/strategies/live/professional-signal`;
@@ -44,10 +44,11 @@ const AUTO_TRADE_STATUS_API = `${config.API_BASE_URL}/autotrade/status`;
 const DEFAULT_DAILY_LOSS_LIMIT = 5000; // ₹5000 max daily loss - hardstop
 const DEFAULT_DAILY_PROFIT_TARGET = 10000; // ₹10000 profit target - auto-stop at profit
 const MIN_SIGNAL_CONFIDENCE = 80; // 80%+ confidence (AI adjusts dynamically)
+const MIN_RR = 1.2; // Minimum risk:reward for entries
 const MAX_STOP_POINTS = 10; // 10-point max stop loss
 const MIN_TREND_STRENGTH = 0.8; // 80%+ trend strength
 const MIN_REGIME_SCORE = 0.6; // Market regime quality
-const MIN_TRADE_QUALITY_SCORE = 0.75; // Minimum 75% quality threshold (AI calculated)
+const MIN_TRADE_QUALITY_SCORE = 0.50; // Minimum 50% quality threshold with weighted scoring
 
 // === MARKET HOURS (IST) ===
 const MARKET_OPEN_HOUR = 9;
@@ -76,32 +77,10 @@ const MARKET_HOLIDAYS = [
   '2026-12-25', // Christmas
 ];
 
+// Keep fetching trade data even when the tab is hidden
+const ALWAYS_FETCH_TRADES = true;
+
 // Screen Wake Lock - Prevent browser/system sleep
-let wakeLock = null;
-
-const requestWakeLock = async () => {
-  try {
-    if ('wakeLock' in navigator) {
-      wakeLock = await navigator.wakeLock.request('screen');
-      console.log('✅ Screen Wake Lock activated - browser will stay awake');
-      return true;
-    } else {
-      console.log('⚠️ Wake Lock API not supported in this browser');
-      return false;
-    }
-  } catch (err) {
-    console.error('❌ Wake Lock request failed:', err);
-    return false;
-  }
-};
-
-const releaseWakeLock = async () => {
-  if (wakeLock) {
-    await wakeLock.release();
-    wakeLock = null;
-    console.log('Wake Lock released');
-  }
-};
 
 const AutoTradingDashboard = () => {
   const [enabled, setEnabled] = useState(false);
@@ -123,6 +102,7 @@ const AutoTradingDashboard = () => {
   const [autoTradingActive, setAutoTradingActive] = useState(false);
   const [hasActiveTrade, setHasActiveTrade] = useState(false);
   const [lastPaperSignalSymbol, setLastPaperSignalSymbol] = useState(null);
+  const [lastPaperSignalAt, setLastPaperSignalAt] = useState(0);
   const [confirmationMode, setConfirmationMode] = useState('balanced');
   const [historyStartDate, setHistoryStartDate] = useState(() => new Date().toLocaleDateString('en-CA'));
   const [historyEndDate, setHistoryEndDate] = useState(() => new Date().toLocaleDateString('en-CA'));
@@ -132,6 +112,8 @@ const AutoTradingDashboard = () => {
   });
   const [signalsLoaded, setSignalsLoaded] = useState(false);
   const [wakeLockActive, setWakeLockActive] = useState(false);
+  const [qualityTrades, setQualityTrades] = useState([]); // Market scanner results
+  const [scannerLoading, setScannerLoading] = useState(false);
   const [lossLimit, setLossLimit] = useState(() => {
     if (typeof window === 'undefined') return DEFAULT_DAILY_LOSS_LIMIT;
     const saved = Number(localStorage.getItem('dailyLossLimit'));
@@ -149,38 +131,40 @@ const AutoTradingDashboard = () => {
     const riskReward = Math.abs(Number(signal.target ?? 0) - Number(signal.entry_price ?? 0)) / 
                       Math.abs(Number(signal.entry_price ?? 0) - Number(signal.stop_loss ?? 0));
     
-    // AI adjustment factors
-    const confidenceBoost = confidence > 90 ? 0.15 : confidence > 85 ? 0.1 : 0;
-    const winRateAdjust = Math.max(0, (winRate - 0.5) * 0.2); // Better win rate = lower RR needed
+    // AI adjustment factors - more realistic for retail trading
+    const confidenceBoost = confidence > 90 ? 0.1 : confidence > 85 ? 0.05 : 0;
+    const winRateAdjust = Math.max(0, (winRate - 0.5) * 0.1); // Less aggressive adjustment
     
-    // Dynamic threshold based on conditions
-    const optimalRR = Math.max(1.0, 1.8 - confidenceBoost - winRateAdjust);
-    return { rr: riskReward, optimalRR, meets: riskReward >= optimalRR };
+    // Dynamic threshold based on conditions (1.5 base for realistic options)
+    const optimalRR = Math.max(1.0, 1.5 - confidenceBoost - winRateAdjust);
+    return { 
+      rr: isNaN(riskReward) || !isFinite(riskReward) ? 1.0 : riskReward, 
+      optimalRR, 
+      meets: riskReward >= optimalRR 
+    };
   };
 
-  // Calculate trade quality score (0-100)
+  // Calculate trade quality score (0-100) using weighted formula
   const calculateTradeQuality = (signal, winRate = 0.5) => {
     const confidence = Number(signal.confirmation_score ?? signal.confidence ?? 0);
     const { rr, optimalRR } = calculateOptimalRR(signal, winRate);
     
-    // Quality components (each 0-25 points)
-    const confidenceScore = Math.min(25, (confidence / 100) * 25); // Confidence: 0-25
-    const rrScore = Math.min(25, (rr / optimalRR) * 25); // RR ratio: 0-25
-    const winRateScore = Math.min(25, winRate * 25); // Win rate: 0-25
-    const riskScore = 25; // Risk management: 25 (if all passes)
+    // Weighted quality scoring (not averaged - confidence is most important)
+    const confidenceScore = Math.min(50, (confidence / 100) * 50); // Confidence: 50% weight (0-50)
+    const rrScore = Math.min(30, Math.max(0, (rr / optimalRR) * 30)); // RR ratio: 30% weight (0-30)
+    const winRateScore = Math.min(20, winRate * 20); // Win rate: 20% weight (0-20)
     
-    const totalScore = (confidenceScore + rrScore + winRateScore + riskScore) / 4;
-    const quality = Math.round(totalScore);
+    // Total quality (no averaging, just sum of weighted components)
+    const quality = Math.round(confidenceScore + rrScore + winRateScore);
     
     return {
       quality,
       isExcellent: quality >= 85,
-      isGood: quality >= 75,
+      isGood: quality >= 60,  // Lowered from 75 to 60 for weighted scoring
       factors: {
-        confidenceScore,
-        rrScore,
-        winRateScore,
-        riskScore
+        confidenceScore: Math.round(confidenceScore),
+        rrScore: Math.round(rrScore),
+        winRateScore: Math.round(winRateScore)
       }
     };
   };
@@ -242,6 +226,56 @@ const AutoTradingDashboard = () => {
     const interval = setInterval(fetchProfessionalSignal, 120000); // refresh every 120s (reduced API calls)
     return () => clearInterval(interval);
   }, []);
+
+  // Market Quality Scanner - finds all 75%+ quality trades
+  const scanMarketForQualityTrades = async () => {
+    setScannerLoading(true);
+    console.log('🔍 Scanning entire market for quality trades (75%+)...');
+    
+    try {
+      // Fetch all signals from the market
+      const res = await config.authFetch(`${OPTION_SIGNALS_API}?include_nifty50=true`);
+      if (!res.ok) throw new Error('Failed to fetch market signals');
+      
+      const data = await res.json();
+      const allSignals = data.signals || [];
+      const winRate = stats?.win_rate ? (stats.win_rate / 100) : 0.5;
+      
+      // Calculate quality for each signal
+      const qualityScores = allSignals.map(signal => {
+        const quality = calculateTradeQuality(signal, winRate);
+        const { rr, optimalRR } = calculateOptimalRR(signal, winRate);
+        return {
+          ...signal,
+          quality: quality.quality,
+          isExcellent: quality.isExcellent,
+          factors: quality.factors,
+          rr,
+          optimalRR,
+          recommendation: quality.quality >= 85 ? '⭐ EXCELLENT' : quality.quality >= 75 ? '✅ GOOD' : '❌ POOR'
+        };
+      });
+      
+      // Filter only 50%+ quality trades and sort by quality descending (weighted scoring)
+      const qualityOnly = qualityScores
+        .filter(s => s.quality >= 50)
+        .sort((a, b) => b.quality - a.quality);
+      
+      console.log(`✅ Market Scan Complete: ${qualityOnly.length} quality trades found (${allSignals.length} total signals)`);
+      console.log(`📊 All Signal Scores:`, qualityScores.map(s => ({ symbol: s.symbol, quality: s.quality, confidence: s.factors?.confidenceScore })));
+      
+      // Log top 5 trades for debugging
+      qualityOnly.slice(0, 5).forEach((t, i) => {
+        console.log(`  #${i+1}: ${t.symbol} - Quality: ${t.quality}% (Confidence: ${t.factors?.confidenceScore?.toFixed(1)}, RR: ${t.factors?.rrScore?.toFixed(1)}, Win Rate: ${t.factors?.winRateScore?.toFixed(1)})`);
+      });
+      setQualityTrades(qualityOnly);
+    } catch (err) {
+      console.error('❌ Market scan failed:', err);
+      setQualityTrades([]);
+    } finally {
+      setScannerLoading(false);
+    }
+  };
 
   // Remove legacy fetchData logic (config references)
   const fetchData = async () => {
@@ -698,7 +732,7 @@ const AutoTradingDashboard = () => {
   useEffect(() => {
     const fetchOptionSignals = async () => {
       try {
-        const res = await fetch(`${OPTION_SIGNALS_API}?mode=${encodeURIComponent(confirmationMode)}`);
+        const res = await fetch(`${OPTION_SIGNALS_API}?mode=${encodeURIComponent(confirmationMode)}&include_nifty50=true`);
         const data = await res.json();
         
         // Check if API returned an error or detail message
@@ -748,6 +782,9 @@ const AutoTradingDashboard = () => {
     ? optionSignals.find((s) => s.symbol === selectedSignalSymbol)
     : null;
 
+  // Get best quality trade from market scanner (if available)
+  const bestQualityTrade = qualityTrades && qualityTrades.length > 0 ? qualityTrades[0] : null;
+
   // Pick the best signal (highest confidence) from valid optionSignals only
   const bestSignal = optionSignals.reduce((best, curr) => {
     // Skip invalid signals
@@ -757,7 +794,8 @@ const AutoTradingDashboard = () => {
     return (!best || ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence))) ? curr : best;
   }, null);
 
-  const activeSignal = selectedSignal || bestSignal;
+  // Use quality trade if available, otherwise use best signal
+  const activeSignal = selectedSignal || bestQualityTrade || bestSignal;
 
   const liveMarketSignal = professionalSignal && !professionalSignal.error
     ? professionalSignal
@@ -909,12 +947,11 @@ const AutoTradingDashboard = () => {
     }
   }, [selectedSignalSymbol]);
 
-  // Auto-execute the selected/best signal when it arrives (demo or live mode)
+  // Auto-execute ONLY after user explicitly starts auto-trading (LIVE mode)
   useEffect(() => {
     if (activeSignal && !executing && !hasActiveTrade) {
-      // Execute automatically in DEMO mode, or if user explicitly enabled LIVE mode
-      if (!isLiveMode || autoTradingActive) {
-        console.log(`🚀 SIGNAL RECEIVED - Executing in ${isLiveMode ? 'LIVE' : 'DEMO'} mode`);
+      if (autoTradingActive && isLiveMode) {
+        console.log('🚀 SIGNAL RECEIVED - Executing LIVE (user-approved)');
         executeAutoTrade(activeSignal);
       }
     }
@@ -928,8 +965,8 @@ const AutoTradingDashboard = () => {
   const executeAutoTrade = async (signal) => {
     if (!signal || executing) return;
     
-    // In DEMO mode, always execute. In LIVE mode, only if autoTradingActive
-    if (isLiveMode && !autoTradingActive) return;
+    // ONLY execute real trades when user explicitly starts auto-trading (LIVE mode)
+    if (!autoTradingActive || !isLiveMode) return;
 
     // Hard stop: no trades after any daily loss
     if (isLossLimitHit()) {
@@ -1057,7 +1094,9 @@ const AutoTradingDashboard = () => {
 
   const createPaperTradeFromSignal = async (signal) => {
     if (!signal || !signal.symbol) return;
-    if (lastPaperSignalSymbol === signal.symbol) return;
+    const paperSignalKey = `${signal.symbol}:${signal.entry_price}:${signal.target}:${signal.stop_loss}`;
+    const now = Date.now();
+    if (lastPaperSignalSymbol === paperSignalKey && (now - lastPaperSignalAt) < 60000) return;
 
     // Hard stop: no paper trades after any daily loss
     if (isLossLimitHit()) {
@@ -1097,7 +1136,8 @@ const AutoTradingDashboard = () => {
       if (res.ok) {
         const data = await res.json();
         if (data?.success !== false) {
-          setLastPaperSignalSymbol(signal.symbol);
+          setLastPaperSignalSymbol(paperSignalKey);
+          setLastPaperSignalAt(Date.now());
         }
       }
     } catch (e) {
@@ -1154,23 +1194,34 @@ const AutoTradingDashboard = () => {
     // Data will load in background
     setLoading(false);
     
-    // Start wake lock immediately
+    // Auto-scan market for quality trades on load
+    setTimeout(() => {
+      scanMarketForQualityTrades();
+      console.log('📊 Auto-scanning market for quality trades...');
+    }, 2000);
+    
+    // Start wake lock + heartbeat immediately
     const activateWakeLock = async () => {
-      const locked = await requestWakeLock();
-      setWakeLockActive(locked);
-      
-      const handleVisibilityChange = async () => {
-        if (!document.hidden && !wakeLock) {
-          const relocked = await requestWakeLock();
-          setWakeLockActive(relocked);
-        }
-      };
-      
-      document.addEventListener('visibilitychange', handleVisibilityChange);
-      return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+      const status = await initializeWakeLock();
+      setWakeLockActive(!!status?.wakeLockActive || !!status?.hasModernAPI || !!status?.heartbeatActive);
+      startKeepAliveHeartbeat();
     };
     
     activateWakeLock();
+
+    const handleVisibilityRefresh = () => {
+      if (!document.hidden) {
+        fetchData();
+        scanMarketForQualityTrades();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityRefresh);
+
+    const wakeLockStatusInterval = setInterval(() => {
+      const status = getWakeLockStatus();
+      setWakeLockActive(!!status?.isActive || !!status?.heartbeatRunning);
+    }, 30000);
 
     // Fetch data in background (non-blocking)
     const initialDataTimeout = setTimeout(() => {
@@ -1193,8 +1244,8 @@ const AutoTradingDashboard = () => {
     const dataRefreshInterval = setInterval(async () => {
       const prevCount = prevActiveTradesCount.current;
       
-      // Only fetch data if component is visible (performance optimization)
-      if (document.hidden) {
+      // Always fetch trade data so it stays updated anytime
+      if (document.hidden && !ALWAYS_FETCH_TRADES) {
         console.log('⏸️ Tab hidden - skipping data fetch');
         return;
       }
@@ -1220,7 +1271,10 @@ const AutoTradingDashboard = () => {
       clearTimeout(initialDataTimeout);
       clearInterval(dataRefreshInterval);
       clearInterval(healthCheckInterval);
+      document.removeEventListener('visibilitychange', handleVisibilityRefresh);
+      clearInterval(wakeLockStatusInterval);
       releaseWakeLock();
+      stopKeepAliveHeartbeat();
     };
   }, [enabled, autoTradingActive, activeTrades.length]);
 
@@ -1237,11 +1291,16 @@ const AutoTradingDashboard = () => {
     const currentCount = activeTrades.length;
     
     // Trade just exited (SL/Target hit)
-    if (autoTradingActive && prevCount > 0 && currentCount === 0) {
+    if (prevCount > 0 && currentCount === 0) {
       console.log(`🚨 TRADE EXIT IMMEDIATE: ${prevCount} → ${currentCount} - Starting new trade cycle`);
-      setTimeout(() => {
-        analyzeMarket();
-      }, 1500);
+      // Allow new paper trade on same symbol after a trade exit
+      setLastPaperSignalSymbol(null);
+      setLastPaperSignalAt(0);
+      if (autoTradingActive) {
+        setTimeout(() => {
+          analyzeMarket();
+        }, 1500);
+      }
     }
     
     prevActiveTradesCount.current = currentCount;
@@ -1269,11 +1328,14 @@ const AutoTradingDashboard = () => {
   }, [autoTradingActive]);
 
   useEffect(() => {
-    if (!autoTradingActive && activeSignal && signalsLoaded) {
-      // Create paper trades when auto-trading is OFF (for user review)
-      createPaperTradeFromSignal(activeSignal);
+    if (!autoTradingActive && !isLiveMode && signalsLoaded && !hasActiveTrade) {
+      // Create paper trades when auto-trading is OFF (demo mode)
+      const signalForPaper = bestQualityTrade || activeSignal;
+      if (signalForPaper) {
+        createPaperTradeFromSignal(signalForPaper);
+      }
     }
-  }, [autoTradingActive, activeSignal, signalsLoaded, activeTrades.length, lotMultiplier]);
+  }, [autoTradingActive, isLiveMode, signalsLoaded, hasActiveTrade, bestQualityTrade, activeSignal, lotMultiplier]);
 
   if (loading) {
     return (
@@ -1434,69 +1496,6 @@ const AutoTradingDashboard = () => {
         }
       `}</style>
       {/* Header with Toggle */}
-      {renderOptionSignalsTable()}
-      
-      {/* Professional Signal Display */}
-      {professionalSignal && !professionalSignal.error && (
-        <div style={{
-          background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-          borderRadius: '16px',
-          padding: '24px',
-          marginBottom: '24px',
-          color: 'white',
-          boxShadow: '0 10px 40px rgba(102, 126, 234, 0.3)'
-        }}>
-          <h3 style={{ margin: '0 0 16px 0', fontSize: '20px', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '8px' }}>
-            🎯 Professional Intraday Signal
-            <span style={{
-              fontSize: '12px',
-              padding: '4px 10px',
-              borderRadius: '12px',
-              background: 'rgba(255,255,255,0.2)',
-              fontWeight: '600'
-            }}>
-              LIVE
-            </span>
-          </h3>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '16px' }}>
-            <div>
-              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Symbol</div>
-              <div style={{ fontSize: '18px', fontWeight: 'bold' }}>{professionalSignal.symbol}</div>
-            </div>
-            <div>
-              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Action</div>
-              <div style={{ fontSize: '20px', fontWeight: 'bold' }}>
-                <span style={{
-                  padding: '6px 16px',
-                  borderRadius: '8px',
-                  background: professionalSignal.signal === 'buy' ? '#48bb78' : professionalSignal.signal === 'sell' ? '#f56565' : '#cbd5e0',
-                  color: 'white'
-                }}>
-                  {(professionalSignal.signal || 'HOLD').toUpperCase()}
-                </span>
-              </div>
-            </div>
-            <div>
-              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Entry Price</div>
-              <div style={{ fontSize: '18px', fontWeight: 'bold' }}>
-                ₹{professionalSignal.entry_price ? professionalSignal.entry_price.toFixed(2) : 'N/A'}
-              </div>
-            </div>
-            <div>
-              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Target</div>
-              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#c6f6d5' }}>
-                ₹{professionalSignal.target ? professionalSignal.target.toFixed(2) : 'N/A'}
-              </div>
-            </div>
-            <div>
-              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Stop Loss</div>
-              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#fed7d7' }}>
-                ₹{professionalSignal.stop_loss ? professionalSignal.stop_loss.toFixed(2) : 'N/A'}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
       
       <div style={{
         display: 'flex',
@@ -1754,6 +1753,179 @@ const AutoTradingDashboard = () => {
           )}
         </div>
     </div>
+
+      {/* Market Quality Scanner */}
+      <div style={{
+        padding: '24px',
+        background: 'linear-gradient(135deg, #fef3c7 0%, #fde68a 100%)',
+        borderRadius: '12px',
+        border: '2px solid #f59e0b',
+        marginBottom: '24px'
+      }}>
+        <div style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginBottom: '16px'
+        }}>
+          <h4 style={{
+            margin: 0,
+            color: '#92400e',
+            fontSize: '18px',
+            fontWeight: 'bold'
+          }}>
+            🎯 All Quality Signals (NIFTY • BANKNIFTY • SENSEX • FINNIFTY - 75%+ Quality)
+          </h4>
+          <button
+            onClick={scanMarketForQualityTrades}
+            disabled={scannerLoading}
+            style={{
+              padding: '10px 20px',
+              background: scannerLoading ? '#cbd5e0' : '#f59e0b',
+              color: 'white',
+              border: 'none',
+              borderRadius: '6px',
+              fontSize: '14px',
+              fontWeight: '600',
+              cursor: scannerLoading ? 'wait' : 'pointer'
+            }}>
+            {scannerLoading ? '🔄 Scanning...' : '🔄 Refresh'}
+          </button>
+        </div>
+
+        {qualityTrades.length > 0 ? (
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{
+              width: '100%',
+              borderCollapse: 'collapse',
+              fontSize: '13px'
+            }}>
+              <thead>
+                <tr style={{ background: '#f59e0b', color: 'white' }}>
+                  <th style={{ padding: '10px', textAlign: 'left' }}>Symbol</th>
+                  <th style={{ padding: '10px', textAlign: 'center' }}>Action</th>
+                  <th style={{ padding: '10px', textAlign: 'center' }}>Quality</th>
+                  <th style={{ padding: '10px', textAlign: 'center' }}>Confidence</th>
+                  <th style={{ padding: '10px', textAlign: 'center' }}>RR</th>
+                  <th style={{ padding: '10px', textAlign: 'center' }}>Entry</th>
+                  <th style={{ padding: '10px', textAlign: 'center' }}>Target</th>
+                  <th style={{ padding: '10px', textAlign: 'center' }}>Rating</th>
+                </tr>
+              </thead>
+              <tbody>
+                {qualityTrades.map((trade, idx) => (
+                  <tr key={idx} style={{
+                    background: idx % 2 === 0 ? '#fffbeb' : '#fef3c7',
+                    borderBottom: '1px solid #fcd34d'
+                  }}>
+                    <td style={{ padding: '10px', fontWeight: '600', color: '#1f2937' }}>{trade.symbol}</td>
+                    <td style={{ padding: '10px', textAlign: 'center', color: trade.action === 'BUY' ? '#48bb78' : '#f56565' }}>
+                      {trade.action}
+                    </td>
+                    <td style={{
+                      padding: '10px',
+                      textAlign: 'center',
+                      fontWeight: 'bold',
+                      background: trade.quality >= 85 ? '#c6f6d5' : '#feebc8',
+                      borderRadius: '4px'
+                    }}>
+                      {trade.quality}%
+                    </td>
+                    <td style={{ padding: '10px', textAlign: 'center' }}>
+                      {(trade.confirmation_score ?? trade.confidence ?? 0).toFixed(1)}%
+                    </td>
+                    <td style={{ padding: '10px', textAlign: 'center' }}>
+                      {trade.rr.toFixed(2)}
+                    </td>
+                    <td style={{ padding: '10px', textAlign: 'center' }}>₹{trade.entry_price?.toFixed(2) || '-'}</td>
+                    <td style={{ padding: '10px', textAlign: 'center' }}>₹{trade.target?.toFixed(2) || '-'}</td>
+                    <td style={{ padding: '10px', textAlign: 'center' }}>{trade.recommendation}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p style={{
+            margin: 0,
+            color: '#92400e',
+            textAlign: 'center',
+            padding: '20px'
+          }}>
+            {scannerLoading ? '🔄 Scanning all markets for quality signals...' : '📊 No quality signals available at this time. Refresh to scan market.'}
+          </p>
+        )}
+      </div>
+
+      {/* Professional Signal Display - uses best quality trade from market scanner */}
+      {bestQualityTrade || (professionalSignal && !professionalSignal.error) ? (
+        <div style={{
+          background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+          borderRadius: '16px',
+          padding: '24px',
+          marginBottom: '24px',
+          color: 'white',
+          boxShadow: '0 10px 40px rgba(102, 126, 234, 0.3)'
+        }}>
+          <h3 style={{ margin: '0 0 16px 0', fontSize: '20px', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '8px' }}>
+            🎯 Professional Intraday Signal
+            <span style={{
+              fontSize: '12px',
+              padding: '4px 10px',
+              borderRadius: '12px',
+              background: 'rgba(255,255,255,0.2)',
+              fontWeight: '600'
+            }}>
+              {bestQualityTrade ? '✨ SCANNED' : 'LIVE'}
+            </span>
+          </h3>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '16px' }}>
+            <div>
+              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Symbol</div>
+              <div style={{ fontSize: '18px', fontWeight: 'bold' }}>{bestQualityTrade?.symbol || professionalSignal?.symbol}</div>
+            </div>
+            <div>
+              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Action</div>
+              <div style={{ fontSize: '20px', fontWeight: 'bold' }}>
+                <span style={{
+                  padding: '6px 16px',
+                  borderRadius: '8px',
+                  background: (bestQualityTrade?.action || professionalSignal?.signal) === 'BUY' || (bestQualityTrade?.action || professionalSignal?.signal) === 'buy' ? '#48bb78' : (bestQualityTrade?.action || professionalSignal?.signal) === 'SELL' || (bestQualityTrade?.action || professionalSignal?.signal) === 'sell' ? '#f56565' : '#cbd5e0',
+                  color: 'white'
+                }}>
+                  {(bestQualityTrade?.action || professionalSignal?.signal || 'HOLD').toUpperCase()}
+                </span>
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Entry Price</div>
+              <div style={{ fontSize: '18px', fontWeight: 'bold' }}>
+                ₹{(bestQualityTrade?.entry_price || professionalSignal?.entry_price)?.toFixed(2) || 'N/A'}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Target</div>
+              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#c6f6d5' }}>
+                ₹{(bestQualityTrade?.target || professionalSignal?.target)?.toFixed(2) || 'N/A'}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Stop Loss</div>
+              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#fed7d7' }}>
+                ₹{(bestQualityTrade?.stop_loss || professionalSignal?.stop_loss)?.toFixed(2) || 'N/A'}
+              </div>
+            </div>
+            {bestQualityTrade && (
+              <div>
+                <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Quality Score</div>
+                <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#fbbf24' }}>
+                  {bestQualityTrade.quality}% ✨
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      ) : null}
 
       {/* Market Analysis */}
       {activeSignal && (

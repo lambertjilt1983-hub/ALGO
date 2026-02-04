@@ -19,6 +19,20 @@ OPTION_CHAIN_URLS = {
     'FINNIFTY': 'https://api.example.com/finnifty/option-chain',
 }
 
+# NIFTY 50 symbols (cash segment). Used for equity option signals when enabled.
+NIFTY_50_SYMBOLS = [
+    "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
+    "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BEL", "BPCL",
+    "BHARTIARTL", "BRITANNIA", "CIPLA", "COALINDIA", "DRREDDY",
+    "EICHERMOT", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE",
+    "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDUSINDBK",
+    "INFY", "ITC", "JSWSTEEL", "KOTAKBANK", "LT",
+    "M&M", "MARUTI", "NESTLEIND", "NTPC", "ONGC",
+    "POWERGRID", "RELIANCE", "SBIN", "SBILIFE", "SHRIRAMFIN",
+    "SUNPHARMA", "TATAMOTORS", "TATASTEEL", "TCS", "TECHM",
+    "TITAN", "ULTRACEMCO", "WIPRO"
+]
+
 # Zerodha Kite Connect (lazy initialized)
 _kite_cache = None
 _kite_cache_time = 0
@@ -507,7 +521,11 @@ _signals_cache_ttl = 60  # seconds - increased from 30 to reduce API calls
 _signals_rate_limit = 5  # seconds between calls - reduced from 10
 _signals_last_call = 0
 
-def generate_signals(user_id: int | None = None) -> List[Dict]:
+def generate_signals(
+    user_id: int | None = None,
+    symbols: List[str] | None = None,
+    include_nifty50: bool = False,
+) -> List[Dict]:
     global _signals_cache, _signals_cache_time, _signals_last_call
     now = time.time()
     with _signals_cache_lock:
@@ -552,8 +570,22 @@ def generate_signals(user_id: int | None = None) -> List[Dict]:
                 instruments_all = None
 
         indices = ["BANKNIFTY", "NIFTY", "SENSEX", "FINNIFTY"]
+        selected = []
+        if symbols:
+            selected = [s.strip().upper() for s in symbols if isinstance(s, str) and s.strip()]
+        else:
+            selected = indices.copy()
+            if include_nifty50:
+                selected.extend(NIFTY_50_SYMBOLS)
+        # de-duplicate while preserving order
+        seen = set()
+        selected_symbols = []
+        for sym in selected:
+            if sym not in seen:
+                selected_symbols.append(sym)
+                seen.add(sym)
         signals = []
-        for idx in indices:
+        for idx in selected_symbols:
             result = fetch_index_option_chain(
                 idx,
                 kite,
@@ -691,8 +723,13 @@ def _apply_confirmation(signal: Dict, sentiment: Dict, trend_row: Dict | None, m
     return signal
 
 
-async def generate_signals_advanced(user_id: int | None = None, mode: str = "balanced") -> List[Dict]:
-    signals = generate_signals(user_id=user_id)
+async def generate_signals_advanced(
+    user_id: int | None = None,
+    mode: str = "balanced",
+    symbols: List[str] | None = None,
+    include_nifty50: bool = False,
+) -> List[Dict]:
+    signals = generate_signals(user_id=user_id, symbols=symbols, include_nifty50=include_nifty50)
     try:
         sentiment = news_analyzer.get_market_sentiment_summary()
     except Exception:

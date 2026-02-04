@@ -473,6 +473,50 @@ def _close_trade(trade: Dict[str, any], exit_price: float) -> None:
             pass
 
 
+def close_all_active_trades(reason: str = "Market close") -> int:
+    """Force-close all open active trades with a market exit order."""
+    if not active_trades:
+        return 0
+
+    closed_count = 0
+    for trade in list(active_trades):
+        if trade.get("status") != "OPEN":
+            continue
+
+        symbol = trade.get("symbol")
+        qty = int(trade.get("quantity") or 0)
+        side = (trade.get("side") or "BUY").upper()
+        exit_side = "SELL" if side == "BUY" else "BUY"
+        exchange = trade.get("exchange") or "NFO"
+        product = trade.get("product") or "MIS"
+        exit_price = trade.get("current_price") or trade.get("price") or 0.0
+
+        if not symbol or qty <= 0:
+            continue
+
+        exit_order = place_zerodha_order(
+            symbol=symbol,
+            quantity=qty,
+            side=exit_side,
+            order_type="MARKET",
+            product=product,
+            exchange=exchange,
+        )
+
+        if exit_order.get("success"):
+            trade["exit_reason"] = reason
+            trade["exit_order_id"] = exit_order.get("order_id")
+            _close_trade(trade, exit_price)
+            closed_count += 1
+        else:
+            trade["exit_error"] = exit_order.get("error")
+
+    if closed_count > 0:
+        active_trades[:] = [t for t in active_trades if t.get("status") == "OPEN"]
+
+    return closed_count
+
+
 def _stop_hit(trade: Dict[str, any], price: float) -> bool:
     """Check if stop loss is hit, with emergency stop buffer to prevent slippage losses"""
     side = trade.get("side", "BUY").upper()
@@ -1130,6 +1174,8 @@ async def execute(
         "quantity": trade.quantity or 1,
         "status": "OPEN",
         "broker_id": trade.broker_id,
+        "exchange": "NFO",
+        "product": "MIS",
         "timestamp": _now(),
         "stop_loss": derived_stop,
         "target": derived_target,

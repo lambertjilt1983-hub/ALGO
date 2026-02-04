@@ -112,34 +112,72 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
 
         for trade in trades:
             try:
-                # Smart Trailing Stop Loss Logic
-                # NO TRAILING until target is reached!
-                # Only after target hit: activate 5pt tight trailing SL
+                # Smart Profit Booking + Trailing Stop Logic
+                # 1) Move SL to breakeven after 50% of target is reached.
+                # 2) Close at target (profit booking).
+                # 3) If target is exceeded, keep a tight trailing SL (5pts).
                 if trade.side == "BUY":
                     if trade.stop_loss is not None:
                         profit_points = new_price - trade.entry_price
                         target_reached = trade.target is not None and new_price >= trade.target
+                        half_target = trade.target is not None and new_price >= (trade.entry_price + (trade.target - trade.entry_price) * 0.5)
+                        if half_target and trade.stop_loss < trade.entry_price:
+                            trade.stop_loss = round(trade.entry_price, 2)
+                            print(
+                                f"✅ BREAKEVEN set at {trade.stop_loss} after 50% target reached (Profit: +{profit_points:.1f}pts)"
+                            )
                         if target_reached:
+                            trade.status = "TARGET_HIT"
+                            trade.exit_price = trade.target
+                            trade.exit_time = datetime.utcnow()
+                            trade.pnl = (trade.target - trade.entry_price) * trade.quantity
+                            trade.pnl_percentage = (trade.pnl / (trade.entry_price * trade.quantity)) * 100
+                            closed_count += 1
+                            print(
+                                f"✅ TARGET HIT: Trade {trade.id} closed at target {trade.target} (Profit: ₹{trade.pnl:.2f})"
+                            )
+                            trade.current_price = trade.target
+                            updated_count += 1
+                            continue
+                        if trade.target is not None and profit_points > (trade.target - trade.entry_price):
                             new_trailing_sl = round(new_price - 5, 2)
                             if new_trailing_sl > trade.stop_loss:
                                 trade.stop_loss = new_trailing_sl
                                 print(
-                                    f"💎 TARGET REACHED! Activating 5pt trailing SL: {trade.stop_loss} (Profit: +{profit_points:.1f}pts)"
+                                    f"💎 TARGET EXCEEDED! Trailing SL: {trade.stop_loss} (Profit: +{profit_points:.1f}pts)"
                                 )
                 else:  # SELL
                     if trade.stop_loss is not None:
                         profit_points = trade.entry_price - new_price
                         target_reached = trade.target is not None and new_price <= trade.target
+                        half_target = trade.target is not None and new_price <= (trade.entry_price - (trade.entry_price - trade.target) * 0.5)
+                        if half_target and trade.stop_loss > trade.entry_price:
+                            trade.stop_loss = round(trade.entry_price, 2)
+                            print(
+                                f"✅ BREAKEVEN set at {trade.stop_loss} after 50% target reached (Profit: +{profit_points:.1f}pts)"
+                            )
                         if target_reached:
+                            trade.status = "TARGET_HIT"
+                            trade.exit_price = trade.target
+                            trade.exit_time = datetime.utcnow()
+                            trade.pnl = (trade.entry_price - trade.target) * trade.quantity
+                            trade.pnl_percentage = (trade.pnl / (trade.entry_price * trade.quantity)) * 100
+                            closed_count += 1
+                            print(
+                                f"✅ TARGET HIT: Trade {trade.id} closed at target {trade.target} (Profit: ₹{trade.pnl:.2f})"
+                            )
+                            trade.current_price = trade.target
+                            updated_count += 1
+                            continue
+                        if trade.target is not None and profit_points > (trade.entry_price - trade.target):
                             new_trailing_sl = round(new_price + 5, 2)
                             if new_trailing_sl < trade.stop_loss:
                                 trade.stop_loss = new_trailing_sl
                                 print(
-                                    f"💎 TARGET REACHED! Activating 5pt trailing SL: {trade.stop_loss} (Profit: +{profit_points:.1f}pts)"
+                                    f"💎 TARGET EXCEEDED! Trailing SL: {trade.stop_loss} (Profit: +{profit_points:.1f}pts)"
                                 )
 
-                # Check SL/Target using live price
-                # IMPORTANT: DO NOT close on target hit - only close on SL hit
+                # Check SL using live price (target handled above)
                 if trade.side == "BUY":
                     if trade.stop_loss is not None and new_price <= trade.stop_loss:
                         new_price = trade.stop_loss
