@@ -12,13 +12,16 @@ async def reset_daily_loss(authorization: Optional[str] = Header(None)):
 """Auto Trading Engine wired to live market data (no mocks)."""
 
 import math
+import time
+import asyncio
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.strategies.market_intelligence import trend_analyzer
-from app.engine.option_signal_generator import generate_signals, select_best_signal
+from app.engine.option_signal_generator import generate_signals, select_best_signal, _get_kite
+from app.engine.paper_trade_updater import _quote_symbol
 from app.core.database import SessionLocal
 from app.models.trading import TradeReport
 from sqlalchemy import func
@@ -28,10 +31,14 @@ from app.engine.simple_momentum_strategy import SimpleMomentumStrategy
 
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
 
-MAX_TRADES = 1  # 1 trade at a time - better loss control
-TARGET_PCT = 2.5  # 2.5% target (25 points on Nifty options)
-STOP_PCT = 0.06   # 10-point max stop loss to cap losses
-MAX_STOP_POINTS = 10  # Maximum 10 points stop loss
+MAX_TRADES = 2  # Allow up to 2 trades at a time (1 CE + 1 PE)
+TARGET_PCT = 2.5  # 2.5% target (index/futures sizing)
+STOP_PCT = 0.06   # Stop-loss percent fallback (index/futures sizing)
+TARGET_POINTS = 15  # Fixed target in points for options
+STOP_POINTS = 20    # Fixed stop loss in points for options
+MAX_STOP_POINTS = 20  # Maximum stop loss in points for options
+PROFIT_EXIT_AMOUNT = 800.0  # Currency profit exit for the first trade
+LOSS_CAP_AMOUNT = 2000.0    # Currency loss cap for the second trade
 CONFIRM_MOMENTUM_PCT = 0.5  # Strong momentum (0.5% minimum move)
 MIN_WIN_RATE = 0.70         # High win rate requirement (70%+)
 MIN_WIN_SAMPLE = 5          # Require 5 trades to assess win rate
@@ -81,6 +88,12 @@ state = {
 active_trades: List[Dict] = []
 history: List[Dict] = []
 broker_logs: List[Dict] = []
+live_price_cache: Dict[str, float] = {}
+live_update_state = {
+    "failure_count": 0,
+    "backoff_until": 0.0,
+    "last_duration": 0.0,
+}
 
 # Initialize engine, broker, and strategy
 engine = AutoTradingEngine()
@@ -90,6 +103,79 @@ strategy = SimpleMomentumStrategy()
 
 def _now() -> str:
     return datetime.now().isoformat()
+
+
+def _option_kind(symbol: str | None) -> str | None:
+    if not symbol:
+        return None
+    upper = symbol.upper()
+    if upper.endswith("CE"):
+        return "CE"
+    if upper.endswith("PE"):
+        return "PE"
+    return None
+
+
+def _best_signal_by_quality(signals: List[Dict]) -> Optional[Dict]:
+    if not signals:
+        return None
+    return max(signals, key=lambda s: (s.get("quality_score", 0), s.get("confidence", 0)))
+
+
+def _best_signals_by_kind(signals: List[Dict]) -> Dict[str, Dict]:
+    best: Dict[str, Dict] = {}
+    for kind in ("CE", "PE"):
+        candidates = [s for s in signals if _option_kind(s.get("symbol")) == kind]
+        if candidates:
+            best[kind] = _best_signal_by_quality(candidates)
+    return best
+
+
+def _apply_fixed_option_levels(signal: Dict) -> Dict:
+    kind = _option_kind(signal.get("symbol"))
+    if not kind:
+        return signal
+    entry = float(signal.get("entry_price") or 0)
+    action = (signal.get("action") or "BUY").upper()
+    if entry <= 0:
+        return signal
+    if action == "SELL":
+        target = entry - TARGET_POINTS
+        stop_loss = entry + STOP_POINTS
+    else:
+        target = entry + TARGET_POINTS
+        stop_loss = entry - STOP_POINTS
+    qty = int(signal.get("quantity") or 1)
+    signal["target"] = round(target, 2)
+    signal["stop_loss"] = round(stop_loss, 2)
+    signal["target_points"] = float(TARGET_POINTS)
+    signal["potential_profit"] = round(abs(target - entry) * qty, 2)
+    signal["risk"] = round(abs(entry - stop_loss) * qty, 2)
+    return signal
+
+
+def _pnl_for_trade(trade: Dict[str, Any], price: float) -> float:
+    qty = trade.get("quantity", 0) or 0
+    side = trade.get("side", "BUY").upper()
+    entry = trade.get("price", 0.0) or 0.0
+    pnl = (price - entry) * qty
+    return pnl if side == "BUY" else -pnl
+
+
+def _should_exit_by_currency(trade: Dict[str, Any], price: float) -> str | None:
+    kind = _option_kind(trade.get("symbol"))
+    if not kind:
+        return None
+    pnl = _pnl_for_trade(trade, price)
+    peak_pnl = float(trade.get("peak_pnl") or pnl)
+    trade["peak_pnl"] = max(peak_pnl, pnl)
+    if kind == "CE":
+        # Exit if we hit profit >= threshold and then fall back below it.
+        if trade.get("peak_pnl", 0) >= PROFIT_EXIT_AMOUNT and pnl <= PROFIT_EXIT_AMOUNT and trade.get("peak_pnl", 0) > pnl:
+            return "PROFIT_TRAIL"
+    if kind == "PE" and pnl <= -LOSS_CAP_AMOUNT:
+        return "LOSS_CAP"
+    return None
 
 
 def _reset_daily_if_needed():
@@ -790,6 +876,8 @@ async def _live_signals(symbols: List[str], instrument_type: str, qty_override: 
             "symbol": symbol,
             "index": index,
             "confidence": raw.get("confidence", 0),
+            "quality_score": raw.get("quality_score", 0),
+            "confirmation_score": raw.get("confirmation_score", raw.get("confidence", 0)),
             "strategy": raw.get("strategy", "ATM Option"),
             "entry_price": entry_price,
             "stop_loss": stop_loss,
@@ -804,18 +892,31 @@ async def _live_signals(symbols: List[str], instrument_type: str, qty_override: 
             "target_points": target_points,
             "data_source": data_source,
         }
+        sig = _apply_fixed_option_levels(sig)
         signals.append(sig)
         print(f"[_live_signals] ✓ Signal generated for {index}: {action} {symbol} @ ₹{entry_price}")
 
-    # Sort by confidence so best is first for recommendation
-    signals.sort(key=lambda s: s.get("confidence", 0), reverse=True)
+    # Sort by quality score so best is first for recommendation
+    signals.sort(key=lambda s: (s.get("quality_score", 0), s.get("confidence", 0)), reverse=True)
     print(f"[_live_signals] ✓ Generated {len(signals)} signals total")
     return signals, data_source
 
 
 def _build_demo_trades(signals: List[Dict]) -> None:
     demo_trades.clear()
-    for idx, sig in enumerate(signals[:2], 1):
+    best_by_kind = _best_signals_by_kind(signals)
+    preferred = []
+    if best_by_kind.get("CE"):
+        preferred.append(best_by_kind["CE"])
+    if best_by_kind.get("PE"):
+        preferred.append(best_by_kind["PE"])
+    if len(preferred) < 2:
+        for sig in signals:
+            if sig not in preferred:
+                preferred.append(sig)
+            if len(preferred) >= 2:
+                break
+    for idx, sig in enumerate(preferred[:2], 1):
         qty = sig["quantity"]
         current_price = sig["entry_price"]
         pnl = (current_price - sig["entry_price"]) * qty
@@ -957,7 +1058,8 @@ async def analyze(
     if not signals:
         raise HTTPException(status_code=503, detail="No live market data available (quotes unavailable).")
 
-    rec = signals[0]
+    rec = _best_signal_by_quality(signals) or signals[0]
+    best_by_kind = _best_signals_by_kind(signals)
     recommendation = {
         "action": rec["action"],
         "symbol": rec["symbol"],
@@ -985,11 +1087,17 @@ async def analyze(
     capital_in_use = _capital_in_use()
     remaining_cap = balance * risk_config.get("max_portfolio_pct", 1.0) - capital_in_use
     can_trade = True if state.get("is_demo_mode") else (len(active_trades) < MAX_TRADES and remaining_cap > 0)
+    active_kinds = {_option_kind(t.get("symbol")) for t in active_trades if t.get("status") == "OPEN"}
+    available_sides = {
+        "CE": "CE" not in active_kinds,
+        "PE": "PE" not in active_kinds,
+    }
 
     response = {
         "success": True,
         "signals": signals,
         "recommendation": recommendation,
+        "best_signals": best_by_kind,
         "signals_count": len(signals),
         "live_balance": balance,
         "live_price": rec["underlying_price"],
@@ -997,6 +1105,7 @@ async def analyze(
         "mode": "DEMO" if state["is_demo_mode"] else "LIVE",
         "data_source": data_source,
         "can_trade": can_trade,
+        "available_sides": available_sides,
         "remaining_capital": round(max(0.0, remaining_cap), 2),
         "capital_in_use": round(capital_in_use, 2),
         "portfolio_cap": round(balance * risk_config.get("max_portfolio_pct", 1.0), 2),
@@ -1018,6 +1127,11 @@ class TradeRequest(BaseModel):
     resistance: Optional[float] = None
     broker_id: int = 1
     expiry: Optional[str] = None
+
+
+class CloseTradeRequest(BaseModel):
+    trade_id: Optional[int] = None
+    symbol: Optional[str] = None
 
 @router.post("/execute")
 async def execute(
@@ -1120,13 +1234,27 @@ async def execute(
     if len(active_trades) >= MAX_TRADES and not auto_demo:
         raise HTTPException(status_code=429, detail="Max active trades reached")
 
+    option_kind = _option_kind(trade.symbol)
+    if option_kind and not auto_demo:
+        open_kinds = {_option_kind(t.get("symbol")) for t in active_trades if t.get("status") == "OPEN"}
+        if option_kind in open_kinds:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Only one {option_kind} trade can be open at a time."
+            )
+
     # ═══════════════════════════════════════════════════════════════
     # 10-POINT MAX STOP LOSS VALIDATION (NEW)
     # ═══════════════════════════════════════════════════════════════
     
     pct = STOP_PCT / 100
     derived_stop = trade.stop_loss
-    if derived_stop is None:
+    if option_kind:
+        if trade.side.upper() == "SELL":
+            derived_stop = round(trade.price + STOP_POINTS, 2)
+        else:
+            derived_stop = round(trade.price - STOP_POINTS, 2)
+    elif derived_stop is None:
         if trade.side.upper() == "BUY":
             derived_stop = round(trade.price * (1 - pct), 2)
         else:
@@ -1135,12 +1263,13 @@ async def execute(
     # Calculate stop loss in points
     stop_points = abs(trade.price - derived_stop)
     if stop_points > MAX_STOP_POINTS and not auto_demo:
-        # Adjust to exactly 10 points
+        # Adjust to max allowed points
         if trade.side.upper() == "BUY":
             derived_stop = trade.price - MAX_STOP_POINTS
         else:
             derived_stop = trade.price + MAX_STOP_POINTS
         print(f"[RISK CONTROL] Stop loss adjusted to {MAX_STOP_POINTS} points: ₹{derived_stop:.2f}")
+        stop_points = abs(trade.price - derived_stop)
     
     # Validate max loss amount
     qty = trade.quantity or 1
@@ -1156,7 +1285,12 @@ async def execute(
     # ═══════════════════════════════════════════════════════════════
 
     derived_target = trade.target
-    if derived_target is None:
+    if option_kind:
+        if trade.side.upper() == "SELL":
+            derived_target = round(trade.price - TARGET_POINTS, 2)
+        else:
+            derived_target = round(trade.price + TARGET_POINTS, 2)
+    elif derived_target is None:
         if trade.side.upper() == "BUY":
             derived_target = round(trade.price * (1 + pct * (TARGET_PCT / STOP_PCT)), 2)
         else:
@@ -1229,6 +1363,167 @@ async def get_active_trades(authorization: Optional[str] = Header(None)):
     return {"trades": trades, "is_demo_mode": False, "count": len(trades)}
 
 
+@router.post("/trades/update-prices")
+async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
+    now = time.time()
+    if live_update_state["backoff_until"] > now:
+        return {
+            "success": False,
+            "updated_count": 0,
+            "message": "Zerodha throttled - backing off",
+            "retry_after": round(live_update_state["backoff_until"] - now, 2),
+        }
+
+    open_trades = [t for t in active_trades if t.get("status") == "OPEN"]
+    if not open_trades:
+        return {"success": True, "updated_count": 0, "message": "No open trades to update"}
+
+    kite = _get_kite()
+    if not kite:
+        return {"success": False, "message": "Zerodha credentials missing or invalid", "updated_count": 0}
+
+    quote_symbols = []
+    trade_symbol_map: Dict[str, List[Dict[str, Any]]] = {}
+    for trade in open_trades:
+        try:
+            quote_symbol = _quote_symbol(trade.get("symbol"), trade.get("index"))
+            quote_symbols.append(quote_symbol)
+            trade_symbol_map.setdefault(quote_symbol, []).append(trade)
+        except Exception:
+            continue
+
+    async def _retry_ltp(symbols: List[str]) -> Dict[str, Any]:
+        delays = [0.2, 0.5, 1.0, 1.5, 2.0]
+        for attempt, delay in enumerate(delays, 1):
+            try:
+                return kite.ltp(symbols)
+            except Exception:
+                if attempt == len(delays):
+                    raise
+                await asyncio.sleep(delay)
+
+    async def _retry_quote(symbols: List[str]) -> Dict[str, Any]:
+        delays = [0.2, 0.5, 1.0]
+        for attempt, delay in enumerate(delays, 1):
+            try:
+                return kite.quote(symbols)
+            except Exception:
+                if attempt == len(delays):
+                    raise
+                await asyncio.sleep(delay)
+
+    start = time.time()
+    try:
+        quotes = await _retry_ltp(quote_symbols)
+    except Exception as e:
+        live_update_state["failure_count"] += 1
+        backoff = min(12.0, 4.0 + live_update_state["failure_count"] * 2.0)
+        live_update_state["backoff_until"] = time.time() + backoff
+        return {
+            "success": False,
+            "message": f"Failed to fetch prices: {str(e)}",
+            "updated_count": 0,
+            "retry_after": round(backoff, 2),
+        }
+    finally:
+        live_update_state["last_duration"] = time.time() - start
+
+    updated_count = 0
+    missing_symbols: List[str] = []
+    for quote_symbol, trades in trade_symbol_map.items():
+        data = quotes.get(quote_symbol) or {}
+        live_price = data.get("last_price")
+        if live_price is None:
+            missing_symbols.append(quote_symbol)
+            continue
+        new_price = float(live_price)
+        live_price_cache[quote_symbol] = new_price
+        for trade in trades:
+            trade["current_price"] = new_price
+            updated_count += 1
+
+    if missing_symbols:
+        try:
+            fallback_quotes = await _retry_quote(missing_symbols)
+        except Exception:
+            fallback_quotes = {}
+        for quote_symbol in missing_symbols:
+            data = fallback_quotes.get(quote_symbol) or {}
+            live_price = data.get("last_price")
+            if live_price is None:
+                cached = live_price_cache.get(quote_symbol)
+                if cached is None:
+                    continue
+                live_price = cached
+            new_price = float(live_price)
+            live_price_cache[quote_symbol] = new_price
+            for trade in trade_symbol_map.get(quote_symbol, []):
+                trade["current_price"] = new_price
+                updated_count += 1
+
+    if live_update_state["last_duration"] > 2.5:
+        live_update_state["failure_count"] += 1
+        backoff = min(10.0, 3.0 + live_update_state["failure_count"])
+        live_update_state["backoff_until"] = time.time() + backoff
+    else:
+        live_update_state["failure_count"] = 0
+
+    return {
+        "success": True,
+        "updated_count": updated_count,
+        "missing_symbols": missing_symbols,
+        "duration": round(live_update_state["last_duration"], 2),
+    }
+
+
+@router.post("/trades/close")
+async def close_active_trade(
+    req: CloseTradeRequest,
+    authorization: Optional[str] = Header(None),
+):
+    if not active_trades:
+        raise HTTPException(status_code=404, detail="No active trades to close")
+
+    trade = None
+    if req.trade_id is not None:
+        trade = next((t for t in active_trades if t.get("id") == req.trade_id and t.get("status") == "OPEN"), None)
+    if trade is None and req.symbol:
+        trade = next((t for t in active_trades if t.get("symbol") == req.symbol and t.get("status") == "OPEN"), None)
+
+    if trade is None:
+        raise HTTPException(status_code=404, detail="Active trade not found")
+
+    symbol = trade.get("symbol")
+    qty = int(trade.get("quantity") or 0)
+    side = (trade.get("side") or "BUY").upper()
+    exit_side = "SELL" if side == "BUY" else "BUY"
+    exchange = trade.get("exchange") or "NFO"
+    product = trade.get("product") or "MIS"
+    exit_price = trade.get("current_price") or trade.get("price") or 0.0
+
+    if not symbol or qty <= 0:
+        raise HTTPException(status_code=400, detail="Invalid trade data")
+
+    exit_order = place_zerodha_order(
+        symbol=symbol,
+        quantity=qty,
+        side=exit_side,
+        order_type="MARKET",
+        product=product,
+        exchange=exchange,
+    )
+
+    if not exit_order.get("success"):
+        raise HTTPException(status_code=502, detail=exit_order.get("error") or "Exit order failed")
+
+    trade["exit_reason"] = "MANUAL_CLOSE"
+    trade["exit_order_id"] = exit_order.get("order_id")
+    _close_trade(trade, exit_price)
+    active_trades[:] = [t for t in active_trades if t.get("status") == "OPEN"]
+
+    return {"success": True, "message": "Trade closed", "trade": trade}
+
+
 @router.post("/trades/price")
 async def update_trade_price(symbol: str, price: float, authorization: Optional[str] = Header(None)):
     updated = 0
@@ -1239,6 +1534,13 @@ async def update_trade_price(symbol: str, price: float, authorization: Optional[
             _maybe_update_trail(trade, price)
             trade["current_price"] = price
             updated += 1
+            exit_reason = _should_exit_by_currency(trade, price)
+            if exit_reason:
+                trade["exit_reason"] = exit_reason
+                _close_trade(trade, price)
+                to_close.append(trade)
+                closed += 1
+                continue
             if _stop_hit(trade, price):
                 _close_trade(trade, price)
                 to_close.append(trade)

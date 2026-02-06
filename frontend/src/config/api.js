@@ -81,6 +81,7 @@ export const config = {
       analyze: '/autotrade/analyze',
       execute: '/autotrade/execute',
       activeTrades: '/autotrade/trades/active',
+      closeTrade: '/autotrade/trades/close',
       tradeHistory: '/autotrade/trades/history',
       report: '/autotrade/report',
       liveIndices: '/autotrade/market/indices',

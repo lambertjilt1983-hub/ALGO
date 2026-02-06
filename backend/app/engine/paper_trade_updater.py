@@ -14,7 +14,7 @@ from app.engine.option_signal_generator import _get_kite
 # Shared rate limit across all callers (routes + background jobs)
 _price_update_cache = {
     "last_update": 0.0,
-    "min_interval": 5.0,  # seconds
+    "min_interval": 2.0,  # seconds
 }
 
 
@@ -23,6 +23,8 @@ def _quote_symbol(trade_symbol: str, index_name: Optional[str] = None) -> str:
         return trade_symbol
     upper = trade_symbol.upper()
     if upper.endswith("CE") or upper.endswith("PE"):
+        if "SENSEX" in upper:
+            return f"BFO:{upper}"
         return f"NFO:{upper}"
     if index_name:
         idx = index_name.upper()

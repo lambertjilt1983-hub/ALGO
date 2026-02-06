@@ -38,14 +38,19 @@ const PAPER_TRADES_ACTIVE_API = `${config.API_BASE_URL}/paper-trades/active`;
 const PAPER_TRADES_HISTORY_API = `${config.API_BASE_URL}/paper-trades/history`;
 const PAPER_TRADES_PERFORMANCE_API = `${config.API_BASE_URL}/paper-trades/performance`;
 const PAPER_TRADES_CREATE_API = `${config.API_BASE_URL}/paper-trades`;
+const PAPER_TRADES_UPDATE_API = `${config.API_BASE_URL}/paper-trades/update-prices`;
 const AUTO_TRADE_STATUS_API = `${config.API_BASE_URL}/autotrade/status`;
+const AUTO_TRADE_ACTIVE_API = config.endpoints?.autoTrade?.activeTrades || `${config.API_BASE_URL}/autotrade/trades/active`;
+const AUTO_TRADE_UPDATE_API = `${config.API_BASE_URL}/autotrade/trades/update-prices`;
 
 // === AGGRESSIVE LOSS MANAGEMENT SYSTEM ===
 const DEFAULT_DAILY_LOSS_LIMIT = 5000; // ₹5000 max daily loss - hardstop
 const DEFAULT_DAILY_PROFIT_TARGET = 10000; // ₹10000 profit target - auto-stop at profit
 const MIN_SIGNAL_CONFIDENCE = 80; // 80%+ confidence (AI adjusts dynamically)
 const MIN_RR = 1.2; // Minimum risk:reward for entries
-const MAX_STOP_POINTS = 10; // 10-point max stop loss
+const MIN_PAPER_CONFIDENCE = 50; // Lower threshold for demo/paper trades
+const MIN_PAPER_RR = 1.0; // Lower RR threshold for demo/paper trades
+const MAX_STOP_POINTS = 20; // 20-point max stop loss
 const MIN_TREND_STRENGTH = 0.8; // 80%+ trend strength
 const MIN_REGIME_SCORE = 0.6; // Market regime quality
 const MIN_TRADE_QUALITY_SCORE = 0.50; // Minimum 50% quality threshold with weighted scoring
@@ -114,6 +119,7 @@ const AutoTradingDashboard = () => {
   const [wakeLockActive, setWakeLockActive] = useState(false);
   const [qualityTrades, setQualityTrades] = useState([]); // Market scanner results
   const [scannerLoading, setScannerLoading] = useState(false);
+  const [scannerTab, setScannerTab] = useState('indices');
   const [lossLimit, setLossLimit] = useState(() => {
     if (typeof window === 'undefined') return DEFAULT_DAILY_LOSS_LIMIT;
     const saved = Number(localStorage.getItem('dailyLossLimit'));
@@ -148,19 +154,17 @@ const AutoTradingDashboard = () => {
   const calculateTradeQuality = (signal, winRate = 0.5) => {
     const confidence = Number(signal.confirmation_score ?? signal.confidence ?? 0);
     const { rr, optimalRR } = calculateOptimalRR(signal, winRate);
-    
-    // Weighted quality scoring (not averaged - confidence is most important)
-    const confidenceScore = Math.min(50, (confidence / 100) * 50); // Confidence: 50% weight (0-50)
-    const rrScore = Math.min(30, Math.max(0, (rr / optimalRR) * 30)); // RR ratio: 30% weight (0-30)
-    const winRateScore = Math.min(20, winRate * 20); // Win rate: 20% weight (0-20)
-    
-    // Total quality (no averaging, just sum of weighted components)
+
+    const confidenceScore = Math.min(50, (confidence / 100) * 50);
+    const rrScore = Math.min(30, Math.max(0, (rr / optimalRR) * 30));
+    const winRateScore = Math.min(20, winRate * 20);
+
     const quality = Math.round(confidenceScore + rrScore + winRateScore);
-    
+
     return {
       quality,
       isExcellent: quality >= 85,
-      isGood: quality >= 60,  // Lowered from 75 to 60 for weighted scoring
+      isGood: quality >= 60,
       factors: {
         confidenceScore: Math.round(confidenceScore),
         rrScore: Math.round(rrScore),
@@ -168,10 +172,48 @@ const AutoTradingDashboard = () => {
       }
     };
   };
+
+  const getOptionKind = (signal) => {
+    const optionType = signal?.option_type || '';
+    if (optionType === 'CE' || optionType === 'PE') return optionType;
+    const symbol = String(signal?.symbol || '').toUpperCase();
+    if (symbol.endsWith('CE')) return 'CE';
+    if (symbol.endsWith('PE')) return 'PE';
+    return null;
+  };
+
+  const INDEX_SYMBOLS = new Set(['NIFTY', 'BANKNIFTY', 'SENSEX', 'FINNIFTY']);
+
+  const getSignalGroup = (signal) => {
+    const indexName = String(signal?.index || '').toUpperCase();
+    if (INDEX_SYMBOLS.has(indexName)) return 'indices';
+    const symbol = String(signal?.symbol || '').toUpperCase();
+    for (const idx of INDEX_SYMBOLS) {
+      if (symbol.includes(idx)) return 'indices';
+    }
+    return 'stocks';
+  };
+
+  const getBestSignalByKind = (signals, kind) => {
+    if (!Array.isArray(signals) || !kind) return null;
+    const candidates = signals.filter((s) => getOptionKind(s) === kind);
+    if (!candidates.length) return null;
+    return candidates
+      .slice()
+      .sort((a, b) => {
+        const qa = Number(a.quality_score ?? 0);
+        const qb = Number(b.quality_score ?? 0);
+        if (qb !== qa) return qb - qa;
+        const ca = Number(a.confirmation_score ?? a.confidence ?? 0);
+        const cb = Number(b.confirmation_score ?? b.confidence ?? 0);
+        return cb - ca;
+      })[0];
+  };
   
   // Track previous active trades count to detect exits
   const prevActiveTradesCount = React.useRef(0);
   const didAutoStart = React.useRef(false);
+  const executingRef = React.useRef(false);
 
   const isLossLimitHit = () => {
     const dailyLoss = Number(stats?.daily_loss ?? 0);
@@ -293,8 +335,13 @@ const AutoTradingDashboard = () => {
         new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), ms))
       ]);
 
+      const useLive = autoTradingActive && isLiveMode;
+      const activeEndpoint = useLive ? AUTO_TRADE_ACTIVE_API : PAPER_TRADES_ACTIVE_API;
+      const updateEndpoint = useLive ? AUTO_TRADE_UPDATE_API : PAPER_TRADES_UPDATE_API;
+
+      await timeoutPromise(config.authFetch(updateEndpoint, { method: 'POST' }), 15000).catch(() => null);
       const [activeRes, historyRes, perfRes, statusRes] = await Promise.all([
-        timeoutPromise(config.authFetch(PAPER_TRADES_ACTIVE_API), 15000),
+        timeoutPromise(config.authFetch(activeEndpoint), 15000),
         timeoutPromise(config.authFetch(`${PAPER_TRADES_HISTORY_API}?days=7&limit=100`), 15000),
         timeoutPromise(config.authFetch(`${PAPER_TRADES_PERFORMANCE_API}?days=30`), 15000),
         timeoutPromise(config.authFetch(AUTO_TRADE_STATUS_API), 15000),
@@ -755,6 +802,20 @@ const AutoTradingDashboard = () => {
     fetchOptionSignals();
   }, [confirmationMode]);
 
+  const fetchLatestOptionSignals = async () => {
+    try {
+      const res = await fetch(`${OPTION_SIGNALS_API}?mode=${encodeURIComponent(confirmationMode)}&include_nifty50=true`);
+      const data = await res.json();
+      if (Array.isArray(data.signals) && data.signals.length > 0) {
+        setOptionSignals(data.signals);
+        return data.signals;
+      }
+    } catch (e) {
+      console.error('❌ Failed to refresh option signals:', e);
+    }
+    return [];
+  };
+
   // Group signals by index to show CE and PE side-by-side
   const groupedSignals = optionSignals.reduce((acc, signal) => {
     // Filter out fake/invalid signals
@@ -784,6 +845,9 @@ const AutoTradingDashboard = () => {
 
   // Get best quality trade from market scanner (if available)
   const bestQualityTrade = qualityTrades && qualityTrades.length > 0 ? qualityTrades[0] : null;
+  const qualityTradesIndices = qualityTrades.filter((t) => getSignalGroup(t) === 'indices');
+  const qualityTradesStocks = qualityTrades.filter((t) => getSignalGroup(t) === 'stocks');
+  const scannerTrades = scannerTab === 'indices' ? qualityTradesIndices : qualityTradesStocks;
 
   // Pick the best signal (highest confidence) from valid optionSignals only
   const bestSignal = optionSignals.reduce((best, curr) => {
@@ -949,21 +1013,55 @@ const AutoTradingDashboard = () => {
 
   // Auto-execute ONLY after user explicitly starts auto-trading (LIVE mode)
   useEffect(() => {
-    if (activeSignal && !executing && !hasActiveTrade) {
-      if (autoTradingActive && isLiveMode) {
-        console.log('🚀 SIGNAL RECEIVED - Executing LIVE (user-approved)');
-        executeAutoTrade(activeSignal);
+    if (!autoTradingActive || !isLiveMode || executing) return;
+    const maxTrades = stats?.max_trades ?? 2;
+    if (activeTrades.length >= maxTrades) return;
+
+    const activeKinds = new Set(activeTrades.map(getOptionKind).filter(Boolean));
+    const candidates = [];
+    const pendingKinds = [];
+    const missing = ['CE', 'PE'].filter((k) => !activeKinds.has(k));
+
+    missing.forEach((kind) => {
+      const best = getBestSignalByKind(optionSignals, kind) || (getOptionKind(activeSignal) === kind ? activeSignal : null);
+      if (best) {
+        candidates.push(best);
+      } else {
+        pendingKinds.push(kind);
       }
+    });
+
+    if (!candidates.length && activeSignal) {
+      candidates.push(activeSignal);
     }
+
+    if (!candidates.length && pendingKinds.length === 0) return;
+
+    (async () => {
+      if (pendingKinds.length > 0) {
+        const latestSignals = await fetchLatestOptionSignals();
+        pendingKinds.forEach((kind) => {
+          const best = getBestSignalByKind(latestSignals, kind);
+          if (best) candidates.push(best);
+        });
+      }
+
+      for (const signal of candidates) {
+        if (activeTrades.length >= maxTrades) break;
+        console.log('🚀 SIGNAL RECEIVED - Executing LIVE (user-approved)');
+        await executeAutoTrade(signal);
+        await fetchData();
+      }
+    })();
     // eslint-disable-next-line
-  }, [activeSignal, isLiveMode, autoTradingActive, hasActiveTrade]);
+  }, [activeSignal, isLiveMode, autoTradingActive, executing, activeTrades, optionSignals, stats?.max_trades]);
 
   // Remove legacy toggleAutoTrading logic (config references)
   const toggleAutoTrading = async () => {};
 
   // Implement auto trade execution using bestSignal
   const executeAutoTrade = async (signal) => {
-    if (!signal || executing) return;
+    if (!signal || executingRef.current) return;
     
     // ONLY execute real trades when user explicitly starts auto-trading (LIVE mode)
     if (!autoTradingActive || !isLiveMode) return;
@@ -975,9 +1073,9 @@ const AutoTradingDashboard = () => {
       return;
     }
     
-    // Only allow one trade at a time
-    if (hasActiveTrade) {
-      console.log('Trade already active, skipping...');
+    const maxTrades = stats?.max_trades ?? 2;
+    if (activeTrades.length >= maxTrades) {
+      console.log('Max active trades reached, skipping...');
       return;
     }
 
@@ -1006,6 +1104,7 @@ const AutoTradingDashboard = () => {
       return;
     }
     
+    executingRef.current = true;
     setExecuting(true);
     const mode = isLiveMode ? 'LIVE' : 'DEMO';
     console.log(`🚀 AUTO-EXECUTING ${mode} TRADE: ${signal.symbol} ${signal.action} at ₹${signal.entry_price}`);
@@ -1030,7 +1129,6 @@ const AutoTradingDashboard = () => {
       });
       if (response.ok) {
         const data = await response.json();
-        setHasActiveTrade(true);
         console.log(`✅ ${mode} TRADE EXECUTED: ${signal.symbol} - ${data.message || 'Success!'}`);
         // Don't show alert for auto-trades, just log
       } else {
@@ -1088,7 +1186,34 @@ const AutoTradingDashboard = () => {
       // Don't auto-stop on network errors - keep retrying when network recovers
       console.log(`♻️ AUTO-TRADING REMAINS ACTIVE: Will retry when connection recovers`);
     } finally {
+      executingRef.current = false;
       setExecuting(false);
+    }
+  };
+
+  const closeActiveTrade = async (trade) => {
+    if (!trade) return;
+    try {
+      let response;
+      if (autoTradingActive && isLiveMode) {
+        response = await config.authFetch(config.endpoints.autoTrade.closeTrade, {
+          method: 'POST',
+          body: JSON.stringify({ trade_id: trade.id, symbol: trade.symbol })
+        });
+      } else {
+        response = await config.authFetch(`${config.API_BASE_URL}/paper-trades/${trade.id}`, {
+          method: 'PUT',
+          body: JSON.stringify({ status: 'MANUAL_CLOSE' })
+        });
+      }
+      if (!response.ok) {
+        const errText = await response.text();
+        console.error('❌ Close trade failed:', errText);
+        return;
+      }
+      await fetchData();
+    } catch (e) {
+      console.error('❌ Close trade error:', e.message);
     }
   };
 
@@ -1098,8 +1223,7 @@ const AutoTradingDashboard = () => {
     const now = Date.now();
     if (lastPaperSignalSymbol === paperSignalKey && (now - lastPaperSignalAt) < 60000) return;
 
-    // Hard stop: no paper trades after any daily loss
-    if (isLossLimitHit()) {
+    if (isLossLimitHit() && autoTradingActive) {
       console.log('🛑 Daily loss limit hit - paper trading paused');
       return;
     }
@@ -1110,7 +1234,9 @@ const AutoTradingDashboard = () => {
     const reward = Math.abs(Number(signal.target) - Number(signal.entry_price));
     const rr = risk > 0 ? reward / risk : 0;
 
-    if (confidence < MIN_SIGNAL_CONFIDENCE || rr < MIN_RR) {
+    const minConf = autoTradingActive ? MIN_SIGNAL_CONFIDENCE : MIN_PAPER_CONFIDENCE;
+    const minRR = autoTradingActive ? MIN_RR : MIN_PAPER_RR;
+    if (confidence < minConf || rr < minRR) {
       console.log(`⏸️ Paper entry blocked: confidence ${confidence.toFixed(1)}% / RR ${rr.toFixed(2)} below thresholds`);
       return;
     }
@@ -1265,7 +1391,7 @@ const AutoTradingDashboard = () => {
       
       // Update ref for next iteration
       prevActiveTradesCount.current = activeTrades.length;
-    }, 5000); // 5 seconds for data refresh
+    }, 2000); // 2 seconds for data refresh
 
     return () => {
       clearTimeout(initialDataTimeout);
@@ -1283,7 +1409,14 @@ const AutoTradingDashboard = () => {
     if (didAutoStart.current) return;
     didAutoStart.current = true;
     setAutoTradingActive(false);
+    setIsLiveMode(false);
   }, []);
+
+  useEffect(() => {
+    if (!autoTradingActive) {
+      setIsLiveMode(false);
+    }
+  }, [autoTradingActive]);
 
   // Detect when activeTrades changes from 1+ to 0
   useEffect(() => {
@@ -1328,14 +1461,20 @@ const AutoTradingDashboard = () => {
   }, [autoTradingActive]);
 
   useEffect(() => {
-    if (!autoTradingActive && !isLiveMode && signalsLoaded && !hasActiveTrade) {
+    if (!autoTradingActive && !isLiveMode && signalsLoaded && activeTrades.length === 0) {
       // Create paper trades when auto-trading is OFF (demo mode)
-      const signalForPaper = bestQualityTrade || activeSignal;
-      if (signalForPaper) {
-        createPaperTradeFromSignal(signalForPaper);
+      const bestCe = getBestSignalByKind(optionSignals, 'CE');
+      const bestPe = getBestSignalByKind(optionSignals, 'PE');
+      if (bestCe) createPaperTradeFromSignal(bestCe);
+      if (bestPe) createPaperTradeFromSignal(bestPe);
+      if (!bestCe && !bestPe) {
+        const signalForPaper = bestQualityTrade || activeSignal;
+        if (signalForPaper) {
+          createPaperTradeFromSignal(signalForPaper);
+        }
       }
     }
-  }, [autoTradingActive, isLiveMode, signalsLoaded, hasActiveTrade, bestQualityTrade, activeSignal, lotMultiplier]);
+  }, [autoTradingActive, isLiveMode, signalsLoaded, activeTrades.length, bestQualityTrade, activeSignal, lotMultiplier, optionSignals]);
 
   if (loading) {
     return (
@@ -1556,7 +1695,11 @@ const AutoTradingDashboard = () => {
             {livePrice && <span>📊 NIFTY: ₹{livePrice.toFixed(2)} • </span>}
             {isLiveMode ? '🔴 REAL Trades Execution' : '⚪ DEMO Mode - Test Trades'}
             {' • '}Max {stats?.max_trades || 10} Concurrent Trades
-            {hasActiveTrade && <span style={{ color: '#f56565', fontWeight: '600' }}> • 🔒 ONE TRADE ACTIVE - Waiting to close...</span>}
+            {activeTrades.length > 0 && (
+              <span style={{ color: '#f56565', fontWeight: '600' }}>
+                {' '}• 🔒 {activeTrades.length} TRADE{activeTrades.length > 1 ? 'S' : ''} ACTIVE - Waiting to close...
+              </span>
+            )}
           </p>
         </div>
         <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
@@ -1813,7 +1956,7 @@ const AutoTradingDashboard = () => {
                 </tr>
               </thead>
               <tbody>
-                {qualityTrades.map((trade, idx) => (
+                {scannerTrades.map((trade, idx) => (
                   <tr key={idx} style={{
                     background: idx % 2 === 0 ? '#fffbeb' : '#fef3c7',
                     borderBottom: '1px solid #fcd34d'
@@ -1852,7 +1995,7 @@ const AutoTradingDashboard = () => {
             textAlign: 'center',
             padding: '20px'
           }}>
-            {scannerLoading ? '🔄 Scanning all markets for quality signals...' : '📊 No quality signals available at this time. Refresh to scan market.'}
+            {scannerLoading ? '🔄 Scanning all markets for quality signals...' : `📊 No ${scannerTab === 'indices' ? 'indices' : 'stock'} signals available right now. Refresh to scan.`}
           </p>
         )}
       </div>
@@ -2066,6 +2209,7 @@ const AutoTradingDashboard = () => {
                   if (autoTradingActive) {
                     setAutoTradingActive(false);
                     setHasActiveTrade(false);
+                    setIsLiveMode(false);
                     setArmError(null);
                     return;
                   }
@@ -2115,7 +2259,7 @@ const AutoTradingDashboard = () => {
                   fontSize: '13px',
                   fontWeight: '600'
                 }}>
-                  {isLiveMode ? '🔴 REAL TRADES' : '⚪ DEMO MODE'} {hasActiveTrade ? '(Trade Active)' : '(Ready)'}
+                  {isLiveMode ? '🔴 REAL TRADES' : '⚪ DEMO MODE'} {activeTrades.length > 0 ? '(Trade Active)' : '(Ready)'}
                 </div>
               )}
             </div>
@@ -2286,19 +2430,27 @@ const AutoTradingDashboard = () => {
                   <th style={{ padding: '10px', textAlign: 'left' }}>Action</th>
                   <th style={{ padding: '10px', textAlign: 'right' }}>Entry</th>
                   <th style={{ padding: '10px', textAlign: 'right' }}>Current</th>
+                  <th style={{ padding: '10px', textAlign: 'right' }}>Target</th>
+                  <th style={{ padding: '10px', textAlign: 'right' }}>Stop Loss</th>
+                  <th style={{ padding: '10px', textAlign: 'right' }}>Expected</th>
                   <th style={{ padding: '10px', textAlign: 'right' }}>P&L</th>
                   <th style={{ padding: '10px', textAlign: 'right' }}>%</th>
                   <th style={{ padding: '10px', textAlign: 'right' }}>Qty</th>
                   <th style={{ padding: '10px', textAlign: 'left' }}>Opened</th>
+                  <th style={{ padding: '10px', textAlign: 'center' }}>Action</th>
                 </tr>
               </thead>
               <tbody>
                 {activeTrades.map((trade) => {
-                  const entry = Number(trade.entry_price || 0);
+                  const entry = Number(trade.entry_price ?? trade.price ?? 0);
                   const current = Number(trade.current_price ?? entry);
                   const pnl = Number(trade.pnl ?? 0);
                   const pnlPct = Number(trade.pnl_percentage ?? 0);
                   const action = trade.side || 'BUY';
+                  const target = Number(trade.target ?? 0);
+                  const stopLoss = Number(trade.stop_loss ?? 0);
+                  const qty = Number(trade.quantity ?? 0);
+                  const expected = entry > 0 && target > 0 ? Math.abs(target - entry) * qty : 0;
                   return (
                     <tr key={trade.id} style={{ borderBottom: '1px solid #e2e8f0' }}>
                       <td style={{ padding: '10px', fontWeight: '600' }}>{trade.symbol}</td>
@@ -2316,6 +2468,15 @@ const AutoTradingDashboard = () => {
                       </td>
                       <td style={{ padding: '10px', textAlign: 'right' }}>₹{entry.toFixed(2)}</td>
                       <td style={{ padding: '10px', textAlign: 'right' }}>₹{current.toFixed(2)}</td>
+                      <td style={{ padding: '10px', textAlign: 'right', color: '#48bb78', fontWeight: '600' }}>
+                        {target ? `₹${target.toFixed(2)}` : '--'}
+                      </td>
+                      <td style={{ padding: '10px', textAlign: 'right', color: '#f56565', fontWeight: '600' }}>
+                        {stopLoss ? `₹${stopLoss.toFixed(2)}` : '--'}
+                      </td>
+                      <td style={{ padding: '10px', textAlign: 'right', fontWeight: '600', color: '#2b6cb0' }}>
+                        {expected ? `₹${expected.toFixed(2)}` : '--'}
+                      </td>
                       <td style={{
                         padding: '10px',
                         textAlign: 'right',
@@ -2335,6 +2496,23 @@ const AutoTradingDashboard = () => {
                       <td style={{ padding: '10px', textAlign: 'right' }}>{trade.quantity}</td>
                       <td style={{ padding: '10px', fontSize: '11px', color: '#718096' }}>
                         {trade.entry_time ? new Date(trade.entry_time).toLocaleString() : '-'}
+                      </td>
+                      <td style={{ padding: '10px', textAlign: 'center' }}>
+                        <button
+                          onClick={() => closeActiveTrade(trade)}
+                          style={{
+                            padding: '6px 10px',
+                            borderRadius: '6px',
+                            border: '1px solid #e53e3e',
+                            background: '#fff5f5',
+                            color: '#c53030',
+                            fontSize: '12px',
+                            fontWeight: '600',
+                            cursor: 'pointer'
+                          }}
+                        >
+                          Close
+                        </button>
                       </td>
                     </tr>
                   );

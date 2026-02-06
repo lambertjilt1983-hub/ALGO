@@ -639,8 +639,8 @@ def select_best_signal(signals: List[Dict]) -> Dict | None:
     if good_rr:
         viable = good_rr
     
-    # Select best by confirmation score (with quality and confidence)
-    return max(viable, key=lambda s: s.get("confirmation_score", s.get("confidence", 0)) * (s.get("quality_score", 50) / 100))
+    # Select best by quality score (tie-break by confidence)
+    return max(viable, key=lambda s: (s.get("quality_score", 0), s.get("confidence", 0)))
 
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:
