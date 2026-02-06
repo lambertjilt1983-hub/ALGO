@@ -876,6 +876,11 @@ const AutoTradingDashboard = () => {
       ? Math.abs(Number(displayEntryPrice) - Number(displayStopLoss))
       : null;
   const displayQuantity = activeSignal?.quantity ?? 0;
+  const displayCapitalRequired =
+    Number(activeSignal?.capital_required ?? 0) ||
+    (displayEntryPrice != null
+      ? Number(displayEntryPrice) * Number(displayQuantity) * Number(lotMultiplier)
+      : 0);
 
   // Render option signals table - Side by side CE and PE
   const renderOptionSignalsTable = () => (
@@ -1017,41 +1022,13 @@ const AutoTradingDashboard = () => {
     const maxTrades = stats?.max_trades ?? 2;
     if (activeTrades.length >= maxTrades) return;
 
-    const activeKinds = new Set(activeTrades.map(getOptionKind).filter(Boolean));
-    const candidates = [];
-    const pendingKinds = [];
-    const missing = ['CE', 'PE'].filter((k) => !activeKinds.has(k));
-
-    missing.forEach((kind) => {
-      const best = getBestSignalByKind(optionSignals, kind) || (getOptionKind(activeSignal) === kind ? activeSignal : null);
-      if (best) {
-        candidates.push(best);
-      } else {
-        pendingKinds.push(kind);
-      }
-    });
-
-    if (!candidates.length && activeSignal) {
-      candidates.push(activeSignal);
-    }
-
-    if (!candidates.length && pendingKinds.length === 0) return;
+    const candidate = activeSignal;
+    if (!candidate) return;
 
     (async () => {
-      if (pendingKinds.length > 0) {
-        const latestSignals = await fetchLatestOptionSignals();
-        pendingKinds.forEach((kind) => {
-          const best = getBestSignalByKind(latestSignals, kind);
-          if (best) candidates.push(best);
-        });
-      }
-
-      for (const signal of candidates) {
-        if (activeTrades.length >= maxTrades) break;
-        console.log('🚀 SIGNAL RECEIVED - Executing LIVE (user-approved)');
-        await executeAutoTrade(signal);
-        await fetchData();
-      }
+      console.log('🚀 SIGNAL RECEIVED - Executing LIVE (user-approved)');
+      await executeAutoTrade(candidate);
+      await fetchData();
     })();
     // eslint-disable-next-line
   }, [activeSignal, isLiveMode, autoTradingActive, executing, activeTrades, optionSignals, stats?.max_trades]);
@@ -1462,16 +1439,10 @@ const AutoTradingDashboard = () => {
 
   useEffect(() => {
     if (!autoTradingActive && !isLiveMode && signalsLoaded && activeTrades.length === 0) {
-      // Create paper trades when auto-trading is OFF (demo mode)
-      const bestCe = getBestSignalByKind(optionSignals, 'CE');
-      const bestPe = getBestSignalByKind(optionSignals, 'PE');
-      if (bestCe) createPaperTradeFromSignal(bestCe);
-      if (bestPe) createPaperTradeFromSignal(bestPe);
-      if (!bestCe && !bestPe) {
-        const signalForPaper = bestQualityTrade || activeSignal;
-        if (signalForPaper) {
-          createPaperTradeFromSignal(signalForPaper);
-        }
+      // Create one paper trade when auto-trading is OFF (demo mode)
+      const signalForPaper = bestQualityTrade || activeSignal;
+      if (signalForPaper) {
+        createPaperTradeFromSignal(signalForPaper);
       }
     }
   }, [autoTradingActive, isLiveMode, signalsLoaded, activeTrades.length, bestQualityTrade, activeSignal, lotMultiplier, optionSignals]);
@@ -2179,6 +2150,10 @@ const AutoTradingDashboard = () => {
                     +
                   </button>
                   <span style={{ fontSize: '12px', color: '#718096' }}>({lotMultiplier} lots)</span>
+                </span>
+                <span>
+                  <strong>Capital Required:</strong>{' '}
+                  ₹{displayCapitalRequired.toLocaleString()}
                 </span>
                 {(() => {
                   const winRate = stats?.win_rate ? (stats.win_rate / 100) : 0.5;

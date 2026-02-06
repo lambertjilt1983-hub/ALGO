@@ -111,16 +111,16 @@ def validate_all_tokens():
     validate_and_refresh_tokens()
 
 def close_market_close_trades():
-    """Close all open trades at market closing time (3:25 PM IST)"""
+    """Close all open trades at market closing time (3:29 PM IST)"""
     db = SessionLocal()
     try:
         # Get current time in IST (India Standard Time)
         current_time = datetime.now()
         
-        # Market closing time: 3:25 PM (15:25) - exit before close
-        market_close = time(15, 25)
+        # Market closing time: 3:29 PM (15:29) - exit before close
+        market_close = time(15, 29)
         
-        # Check if current time is after market close (3:25 PM IST)
+        # Check if current time is after market close (3:29 PM IST)
         current_time_only = current_time.time()
         if current_time_only >= market_close:
             # Close all open trades
@@ -137,18 +137,18 @@ def close_market_close_trades():
                 logger.log_error("Market close - Trades auto-exited", {
                     "closed_count": closed_count,
                     "time": current_time.isoformat(),
-                    "reason": "Market closing time (3:25 PM IST)"
+                    "reason": "Market closing time (3:29 PM IST)"
                 })
 
             # Close all live active trades (auto-trading)
             try:
                 from app.routes.auto_trading_simple import close_all_active_trades
-                live_closed = close_all_active_trades(reason="Market close (3:25 PM IST)")
+                live_closed = close_all_active_trades(reason="Market close (3:29 PM IST)")
                 if live_closed > 0:
                     logger.log_error("Market close - Live trades auto-exited", {
                         "closed_count": live_closed,
                         "time": current_time.isoformat(),
-                        "reason": "Market closing time (3:25 PM IST)"
+                        "reason": "Market closing time (3:29 PM IST)"
                     })
             except Exception as e:
                 logger.log_error("Market close live-exit failed", {"error": str(e)})

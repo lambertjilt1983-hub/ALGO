@@ -14,6 +14,7 @@ async def reset_daily_loss(authorization: Optional[str] = Header(None)):
 import math
 import time
 import asyncio
+import re
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -31,11 +32,13 @@ from app.engine.simple_momentum_strategy import SimpleMomentumStrategy
 
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
 
-MAX_TRADES = 2  # Allow up to 2 trades at a time (1 CE + 1 PE)
+MAX_TRADES = 1  # Only one trade at a time (best signal)
 TARGET_PCT = 2.5  # 2.5% target (index/futures sizing)
 STOP_PCT = 0.06   # Stop-loss percent fallback (index/futures sizing)
 TARGET_POINTS = 15  # Fixed target in points for options
-STOP_POINTS = 20    # Fixed stop loss in points for options
+STOP_PCT_OPTIONS = 10.0  # Stop loss percent for options
+TRAIL_START_POINTS = 5  # Start trailing after 5 points profit
+TRAIL_GAP_POINTS = 10   # Trail by 10 points once active
 MAX_STOP_POINTS = 20  # Maximum stop loss in points for options
 PROFIT_EXIT_AMOUNT = 800.0  # Currency profit exit for the first trade
 LOSS_CAP_AMOUNT = 2000.0    # Currency loss cap for the second trade
@@ -54,6 +57,7 @@ risk_config = {
     "max_position_pct": 0.10,        # 10% max per position
     "max_portfolio_pct": 0.10,       # 10% total exposure
     "cooldown_minutes": 0,           # NO COOLDOWN - trade immediately if conditions met
+    "symbol_cooldown_minutes": 10,   # Cooldown after SL on same symbol/root
     "min_momentum_pct": 0.5,         # Very strong momentum (0.5%) - avoid weak entries
     "min_trend_strength": 0.8,       # HIGH trend strength (80%) required - quality only
     "require_trend_confirmation": True,  # STRICT: Confirm trend before entry
@@ -63,7 +67,7 @@ risk_config = {
 
 trade_window = {
     "start": (9, 20),   # HH, MM local server time
-    "end": (15, 20),    # HH, MM local server time
+    "end": (15, 29),    # HH, MM local server time
 }
 
 trail_config = {
@@ -84,6 +88,7 @@ state = {
     "last_loss_time": None,
     "trading_paused": False,  # NEW: Pause if profit/loss limits hit
     "pause_reason": None,  # NEW: Why trading is paused
+    "symbol_cooldowns": {},  # Track recent exits to avoid immediate re-entry
 }
 active_trades: List[Dict] = []
 history: List[Dict] = []
@@ -94,6 +99,7 @@ live_update_state = {
     "backoff_until": 0.0,
     "last_duration": 0.0,
 }
+execute_lock = asyncio.Lock()
 
 # Initialize engine, broker, and strategy
 engine = AutoTradingEngine()
@@ -103,6 +109,13 @@ strategy = SimpleMomentumStrategy()
 
 def _now() -> str:
     return datetime.now().isoformat()
+
+
+def _symbol_root(symbol: str | None) -> str | None:
+    if not symbol:
+        return None
+    match = re.match(r"^([A-Z]+)", symbol.upper())
+    return match.group(1) if match else symbol.upper()
 
 
 def _option_kind(symbol: str | None) -> str | None:
@@ -139,12 +152,13 @@ def _apply_fixed_option_levels(signal: Dict) -> Dict:
     action = (signal.get("action") or "BUY").upper()
     if entry <= 0:
         return signal
+    stop_move = entry * (STOP_PCT_OPTIONS / 100)
     if action == "SELL":
         target = entry - TARGET_POINTS
-        stop_loss = entry + STOP_POINTS
+        stop_loss = entry + stop_move
     else:
         target = entry + TARGET_POINTS
-        stop_loss = entry - STOP_POINTS
+        stop_loss = entry - stop_move
     qty = int(signal.get("quantity") or 1)
     signal["target"] = round(target, 2)
     signal["stop_loss"] = round(stop_loss, 2)
@@ -503,12 +517,21 @@ def _close_trade(trade: Dict[str, any], exit_price: float) -> None:
     side = trade.get("side", "BUY").upper()
     entry = trade.get("price", 0.0)
     pnl = (exit_price - entry) * qty * (1 if side == "BUY" else -1)
+    pnl_percentage = (pnl / (entry * qty) * 100) if entry and qty else 0.0
+    exit_dt = datetime.utcnow()
     trade.update({
         "status": "CLOSED",
         "exit_price": exit_price,
-        "exit_time": _now(),
+        "exit_time": exit_dt.isoformat(),
         "pnl": round(pnl, 2),
+        "pnl_percentage": round(pnl_percentage, 2),
     })
+    root = _symbol_root(trade.get("symbol") or trade.get("index"))
+    if root:
+        state.setdefault("symbol_cooldowns", {})[root] = {
+            "status": trade.get("status"),
+            "exit_time": exit_dt.isoformat(),
+        }
     history.append(trade.copy())
     
     # Track daily P&L (both loss and profit)
@@ -540,7 +563,7 @@ def _close_trade(trade: Dict[str, any], exit_price: float) -> None:
             entry_price=entry,
             exit_price=exit_price,
             pnl=round(pnl, 2),
-            pnl_percentage=trade.get("profit_percentage") or trade.get("pnl_percent"),
+            pnl_percentage=round(pnl_percentage, 2),
             strategy=trade.get("strategy") or trade.get("strategy_name"),
             status=trade.get("status") or "CLOSED",
             entry_time=entry_dt,
@@ -1178,6 +1201,24 @@ async def execute(
             status_code=403,
             detail=f"Trading paused: {state.get('pause_reason', 'System pause')}"
         )
+
+    root = _symbol_root(trade.symbol)
+    if root:
+        cooldown_minutes = risk_config.get("symbol_cooldown_minutes", 0)
+        if cooldown_minutes > 0:
+            recent = state.get("symbol_cooldowns", {}).get(root)
+            if recent and recent.get("status") in {"SL_HIT", "STOPPED"}:
+                try:
+                    last_exit = datetime.fromisoformat(recent.get("exit_time"))
+                except Exception:
+                    last_exit = None
+                if last_exit:
+                    elapsed = (datetime.utcnow() - last_exit).total_seconds() / 60
+                    if elapsed < cooldown_minutes:
+                        raise HTTPException(
+                            status_code=403,
+                            detail=f"Cooldown active for {root}. Wait {int(cooldown_minutes - elapsed)} min after SL."
+                        )
     
     # ═══════════════════════════════════════════════════════════════
     # ADVANCED AI-BASED ENTRY VALIDATION (NEW)
@@ -1231,17 +1272,7 @@ async def execute(
         raise HTTPException(status_code=403, detail="Outside trading window")
 
 
-    if len(active_trades) >= MAX_TRADES and not auto_demo:
-        raise HTTPException(status_code=429, detail="Max active trades reached")
-
     option_kind = _option_kind(trade.symbol)
-    if option_kind and not auto_demo:
-        open_kinds = {_option_kind(t.get("symbol")) for t in active_trades if t.get("status") == "OPEN"}
-        if option_kind in open_kinds:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Only one {option_kind} trade can be open at a time."
-            )
 
     # ═══════════════════════════════════════════════════════════════
     # 10-POINT MAX STOP LOSS VALIDATION (NEW)
@@ -1250,10 +1281,11 @@ async def execute(
     pct = STOP_PCT / 100
     derived_stop = trade.stop_loss
     if option_kind:
+        stop_move = trade.price * (STOP_PCT_OPTIONS / 100)
         if trade.side.upper() == "SELL":
-            derived_stop = round(trade.price + STOP_POINTS, 2)
+            derived_stop = round(trade.price + stop_move, 2)
         else:
-            derived_stop = round(trade.price - STOP_POINTS, 2)
+            derived_stop = round(trade.price - stop_move, 2)
     elif derived_stop is None:
         if trade.side.upper() == "BUY":
             derived_stop = round(trade.price * (1 - pct), 2)
@@ -1296,64 +1328,73 @@ async def execute(
         else:
             derived_target = round(trade.price * (1 - pct * (TARGET_PCT / STOP_PCT)), 2)
 
-    broker_response: Dict[str, any] = {}
+    async with execute_lock:
+        if len(active_trades) >= MAX_TRADES and not auto_demo:
+            raise HTTPException(status_code=429, detail="Max active trades reached")
 
-    trail_fields = _init_trailing_fields(trade.price, trade.side)
+        if not auto_demo:
+            existing = next((t for t in active_trades if t.get("status") == "OPEN"), None)
+            if existing:
+                raise HTTPException(status_code=429, detail="Another trade is already open")
 
-    trade_obj = {
-        "id": len(active_trades) + 1,
-        "symbol": trade.symbol,
-        "price": trade.price,
-        "side": trade.side.upper(),
-        "quantity": trade.quantity or 1,
-        "status": "OPEN",
-        "broker_id": trade.broker_id,
-        "exchange": "NFO",
-        "product": "MIS",
-        "timestamp": _now(),
-        "stop_loss": derived_stop,
-        "target": derived_target,
-        "support": trade.support,
-        "resistance": trade.resistance,
-        **trail_fields,
-    }
+        broker_response: Dict[str, any] = {}
 
-    # --- REAL ZERODHA ORDER PLACEMENT ---
-    # Map your signal to the correct Zerodha symbol (tradingsymbol)
-    zerodha_symbol = trade.symbol  # You may need to convert to e.g. 'BANKNIFTY24FEB48000CE'
-    print(f"[API /execute] ▶ Placing {mode} order to Zerodha...")
-    print(f"[API /execute] ▶ Order Details: {zerodha_symbol}, {trade.quantity or 1} qty, {trade.side} at ₹{trade.price}")
-    real_order = place_zerodha_order(
-        symbol=zerodha_symbol,
-        quantity=trade.quantity or 1,
-        side=trade.side,
-        order_type="MARKET",
-        product="MIS",
-        exchange="NFO"  # Use 'NFO' for options
-    )
-    if real_order["success"]:
-        print(f"[API /execute] ✓ Zerodha order ACCEPTED - Order ID: {real_order.get('order_id', 'N/A')}")
-        broker_response = real_order
-        active_trades.append(trade_obj)
-    else:
-        print(f"[API /execute] ✗ Zerodha order REJECTED - Error: {real_order.get('error', 'Unknown')}")
-        return {
-            "success": False,
-            "message": real_order["error"],
+        trail_fields = _init_trailing_fields(trade.price, trade.side)
+
+        trade_obj = {
+            "id": len(active_trades) + 1,
+            "symbol": trade.symbol,
+            "price": trade.price,
+            "side": trade.side.upper(),
+            "quantity": trade.quantity or 1,
+            "status": "OPEN",
+            "broker_id": trade.broker_id,
+            "exchange": "NFO",
+            "product": "MIS",
             "timestamp": _now(),
+            "stop_loss": derived_stop,
+            "target": derived_target,
+            "support": trade.support,
+            "resistance": trade.resistance,
+            **trail_fields,
         }
 
-    broker_logs.append({"trade": trade_obj, "response": broker_response})
+        # --- REAL ZERODHA ORDER PLACEMENT ---
+        # Map your signal to the correct Zerodha symbol (tradingsymbol)
+        zerodha_symbol = trade.symbol  # You may need to convert to e.g. 'BANKNIFTY24FEB48000CE'
+        print(f"[API /execute] ▶ Placing {mode} order to Zerodha...")
+        print(f"[API /execute] ▶ Order Details: {zerodha_symbol}, {trade.quantity or 1} qty, {trade.side} at ₹{trade.price}")
+        real_order = place_zerodha_order(
+            symbol=zerodha_symbol,
+            quantity=trade.quantity or 1,
+            side=trade.side,
+            order_type="MARKET",
+            product="MIS",
+            exchange="NFO"  # Use 'NFO' for options
+        )
+        if real_order["success"]:
+            print(f"[API /execute] ✓ Zerodha order ACCEPTED - Order ID: {real_order.get('order_id', 'N/A')}")
+            broker_response = real_order
+            active_trades.append(trade_obj)
+        else:
+            print(f"[API /execute] ✗ Zerodha order REJECTED - Error: {real_order.get('error', 'Unknown')}")
+            return {
+                "success": False,
+                "message": real_order["error"],
+                "timestamp": _now(),
+            }
 
-    return {
-        "success": True,
-        "is_demo_mode": auto_demo,
-        "message": f"{mode} trade accepted for {trade.symbol} at {trade.price}",
-        "timestamp": _now(),
-        "broker_response": broker_response,
-        "stop_loss": derived_stop,
-        "target": derived_target,
-    }
+        broker_logs.append({"trade": trade_obj, "response": broker_response})
+
+        return {
+            "success": True,
+            "is_demo_mode": auto_demo,
+            "message": f"{mode} trade accepted for {trade.symbol} at {trade.price}",
+            "timestamp": _now(),
+            "broker_response": broker_response,
+            "stop_loss": derived_stop,
+            "target": derived_target,
+        }
 
 
 @router.get("/trades/active")
@@ -1440,6 +1481,15 @@ async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
         live_price_cache[quote_symbol] = new_price
         for trade in trades:
             trade["current_price"] = new_price
+            if _option_kind(trade.get("symbol")):
+                entry = float(trade.get("price") or 0)
+                if entry > 0:
+                    profit_points = new_price - entry
+                    if profit_points >= TRAIL_START_POINTS:
+                        trail_stop = new_price - TRAIL_GAP_POINTS
+                        current_sl = trade.get("stop_loss")
+                        if current_sl is None or trail_stop > current_sl:
+                            trade["stop_loss"] = round(trail_stop, 2)
             updated_count += 1
 
     if missing_symbols:
@@ -1459,6 +1509,15 @@ async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
             live_price_cache[quote_symbol] = new_price
             for trade in trade_symbol_map.get(quote_symbol, []):
                 trade["current_price"] = new_price
+                if _option_kind(trade.get("symbol")):
+                    entry = float(trade.get("price") or 0)
+                    if entry > 0:
+                        profit_points = new_price - entry
+                        if profit_points >= TRAIL_START_POINTS:
+                            trail_stop = new_price - TRAIL_GAP_POINTS
+                            current_sl = trade.get("stop_loss")
+                            if current_sl is None or trail_stop > current_sl:
+                                trade["stop_loss"] = round(trail_stop, 2)
                 updated_count += 1
 
     if live_update_state["last_duration"] > 2.5:

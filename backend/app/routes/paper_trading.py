@@ -14,7 +14,7 @@ from app.models.trading import PaperTrade
 
 router = APIRouter()
 
-MAX_PAPER_TRADES = 2  # Allow up to 2 paper trades (1 CE + 1 PE)
+MAX_PAPER_TRADES = 1  # Only one paper trade at a time
 
 
 def _option_kind(symbol: str | None) -> str | None:
@@ -50,7 +50,7 @@ class PaperTradeUpdate(BaseModel):
 
 @router.post("/paper-trades")
 def create_paper_trade(trade: PaperTradeCreate, db: Session = Depends(get_db)):
-    """Log a new paper trade signal - allow up to 2 open trades (CE + PE)"""
+    """Log a new paper trade signal - only one open trade allowed"""
     open_trades = db.query(PaperTrade).filter(PaperTrade.status == "OPEN").all()
     active_count = len(open_trades)
 
@@ -61,15 +61,6 @@ def create_paper_trade(trade: PaperTradeCreate, db: Session = Depends(get_db)):
             "active_trades": active_count
         }
 
-    kind = _option_kind(trade.symbol)
-    if kind:
-        active_kinds = {_option_kind(t.symbol) for t in open_trades}
-        if kind in active_kinds:
-            return {
-                "success": False,
-                "message": f"Only one {kind} trade can be open at a time.",
-                "active_trades": active_count
-            }
     
     paper_trade = PaperTrade(
         user_id=1,  # Default user
