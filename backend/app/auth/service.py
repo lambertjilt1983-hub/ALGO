@@ -1,3 +1,4 @@
+
 from datetime import datetime, timedelta
 import secrets
 from typing import Optional
@@ -5,12 +6,16 @@ from jose import JWTError, jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer
 from sqlalchemy.orm import Session
-
 from app.core.config import get_settings
 from app.core.security import encryption_manager
 from app.core.database import get_db, SessionLocal
 from app.models.auth import User, BrokerCredential
 from app.models.schemas import UserCreate, UserLogin, TokenResponse, OtpVerify
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from twilio.rest import Client
+import os
 
 settings = get_settings()
 security = HTTPBearer()
@@ -20,12 +25,59 @@ class AuthService:
 
     @staticmethod
     def _generate_otp() -> str:
-        return f"{secrets.randbelow(900000) + 100000}"
+        # Hardcoded OTP for all users (for testing/demo only)
+        return "988060"
 
     @staticmethod
     def _send_otp(user: User, otp: str) -> None:
-        # Placeholder for SMS/Email integrations; logged for now.
-        print(f"[OTP] Send to email {user.email} and mobile {user.mobile}: {otp}")
+        # Send OTP via Email (SMTP)
+        smtp_host = os.getenv("SMTP_HOST", getattr(settings, "SMTP_HOST", "smtp.gmail.com"))
+        smtp_port = int(os.getenv("SMTP_PORT", getattr(settings, "SMTP_PORT", 587)))
+        smtp_user = os.getenv("SMTP_USER", getattr(settings, "SMTP_USER", ""))
+        smtp_password = os.getenv("SMTP_PASSWORD", getattr(settings, "SMTP_PASSWORD", ""))
+        email_from = os.getenv("EMAIL_FROM", getattr(settings, "EMAIL_FROM", smtp_user))
+        email_to = user.email
+        subject = "Your OTP Code"
+        body = f"Your OTP code is: {otp}"
+
+        if email_to:
+            try:
+                msg = MIMEMultipart()
+                msg["From"] = email_from
+                msg["To"] = email_to
+                msg["Subject"] = subject
+                msg.attach(MIMEText(body, "plain"))
+                server = smtplib.SMTP(smtp_host, smtp_port)
+                server.starttls()
+                server.login(smtp_user, smtp_password)
+                server.sendmail(email_from, email_to, msg.as_string())
+                server.quit()
+                print(f"[OTP] Email sent to {email_to}")
+            except Exception as e:
+                print(f"[OTP] Failed to send email: {e}")
+        else:
+            print("[OTP] No email address provided for user.")
+
+        # Send OTP via SMS (Twilio)
+        twilio_sid = os.getenv("TWILIO_ACCOUNT_SID", getattr(settings, "TWILIO_ACCOUNT_SID", ""))
+        twilio_token = os.getenv("TWILIO_AUTH_TOKEN", getattr(settings, "TWILIO_AUTH_TOKEN", ""))
+        twilio_from = os.getenv("TWILIO_FROM_NUMBER", getattr(settings, "TWILIO_FROM_NUMBER", ""))
+        mobile_to = user.mobile
+        sms_body = f"Your OTP code is: {otp}"
+
+        if mobile_to and twilio_sid and twilio_token and twilio_from:
+            try:
+                client = Client(twilio_sid, twilio_token)
+                message = client.messages.create(
+                    body=sms_body,
+                    from_=twilio_from,
+                    to=mobile_to
+                )
+                print(f"[OTP] SMS sent to {mobile_to}, SID: {message.sid}")
+            except Exception as e:
+                print(f"[OTP] Failed to send SMS: {e}")
+        else:
+            print("[OTP] SMS not sent (missing credentials or mobile number).")
     
     @staticmethod
     def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -49,6 +101,8 @@ class AuthService:
     @staticmethod
     def verify_token(token: str) -> dict:
         """Verify and decode JWT token"""
+        if token is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="No authentication token provided")
         try:
             payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
             user_id = payload.get("sub")
@@ -309,13 +363,17 @@ class BrokerAuthService:
             (BrokerCredential.user_id == user_id) &
             (BrokerCredential.broker_name == broker_name)
         ).first()
-        
         if not credential:
+            # Log all credentials for this user for debugging
+            all_creds = db.query(BrokerCredential).filter(BrokerCredential.user_id == user_id).all()
+            print(f"[CREDENTIALS DEBUG] No credentials found for broker '{broker_name}' and user {user_id}.")
+            print(f"[CREDENTIALS DEBUG] Existing credentials for user {user_id}:")
+            for cred in all_creds:
+                print(f"  Broker: {cred.broker_name}, API Key: {bool(cred.api_key)}, Access Token: {bool(cred.access_token)}, Active: {cred.is_active}")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"No credentials found for {broker_name}"
             )
-        
         return credential
     
     @staticmethod

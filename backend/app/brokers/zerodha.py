@@ -13,10 +13,48 @@ def get_zerodha_access_token():
     """
     return os.getenv("ZERODHA_ACCESS_TOKEN")
 
+
+from app.routes.broker import get_broker_credentials
+from app.core.database import SessionLocal
+from datetime import datetime
+
 class ZerodhaKite(BrokerInterface):
-    """Zerodha Kite Connect API integration"""
-    
+    """Zerodha Kite Connect API integration (always loads credentials from DB)"""
     BASE_URL = "https://api.kite.trade"
+
+    @classmethod
+    async def from_user_context(cls, authorization: str = None):
+        """Factory: Load credentials from DB, handle expiry/refresh."""
+        from app.core.token_manager import TokenManager
+        db = SessionLocal()
+        token = None
+        if authorization and authorization.startswith("Bearer "):
+            token = authorization.split(" ", 1)[1]
+        elif authorization:
+            token = authorization
+        # Always pass only the JWT token string
+        broker_cred = await get_broker_credentials(broker_name="zerodha", db=db, token=token)
+        api_key = broker_cred.api_key
+        api_secret = broker_cred.api_secret
+        access_token = broker_cred.access_token
+        refresh_token = getattr(broker_cred, 'refresh_token', None)
+        token_expiry = getattr(broker_cred, 'token_expiry', None)
+        broker_id = getattr(broker_cred, 'id', None)
+        # Check expiry and refresh if needed
+        if token_expiry and datetime.utcnow() >= token_expiry and broker_id:
+            print(f"[ZERODHA] Access token expired, refreshing...")
+            refresh_result = TokenManager.refresh_zerodha_token(broker_id, db)
+            if refresh_result.get("status") == "success":
+                # Reload credential from DB to get new access_token
+                broker_cred = db.query(type(broker_cred)).filter_by(id=broker_id).first()
+                access_token = broker_cred.access_token
+                print(f"[ZERODHA] Token refreshed for broker_id={broker_id}")
+            else:
+                print(f"[ZERODHA] Token refresh failed: {refresh_result}")
+        return cls(api_key, api_secret, access_token)
+
+    def __init__(self, api_key: str, api_secret: str, access_token: Optional[str] = None):
+        super().__init__(api_key, api_secret, access_token)
     
     async def authenticate(self) -> bool:
         """Authenticate with Zerodha"""
@@ -157,18 +195,60 @@ class ZerodhaKite(BrokerInterface):
                         # Returns CSV data, parse it
                         text = await resp.text()
                         instruments = []
-                        for line in text.split('\n')[1:]:  # Skip header
-                            if line.strip():
-                                parts = line.split(',')
-                                if len(parts) >= 12:
-                                    instruments.append({
-                                        'tradingsymbol': parts[1],
-                                        'name': parts[2],
-                                        'lot_size': int(parts[11]) if parts[11].isdigit() else 1,
-                                        'expiry': parts[9] if len(parts) > 9 else None,
-                                        'strike': float(parts[10]) if len(parts) > 10 and parts[10] else 0,
-                                        'instrument_type': parts[8] if len(parts) > 8 else None
-                                    })
+                        import sys
+                        if text is None:
+                            print(f"[ZERODHA] instruments text is None!", file=sys.stderr)
+                            return []
+                        if not isinstance(text, str):
+                            print(f"[ZERODHA] instruments text is not a string: {text} (type={type(text)})", file=sys.stderr)
+                            return []
+                        print(f"[ZERODHA] instruments text type: {type(text)} length: {len(text)}", file=sys.stderr)
+                        def safe_float(val):
+                            try:
+                                return float(val)
+                            except Exception:
+                                return 0
+                        def safe_int(val):
+                            try:
+                                return int(val)
+                            except Exception:
+                                return 1
+                        for idx, line in enumerate(text.split('\n')[1:], 2):  # Skip header, line numbers start at 2
+                            if line is None:
+                                print(f"[ZERODHA] Skipping None line at {idx}", file=sys.stderr)
+                                continue
+                            if not isinstance(line, str):
+                                print(f"[ZERODHA] Skipping non-string line at {idx}: {line} (type={type(line)})", file=sys.stderr)
+                                continue
+                            if not line.strip():
+                                continue
+                            print(f"[ZERODHA] line before split: {line[:80]} (type={type(line)})", file=sys.stderr)
+                            parts = line.split(',')
+                            if len(parts) < 12:
+                                print(f"[ZERODHA] Skipping malformed instrument line {idx}: {line}", file=sys.stderr)
+                                continue
+                            try:
+                                tradingsymbol = parts[1]
+                                name = parts[2]
+                                lot_size = safe_int(parts[11]) if len(parts) > 11 else 1
+                                expiry = parts[9] if len(parts) > 9 else None
+                                strike = safe_float(parts[10]) if len(parts) > 10 else 0
+                                instrument_type = parts[8] if len(parts) > 8 else None
+                                # Defensive: skip if any required field is None
+                                if not tradingsymbol or not name or not instrument_type:
+                                    print(f"[ZERODHA] Skipping instrument with missing fields at line {idx}: {parts}", file=sys.stderr)
+                                    continue
+                                instruments.append({
+                                    'tradingsymbol': tradingsymbol,
+                                    'name': name,
+                                    'lot_size': lot_size,
+                                    'expiry': expiry,
+                                    'strike': strike,
+                                    'instrument_type': instrument_type
+                                })
+                            except Exception as parse_e:
+                                print(f"[ZERODHA] Exception parsing instrument line {idx}: {line} | Error: {parse_e}", file=sys.stderr)
+                                continue
                         logger.log_api_call("zerodha", "get_instruments", "success", {"count": len(instruments)})
                         return instruments
         except Exception as e:

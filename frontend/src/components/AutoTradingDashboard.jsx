@@ -2304,7 +2304,16 @@ const AutoTradingDashboard = () => {
       )}
 
       {/* All Signals Table */}
-      {analysis?.signals?.length > 0 && (
+      {/* Debug: Raw signals output */}
+      {analysis && analysis.signals && (
+        <div style={{ margin: '16px 0', padding: '12px', background: '#f7fafc', border: '1px dashed #cbd5e0', borderRadius: '8px', fontSize: '12px', color: '#2d3748' }}>
+          <strong>Debug: Raw signals array</strong>
+          <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all', margin: 0 }}>
+            {JSON.stringify(analysis.signals, null, 2)}
+          </pre>
+        </div>
+      )}
+      {analysis && analysis.signals && analysis.signals.length > 0 && (
         <div style={{ marginBottom: '24px' }}>
           <h4 style={{
             margin: '0 0 16px 0',

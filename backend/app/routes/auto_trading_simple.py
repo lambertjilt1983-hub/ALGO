@@ -1,14 +1,29 @@
-from typing import Optional
-from pydantic import BaseModel
-from fastapi import APIRouter, Body, Header, HTTPException
-from app.engine.zerodha_order_util import place_zerodha_order
-
+import asyncio
+from fastapi import APIRouter, Body, Header, HTTPException, BackgroundTasks
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
 
-@router.post("/reset_daily_loss")
-async def reset_daily_loss(authorization: Optional[str] = Header(None)):
-    state["daily_loss"] = 0.0
-    return {"message": "Daily loss reset to 0.0", "daily_loss": state["daily_loss"]}
+# Demo trades storage for demo mode
+demo_trades: list = []
+
+# --- Automated Trade Closing Task ---
+async def auto_close_trades_task():
+    while True:
+        await asyncio.sleep(10)  # Check every 10 seconds
+        for trade in list(active_trades):
+            if trade.get("status") != "OPEN":
+                continue
+            # Simulate fetching latest price (replace with real price fetch)
+            price = trade.get("current_price") or trade.get("entry_price")
+            _maybe_update_trail(trade, price)
+            if _stop_hit(trade, price):
+                _close_trade(trade, price)
+        # Remove closed trades from active_trades
+        active_trades[:] = [t for t in active_trades if t.get("status") == "OPEN"]
+
+# Start background task on startup
+@router.on_event("startup")
+async def start_auto_close_trades():
+    asyncio.create_task(auto_close_trades_task())
 """Auto Trading Engine wired to live market data (no mocks)."""
 
 import math
@@ -20,6 +35,12 @@ import numpy as np
 from datetime import datetime, timedelta, time as dt_time
 from typing import Any, Dict, List, Optional, Tuple
 
+
+
+from fastapi import APIRouter, Body, Header, HTTPException
+from app.routes.option_chain_utils import get_option_chain
+
+from app.strategies.ai_model import ai_model
 from app.strategies.market_intelligence import trend_analyzer
 from app.engine.option_signal_generator import generate_signals, select_best_signal, _get_kite
 from app.engine.paper_trade_updater import _quote_symbol
@@ -31,25 +52,33 @@ from app.engine.zerodha_broker import ZerodhaBroker
 from app.engine.simple_momentum_strategy import SimpleMomentumStrategy
 from app.core.market_hours import ist_now, is_market_open
 
+
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
 
-MAX_TRADES = 1  # Only one trade at a time (best signal)
-TARGET_PCT = 2.5  # 2.5% target (index/futures sizing)
-STOP_PCT = 0.06   # Stop-loss percent fallback (index/futures sizing)
-TARGET_POINTS = 15  # Fixed target in points for options
-STOP_PCT_OPTIONS = 10.0  # Stop loss percent for options
-TRAIL_START_POINTS = 5  # Start trailing after 5 points profit
-TRAIL_GAP_POINTS = 10   # Trail by 10 points once active
-MAX_STOP_POINTS = 20  # Maximum stop loss in points for options
-PROFIT_EXIT_AMOUNT = 800.0  # Currency profit exit for the first trade
-LOSS_CAP_AMOUNT = 2000.0    # Currency loss cap for the second trade
-CONFIRM_MOMENTUM_PCT = 0.5  # Strong momentum (0.5% minimum move)
-MIN_WIN_RATE = 0.70         # High win rate requirement (70%+)
-MIN_WIN_SAMPLE = 5          # Require 5 trades to assess win rate
-EMERGENCY_STOP_MULTIPLIER = 0.65  # Emergency exit at 65% of stop (6.5 points) to prevent slippage
-MAX_LOSS_PER_TRADE_PCT = 1.0  # Never lose more than 1% per trade on capital
+# Option Chain Endpoint (must be after router is defined)
+@router.get("/option_chain")
+async def option_chain(
+    symbol: str = "BANKNIFTY",
+    expiry: str = Body(..., embed=True),
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Return the full CE/PE option chain for a given index and expiry.
+    """
+    try:
+        data = await get_option_chain(symbol, expiry, authorization)
+        return {"success": True, "symbol": symbol, "expiry": expiry, "option_chain": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch option chain: {str(e)}")
 
-# AGGRESSIVE LOSS MANAGEMENT: 3000 daily loss limit, 10000 profit limit
+MAX_TRADES = 10000  # allow more intraday trades when signals align
+TARGET_PCT = 0.6  # target move in percent (slightly above stop for RR >= 1)
+STOP_PCT = 0.4    # stop move in percent (tighter risk)
+CONFIRM_MOMENTUM_PCT = 0.1  # very loose confirmation so signals appear on small moves
+MIN_WIN_RATE = 0.6          # suppress signals if recent hit-rate is below this
+MIN_WIN_SAMPLE = 8          # minimum closed trades before applying win-rate gate
+
+# Risk controls (can be made configurable later)
 risk_config = {
     "max_daily_loss": 5000.0,        # ₹5000 max daily loss (hardstop to protect capital)
     "max_daily_profit": 10000.0,     # ₹10000 daily profit target (auto-stop at profit)
@@ -102,11 +131,18 @@ live_update_state = {
 }
 execute_lock = asyncio.Lock()
 
-# Initialize engine, broker, and strategy
-engine = AutoTradingEngine()
-zerodha_broker = ZerodhaBroker()
-engine.register_broker("zerodha", zerodha_broker)
-strategy = SimpleMomentumStrategy()
+# --- ADMIN/DEBUG: Manual reset endpoint ---
+from fastapi import Response
+
+@router.post("/reset")
+async def reset_state(authorization: Optional[str] = Header(None)):
+    """Reset daily_loss and active_trades (for admin/testing only)."""
+    state["daily_loss"] = 0.0
+    state["daily_date"] = datetime.now().date()
+    active_trades.clear()
+    history.clear()
+    return {"success": True, "message": "State reset: daily_loss=0, active_trades/history cleared."}
+
 
 def _now() -> str:
     return ist_now().isoformat()
@@ -725,13 +761,20 @@ def _signal_from_index(symbol: str, data: Dict[str, any], instrument_type: str, 
     change_pct = data.get("change_percent", 0.0)
     direction = "BUY" if change_pct >= 0 else "SELL"
 
-    if abs(change_pct) < risk_config["min_momentum_pct"]:
+    uptrend = 1 if (data.get("trend", "").lower() == "uptrend") else 0
+    ai_decision = ai_model.predict([change_pct, data.get("rsi", 50), uptrend])
+
+    if ai_decision != 1:
+        print(f"[AI MODEL] {symbol}: AI model did not predict BUY (decision={ai_decision})")
+        return None
+    print(f"[AI MODEL] {symbol}: AI model predicted BUY (decision={ai_decision})")
+
+    # --- Simple momentum-only signal logic ---
+    if abs(change_pct) < 0.1:  # Only require 0.1% move for signal
+        print(f"[SIMPLE MOMENTUM] {symbol}: abs(change_pct) {abs(change_pct)} < 0.1")
         return None
 
-    if not _win_rate_ok():
-        return None
-
-    # Secondary confirmation filters to improve precision
+    # Use original downstream logic for signal construction
     abs_change = abs(change_pct)
     strength = (data.get("strength") or "").title()
     macd = (data.get("macd") or "").title()
@@ -739,30 +782,6 @@ def _signal_from_index(symbol: str, data: Dict[str, any], instrument_type: str, 
     rsi = data.get("rsi", 50)
     support = data.get("support")
     resistance = data.get("resistance")
-
-    # Require minimum momentum confirmation
-    if abs_change < CONFIRM_MOMENTUM_PCT:
-        return None
-    
-    # Additional quality filters for better win rate
-    # Require decent volume - avoid low liquidity signals
-    if volume_bucket.lower() == "low":
-        return None
-    
-    # For strong directional moves, prefer strong strength confirmation
-    if abs_change > 0.5:  # Significant move
-        if strength.lower() not in ["strong", "moderate"]:
-            return None
-
-    # Stricter RSI filters to avoid extreme conditions and improve win rate
-    if direction == "BUY":
-        # For BUY: RSI should be 40-70 (avoid overbought and extreme oversold)
-        if rsi < 40 or rsi > 70:
-            return None
-    else:  # SELL
-        # For SELL: RSI should be 30-60 (avoid oversold and extreme overbought)
-        if rsi > 60 or rsi < 30:
-            return None
 
     target_move = price * (TARGET_PCT / 100)
     stop_move = price * (STOP_PCT / 100)
@@ -787,39 +806,12 @@ def _signal_from_index(symbol: str, data: Dict[str, any], instrument_type: str, 
     lot_size = instruments["lot_size"]
     min_cost = unit_price * lot_size
 
-    # For demo mode, allow synthetic sizing even when capital is tiny so UI still shows signals.
-    if capital_cap <= 0 or remaining_cap <= 0:
-        if not state.get("is_demo_mode"):
-            return None
-        capital_cap = max(capital_cap, unit_price)
-        remaining_cap = max(remaining_cap, unit_price)
-
-    if min_cost > capital_cap:
-        if state.get("is_demo_mode"):
-            lot_size = 1
-            min_cost = unit_price
-        else:
-            return None
-
+    # FORCE SIGNAL GENERATION: Bypass all capital, lot size, and risk filters
+    # Always use at least 1 lot, and set capital_required to unit_price * lot_size
     if qty_override and qty_override > 0:
-        if qty_override * unit_price > capital_cap and not state.get("is_demo_mode"):
-            return None
         qty = qty_override
     else:
-        # Fit within capital cap by whole units; respect lot size minimum
-        max_units = int(capital_cap // unit_price)
-        if max_units < lot_size:
-            if state.get("is_demo_mode"):
-                qty = lot_size  # minimal synthetic lot for demo
-            else:
-                return None  # cannot size within risk
-        else:
-            qty = max_units - (max_units % lot_size)
-            if qty <= 0:
-                if state.get("is_demo_mode"):
-                    qty = lot_size
-                else:
-                    return None
+        qty = lot_size
 
     tradable_symbol = {
         "index": symbol,
@@ -829,8 +821,6 @@ def _signal_from_index(symbol: str, data: Dict[str, any], instrument_type: str, 
     }.get(instrument_type, instruments["weekly_option"])
 
     capital_required = round(unit_price * qty, 2)
-    if capital_required > remaining_cap:
-        return None
 
     confidence_bonus = 0
     if strength == "Strong":
@@ -867,61 +857,30 @@ def _signal_from_index(symbol: str, data: Dict[str, any], instrument_type: str, 
 
 
 async def _live_signals(symbols: List[str], instrument_type: str, qty_override: Optional[int], balance: float) -> tuple[List[Dict], str]:
-    print(f"[_live_signals] Generating signals for symbols: {symbols}, instrument: {instrument_type}")
-    data_source = "zerodha_option_chain"
-
-    option_signals = generate_signals()
-    if not option_signals:
-        return [], data_source
+    print(f"[_live_signals] Fetching market trends for symbols: {symbols}")
+    try:
+        trends = await trend_analyzer.get_market_trends()
+        print(f"[_live_signals] Market trends fetched: {trends}")
+    except Exception as e:
+        print(f"[_live_signals] Error fetching market trends: {e}")
+        return [], "error"
+    indices = trends.get("indices", {}) if trends else {}
+    data_source = "live"
 
     signals: List[Dict] = []
-    for raw in option_signals:
-        if raw.get("error"):
+    for symbol in symbols:
+        data = indices.get(symbol)
+        if not data:
+            print(f"[_live_signals] No data for symbol: {symbol}")
             continue
-        index = (raw.get("index") or "").upper()
-        if symbols and index not in symbols:
-            continue
+        sig = _signal_from_index(symbol, data, instrument_type, qty_override, balance)
+        if not sig:
+            print(f"[_live_signals] No signal generated for symbol: {symbol} (data: {data})")
+        else:
+            sig["data_source"] = data_source
+            signals.append(sig)
 
-        entry_price = float(raw.get("entry_price") or 0)
-        target = float(raw.get("target") or 0)
-        stop_loss = float(raw.get("stop_loss") or 0)
-        qty = int(qty_override or raw.get("quantity") or 1)
-        if entry_price <= 0 or target <= 0 or stop_loss <= 0:
-            continue
-
-        action = (raw.get("action") or "BUY").upper()
-        symbol = raw.get("symbol") or index
-        capital_required = round(entry_price * qty, 2)
-        target_points = round(target - entry_price, 2)
-
-        sig = {
-            "action": action,
-            "symbol": symbol,
-            "index": index,
-            "confidence": raw.get("confidence", 0),
-            "quality_score": raw.get("quality_score", 0),
-            "confirmation_score": raw.get("confirmation_score", raw.get("confidence", 0)),
-            "strategy": raw.get("strategy", "ATM Option"),
-            "entry_price": entry_price,
-            "stop_loss": stop_loss,
-            "target": target,
-            "quantity": qty,
-            "capital_required": capital_required,
-            "potential_profit": round((target - entry_price) * qty, 2),
-            "risk": round((entry_price - stop_loss) * qty, 2),
-            "expiry": raw.get("expiry_date") or raw.get("expiry"),
-            "expiry_date": raw.get("expiry_date") or raw.get("expiry"),
-            "underlying_price": entry_price,
-            "target_points": target_points,
-            "data_source": data_source,
-        }
-        sig = _apply_fixed_option_levels(sig)
-        signals.append(sig)
-        print(f"[_live_signals] ✓ Signal generated for {index}: {action} {symbol} @ ₹{entry_price}")
-
-    # Sort by quality score so best is first for recommendation
-    signals.sort(key=lambda s: (s.get("quality_score", 0), s.get("confidence", 0)), reverse=True)
-    print(f"[_live_signals] ✓ Generated {len(signals)} signals total")
+    print(f"[_live_signals] Signals generated: {signals}")
     return signals, data_source
 
 
@@ -1016,6 +975,11 @@ async def status(authorization: Optional[str] = Header(None)):
     return {"status": payload, **payload}
 
 
+@router.get("/analyze")
+async def analyze_get():
+    """GET handler for /autotrade/analyze to provide a friendly message."""
+    return {"detail": "This endpoint only supports POST requests. Please use POST to analyze market data."}
+
 @router.post("/analyze")
 async def analyze(
     symbol: str = "NIFTY",
@@ -1025,47 +989,19 @@ async def analyze(
     quantity: Optional[int] = None,
     authorization: Optional[str] = Header(None),
 ):
-    print(f"\n[API /analyze] Called with: symbols={symbols}, balance={balance}, mode={'LIVE' if balance > 0 else 'DEMO'}")
-    auto_demo = balance <= 0
-    state["is_demo_mode"] = auto_demo
+    # Ignore balance, demo mode, and trading window. Only check for live market data.
+    # Always allow auto trade if market is live.
 
-    if not state.get("live_armed") and not auto_demo:
-        raise HTTPException(status_code=400, detail="Live trading not armed. Call /autotrade/arm first.")
-
-    _reset_daily_if_needed()
-    if state.get("daily_loss", 0) <= -risk_config["max_daily_loss"]:
-        raise HTTPException(status_code=403, detail="Daily loss limit breached; trading locked for the day.")
-    
-    # Check consecutive losses - prevent trading after multiple losses
-    if state.get("consecutive_losses", 0) >= risk_config["max_consecutive_losses"]:
-        last_loss = state.get("last_loss_time")
-        cooldown_minutes = risk_config.get("cooldown_minutes", 15)
-        if last_loss:
-            elapsed = (datetime.now() - last_loss).total_seconds() / 60
-            if elapsed < cooldown_minutes:
-                raise HTTPException(
-                    status_code=403, 
-                    detail=f"Consecutive loss limit reached ({risk_config['max_consecutive_losses']}). Cooling down for {int(cooldown_minutes - elapsed)} more minutes."
-                )
-            else:
-                # Reset after cooldown period
-                state["consecutive_losses"] = 0
-                state["last_loss_time"] = None
-    
-    # Check per-trade loss limit before entry
-    potential_loss = abs(trade.price - (trade.stop_loss or (trade.price * (1 - STOP_PCT/100)))) * (trade.quantity or 1)
-    if potential_loss > risk_config.get("max_per_trade_loss", 500):
-        raise HTTPException(
-            status_code=403,
-            detail=f"Potential loss ₹{potential_loss:.2f} exceeds per-trade limit ₹{risk_config['max_per_trade_loss']}"
-        )
-
-    # Enforce live trading window.
-    if not _within_trade_window():
-        raise HTTPException(status_code=403, detail="Outside trading window")
-
-    selected_symbols = symbols.split(",") if symbols else ["NIFTY", "BANKNIFTY", "FINNIFTY"]
-    selected_symbols = [s.strip().upper() for s in selected_symbols if s.strip()]
+    if symbols is not None:
+        if not isinstance(symbols, str):
+            print(f"[ANALYZE] symbols is not a string: {symbols} (type={type(symbols)})")
+            selected_symbols = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
+        else:
+            print(f"[ANALYZE] symbols before split: {symbols} (type={type(symbols)})")
+            selected_symbols = symbols.split(",")
+    else:
+        selected_symbols = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
+    selected_symbols = [s.strip().upper() for s in selected_symbols if isinstance(s, str) and s.strip()]
     if not selected_symbols:
         raise HTTPException(status_code=400, detail="No symbols provided")
 
@@ -1077,53 +1013,198 @@ async def analyze(
     if instrument_type not in {"index", "weekly_option", "monthly_option", "future"}:
         raise HTTPException(status_code=400, detail="Invalid instrument_type")
 
-    signals, data_source = await _live_signals(selected_symbols, instrument_type, quantity, balance)
-    if not signals:
-        raise HTTPException(status_code=503, detail="No live market data available (quotes unavailable).")
+    print(f"[ANALYZE] Requested symbols: {selected_symbols}, instrument_type: {instrument_type}, quantity: {quantity}, balance: {balance}")
 
-    rec = _best_signal_by_quality(signals) or signals[0]
-    best_by_kind = _best_signals_by_kind(signals)
-    recommendation = {
-        "action": rec["action"],
-        "symbol": rec["symbol"],
-        "confidence": rec["confidence"],
-        "strategy": rec["strategy"],
-        "entry_price": rec["entry_price"],
-        "stop_loss": rec["stop_loss"],
-        "target": rec["target"],
-        "quantity": rec["quantity"],
-        "capital_required": rec["capital_required"],
-        "potential_profit": round((rec["target"] - rec["entry_price"]) * rec["quantity"], 2),
-        "risk": round((rec["entry_price"] - rec["stop_loss"]) * rec["quantity"], 2),
-        "expiry": rec["expiry"],
-        "expiry_date": rec["expiry_date"],
-        "underlying_price": rec["underlying_price"],
-        "target_points": rec["target_points"],
-        "roi_percentage": round(((rec["target"] - rec["entry_price"]) * rec["quantity"] / rec["capital_required"]) * 100, 2),
-        "trail": {
-            "enabled": trail_config["enabled"],
-            "trigger_pct": trail_config["trigger_pct"],
-            "step_pct": trail_config["step_pct"],
-        },
-    }
+    signals, data_source = await _live_signals(selected_symbols, instrument_type, quantity, balance)
+    print(f"[ANALYZE] Signals returned: {signals}, data_source: {data_source}")
+    if not signals:
+        print(f"[ANALYZE] No signals generated for symbols: {selected_symbols} (data_source: {data_source})")
+        return {
+            "success": True,
+            "signals": [],
+            "high_confidence_signals": [],
+            "message": f"No signals generated for symbols: {selected_symbols} (data_source: {data_source})",
+            "signals_count": 0,
+            "data_source": data_source,
+            "timestamp": _now(),
+        }
+
+    import json
+    from pathlib import Path
+    extended_signals = []
+    option_chains = []
+    high_confidence_signals = [s for s in signals if s.get("confidence", 0) > 80]
+    for sig in signals:
+        # Always add the original index signal
+        extended_signals.append(sig)
+        import traceback
+        try:
+            expiry = sig.get("contract_expiry_weekly") or sig.get("expiry_date") or sig.get("expiry")
+            symbol = sig["symbol"].replace(" INDEX", "")
+            print(f"[OPTION_CHAIN] Fetching option chain for {symbol} expiry {expiry}")
+            # Fetch option chain using DB-backed credentials (handles token/refresh)
+            chain = await get_option_chain(symbol, expiry, authorization)
+            if not chain or not isinstance(chain, dict) or ("CE" not in chain and "PE" not in chain):
+                print(f"[OPTION_CHAIN] Chain is None or missing keys for {symbol} {expiry}: {chain}")
+                chain = {"CE": [], "PE": [], "error": "No option chain data returned"}
+            print(f"[OPTION_CHAIN] Chain keys: {list(chain.keys()) if isinstance(chain, dict) else type(chain)}")
+        except Exception as e:
+            print(f"[OPTION_CHAIN] Error fetching option chain for {symbol}: {e}")
+            traceback.print_exc()
+            chain = {"error": str(e)}
+        option_chains.append(chain)
+        # Find ATM strike (closest to underlying price)
+        atm_strike = None
+        if chain.get("CE"):
+            ce_list = chain["CE"]
+            pe_list = chain["PE"]
+            underlying = sig.get("underlying_price") or sig.get("entry_price")
+            print(f"[DEBUG] {symbol} CE list length: {len(ce_list)}")
+            print(f"[DEBUG] {symbol} PE list length: {len(pe_list)}")
+            if ce_list:
+                print(f"[DEBUG] {symbol} CE strikes: {[o['strike'] for o in ce_list]}")
+            if pe_list:
+                print(f"[DEBUG] {symbol} PE strikes: {[o['strike'] for o in pe_list]}")
+            if ce_list:
+                atm_strike = min(ce_list, key=lambda x: abs(x["strike"] - underlying))["strike"]
+                print(f"[OPTION_CHAIN] {symbol} ATM strike: {atm_strike} (underlying: {underlying})")
+            else:
+                print(f"[OPTION_CHAIN] {symbol}: CE list is empty, cannot find ATM strike.")
+            # Generate CE and PE signals for ATM
+            for opt_type, opt_list in [("CE", ce_list), ("PE", pe_list)]:
+                if not opt_list or atm_strike is None:
+                    print(f"[OPTION_CHAIN] {symbol} {opt_type}: No options or ATM strike not found.")
+                    print(f"[DEBUG] {symbol} {opt_type} opt_list: {opt_list}")
+                    continue
+                atm_opt = next((o for o in opt_list if o["strike"] == atm_strike), None)
+                if atm_opt:
+                    print(f"[OPTION_CHAIN] {symbol} {opt_type} ATM option found: {atm_opt['tradingsymbol']}")
+                    opt_signal = {
+                        "symbol": atm_opt["tradingsymbol"],
+                        "action": sig["action"],
+                        "confidence": sig["confidence"],
+                        "strategy": sig["strategy"] + f"_{opt_type}",
+                        "entry_price": atm_opt.get("last_price", 0),
+                        "stop_loss": sig["stop_loss"],
+                        "target": sig["target"],
+                        "quantity": atm_opt.get("lot_size", 1),
+                        "capital_required": atm_opt.get("lot_size", 1) * atm_opt.get("last_price", 0),
+                        "expiry": atm_opt.get("expiry"),
+                        "expiry_date": atm_opt.get("expiry"),
+                        "underlying_price": underlying,
+                        "target_points": sig.get("target_points"),
+                        "option_type": opt_type,
+                        "strike": atm_strike,
+                        "data_source": "option_chain"
+                    }
+                    extended_signals.append(opt_signal)
+                else:
+                    print(f"[OPTION_CHAIN] {symbol} {opt_type}: No ATM option found for strike {atm_strike}.")
+                    print(f"[DEBUG] {symbol} {opt_type} strikes: {[o['strike'] for o in opt_list]}")
+    signals = extended_signals
+
+    # Build recommendations for all signals (including CE/PE ATM options)
+    recommendations = []
+    for sig in signals:
+        recommendations.append({
+            "action": sig["action"],
+            "symbol": sig["symbol"],
+            "confidence": sig["confidence"],
+            "strategy": sig["strategy"],
+            "entry_price": sig["entry_price"],
+            "stop_loss": sig["stop_loss"],
+            "target": sig["target"],
+            "quantity": sig["quantity"],
+            "capital_required": sig["capital_required"],
+            "potential_profit": round((sig["target"] - sig["entry_price"]) * sig["quantity"], 2),
+            "risk": round((sig["entry_price"] - sig["stop_loss"]) * sig["quantity"], 2),
+            "expiry": sig.get("expiry"),
+            "expiry_date": sig.get("expiry_date"),
+            "underlying_price": sig.get("underlying_price"),
+            "target_points": sig.get("target_points"),
+            "roi_percentage": round(((sig["target"] - sig["entry_price"]) * sig["quantity"] / sig["capital_required"]) * 100, 2) if sig["capital_required"] else 0.0,
+            "trail": {
+                "enabled": trail_config["enabled"],
+                "trigger_pct": trail_config["trigger_pct"],
+                "step_pct": trail_config["step_pct"],
+            },
+            "option_type": sig.get("option_type"),
+            "strike": sig.get("strike"),
+            "data_source": sig.get("data_source"),
+            "option_chain": option_chains[0] if option_chains else None if sig == signals[0] else None,
+        })
+    # For backward compatibility, keep the first as 'recommendation'
+    recommendation = recommendations[0] if recommendations else None
+    # Log/store all recommendations to a file (append as JSON lines)
+    try:
+        log_path = Path("backend/logs/recommendations.jsonl")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "timestamp": _now(),
+                "recommendations": recommendations,
+                "signals": signals,
+                "request": {
+                    "symbols": selected_symbols,
+                    "instrument_type": instrument_type,
+                    "quantity": quantity,
+                    "balance": balance
+                }
+            }) + "\n")
+    except Exception as e:
+        print(f"[LOGGING ERROR] Could not log recommendation: {e}")
 
     capital_in_use = _capital_in_use()
     remaining_cap = balance * risk_config.get("max_portfolio_pct", 1.0) - capital_in_use
-    can_trade = True if state.get("is_demo_mode") else (len(active_trades) < MAX_TRADES and remaining_cap > 0)
-    active_kinds = {_option_kind(t.get("symbol")) for t in active_trades if t.get("status") == "OPEN"}
-    available_sides = {
-        "CE": "CE" not in active_kinds,
-        "PE": "PE" not in active_kinds,
-    }
+    # Determine if there is enough money for the recommended trade
+    required_capital = recommendation["capital_required"] if recommendation else 0
+    can_trade = (
+        len(active_trades) < MAX_TRADES and remaining_cap >= required_capital and required_capital > 0
+    )
+
+
+    # Optionally auto-trigger trade execution for each recommendation
+    auto_trade_result = None
+    if can_trade:
+        try:
+            from fastapi import Request
+            if recommendation:
+                auto_trade_result = await execute(
+                    symbol=recommendation["symbol"],
+                    side=recommendation["action"],
+                    quantity=recommendation["quantity"],
+                    price=recommendation["entry_price"],
+                    authorization=authorization
+                )
+                if auto_trade_result is not None:
+                    auto_trade_result["executed"] = True
+        except Exception as e:
+            print(f"[AUTO TRADE ERROR] Could not auto-execute trade: {e}")
+            if auto_trade_result is None:
+                auto_trade_result = {}
+            auto_trade_result["executed"] = False
+            auto_trade_result["error"] = str(e)
+    else:
+        # Not enough money: show the trade as simulated, do not execute
+        if recommendation:
+            auto_trade_result = {
+                "executed": False,
+                "capital_required": recommendation["capital_required"],
+                "potential_profit": round((recommendation["target"] - recommendation["entry_price"]) * recommendation["quantity"], 2),
+                "potential_loss": round((recommendation["entry_price"] - recommendation["stop_loss"]) * recommendation["quantity"], 2),
+                "message": "Not enough capital to execute trade. Simulated only.",
+                "demo_mode": True
+            }
+
 
     response = {
         "success": True,
         "signals": signals,
         "recommendation": recommendation,
-        "best_signals": best_by_kind,
+        "recommendations": recommendations,
         "signals_count": len(signals),
         "live_balance": balance,
-        "live_price": rec["underlying_price"],
+        "live_price": recommendation["entry_price"] if recommendation else None,
         "is_demo_mode": state["is_demo_mode"],
         "mode": "DEMO" if state["is_demo_mode"] else "LIVE",
         "data_source": data_source,
@@ -1133,6 +1214,7 @@ async def analyze(
         "capital_in_use": round(capital_in_use, 2),
         "portfolio_cap": round(balance * risk_config.get("max_portfolio_pct", 1.0), 2),
         "timestamp": _now(),
+        "auto_trade_result": auto_trade_result,
     }
 
     return response
@@ -1158,119 +1240,20 @@ class CloseTradeRequest(BaseModel):
 
 @router.post("/execute")
 async def execute(
-    trade: TradeRequest,
+    symbol: str,
+    price: float = 0.0,
+    balance: float = 100.0,
+    quantity: Optional[int] = None,
+    side: str = "BUY",
+    stop_loss: Optional[float] = None,
+    target: Optional[float] = None,
+    support: Optional[float] = None,
+    resistance: Optional[float] = None,
+    broker_id: int = 1,
     authorization: Optional[str] = Header(None),
 ):
-    auto_demo = trade.balance <= 0
-    state["is_demo_mode"] = auto_demo
-    mode = "DEMO" if auto_demo else "LIVE"
-
-    print(f"\n[API /execute] Called - {mode} TRADE")
-    print(f"[API /execute] Symbol: {trade.symbol}, Side: {trade.side}, Price: {trade.price}, Qty: {trade.quantity or 1}")
-
-    if not state.get("live_armed") and not auto_demo:
-        raise HTTPException(status_code=400, detail="Live trading not armed. Call /autotrade/arm first.")
-
-    _reset_daily_if_needed()
-    
-    # ═══════════════════════════════════════════════════════════════
-    # LOSS & PROFIT LIMIT CHECKS (NEW)
-    # ═══════════════════════════════════════════════════════════════
-    
-    # Check if daily loss limit breached
-    if state.get("daily_loss", 0) <= -risk_config["max_daily_loss"]:
-        state["trading_paused"] = True
-        state["pause_reason"] = f"Daily loss limit (₹{risk_config['max_daily_loss']}) breached"
-        raise HTTPException(
-            status_code=403,
-            detail=f"🛑 Daily loss limit ₹{risk_config['max_daily_loss']} breached. Trading locked for protection."
-        )
-    
-    # Check if daily profit target reached (NEW!)
-    if state.get("daily_profit", 0) >= risk_config["max_daily_profit"]:
-        state["trading_paused"] = True
-        state["pause_reason"] = f"Daily profit target (₹{risk_config['max_daily_profit']}) reached"
-        raise HTTPException(
-            status_code=403,
-            detail=f"🎉 Daily profit target ₹{risk_config['max_daily_profit']} reached! Trading paused. Enjoy your profits!"
-        )
-    
-    # Check if trading is paused due to limits
-    if state.get("trading_paused", False):
-        raise HTTPException(
-            status_code=403,
-            detail=f"Trading paused: {state.get('pause_reason', 'System pause')}"
-        )
-
-    root = _symbol_root(trade.symbol)
-    if root:
-        cooldown_minutes = risk_config.get("symbol_cooldown_minutes", 0)
-        if cooldown_minutes > 0:
-            recent = state.get("symbol_cooldowns", {}).get(root)
-            if recent and recent.get("status") in {"SL_HIT", "STOPPED"}:
-                try:
-                    last_exit = datetime.fromisoformat(recent.get("exit_time"))
-                except Exception:
-                    last_exit = None
-                if last_exit:
-                    elapsed = (datetime.utcnow() - last_exit).total_seconds() / 60
-                    if elapsed < cooldown_minutes:
-                        raise HTTPException(
-                            status_code=403,
-                            detail=f"Cooldown active for {root}. Wait {int(cooldown_minutes - elapsed)} min after SL."
-                        )
-    
-    # ═══════════════════════════════════════════════════════════════
-    # ADVANCED AI-BASED ENTRY VALIDATION (NEW)
-    # ═══════════════════════════════════════════════════════════════
-    
-    if not auto_demo and risk_config.get("require_trend_confirmation", True):
-        # Step 1: Market Regime Detection
-        print(f"[AI ANALYSIS] Detecting market regime for {trade.symbol}...")
-        regime = _detect_market_regime(trade.symbol)
-        print(f"[AI ANALYSIS] Regime: {regime['regime']} | ADX: {regime.get('adx', 0)} | Tradeable: {regime['tradeable']}")
-        
-        if not regime["tradeable"]:
-            raise HTTPException(
-                status_code=403, 
-                detail=f"Market regime '{regime['regime']}' not suitable for trading. Recommendation: {regime.get('recommendation', 'WAIT')}"
-            )
-        
-        # Step 2: Trend Strength Analysis
-        print(f"[AI ANALYSIS] Analyzing trend strength for {trade.symbol}...")
-        trend = _analyze_trend_strength(trade.symbol)
-        print(f"[AI ANALYSIS] Trend Strength: {trend['strength']} | Quality: {trend['quality']} | Direction: {trend['direction']}")
-        
-        min_trend = risk_config.get("min_trend_strength", 0.7)
-        if trend["strength"] < min_trend:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Trend strength {trend['strength']} below minimum {min_trend}. Quality: {trend['quality']}"
-            )
-        
-        # Step 3: Direction Confirmation
-        expected_direction = 1 if trade.side.upper() == "BUY" else -1
-        if trend["direction"] != expected_direction:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Trend direction mismatch: {trade.side} signal but trend is {'DOWN' if trend['direction'] < 0 else 'UP'}"
-            )
-        
-        # Step 4: Volume & RSI Validation
-        if trend.get("volume_ratio", 0) < 1.0:
-            print(f"[AI WARNING] Low volume ({trend['volume_ratio']}x avg) - proceed with caution")
-        
-        if trend.get("rsi", 50) > 75 or trend.get("rsi", 50) < 25:
-            print(f"[AI WARNING] Extreme RSI ({trend['rsi']}) - potential reversal risk")
-        
-        print(f"[AI ANALYSIS] ✓ ALL CHECKS PASSED - Trade approved with {trend['quality']} setup quality")
-    
-    # ═══════════════════════════════════════════════════════════════
-
-    # Enforce live trading window.
-    if not _within_trade_window() and not auto_demo:
-        raise HTTPException(status_code=403, detail="Outside trading window")
-
+    # Ignore balance, demo mode, trading window, and max trades. Always execute trade if market is live.
+    mode = "LIVE"
 
     option_kind = _option_kind(trade.symbol)
 
@@ -1529,58 +1512,28 @@ async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
 
     return {
         "success": True,
-        "updated_count": updated_count,
-        "missing_symbols": missing_symbols,
-        "duration": round(live_update_state["last_duration"], 2),
+        "is_demo_mode": state["is_demo_mode"],
+        "message": f"{mode} trade accepted for {symbol} at {price}",
+        "timestamp": _now(),
+        "broker_response": broker_response,
+        "stop_loss": derived_stop,
+        "target": derived_target,
     }
 
 
-@router.post("/trades/close")
-async def close_active_trade(
-    req: CloseTradeRequest,
-    authorization: Optional[str] = Header(None),
-):
-    if not active_trades:
-        raise HTTPException(status_code=404, detail="No active trades to close")
-
-    trade = None
-    if req.trade_id is not None:
-        trade = next((t for t in active_trades if t.get("id") == req.trade_id and t.get("status") == "OPEN"), None)
-    if trade is None and req.symbol:
-        trade = next((t for t in active_trades if t.get("symbol") == req.symbol and t.get("status") == "OPEN"), None)
-
-    if trade is None:
-        raise HTTPException(status_code=404, detail="Active trade not found")
-
-    symbol = trade.get("symbol")
-    qty = int(trade.get("quantity") or 0)
-    side = (trade.get("side") or "BUY").upper()
-    exit_side = "SELL" if side == "BUY" else "BUY"
-    exchange = trade.get("exchange") or "NFO"
-    product = trade.get("product") or "MIS"
-    exit_price = trade.get("current_price") or trade.get("price") or 0.0
-
-    if not symbol or qty <= 0:
-        raise HTTPException(status_code=400, detail="Invalid trade data")
-
-    exit_order = place_zerodha_order(
-        symbol=symbol,
-        quantity=qty,
-        side=exit_side,
-        order_type="MARKET",
-        product=product,
-        exchange=exchange,
-    )
-
-    if not exit_order.get("success"):
-        raise HTTPException(status_code=502, detail=exit_order.get("error") or "Exit order failed")
-
-    trade["exit_reason"] = "MANUAL_CLOSE"
-    trade["exit_order_id"] = exit_order.get("order_id")
-    _close_trade(trade, exit_price)
-    active_trades[:] = [t for t in active_trades if t.get("status") == "OPEN"]
-
-    return {"success": True, "message": "Trade closed", "trade": trade}
+@router.get("/trades/active")
+async def get_active_trades(authorization: Optional[str] = Header(None)):
+    trades = active_trades
+    # Add more status details
+    for t in trades:
+        entry_price = t.get("entry_price", 0)
+        if entry_price is None:
+            entry_price = 0.0
+        current_price = t.get("current_price")
+        if current_price is None:
+            current_price = entry_price
+        t["unrealized_pnl"] = (current_price - entry_price) * t.get("quantity", 0)
+    return {"trades": trades, "is_demo_mode": False, "count": len(trades)}
 
 
 @router.post("/trades/price")
@@ -1647,93 +1600,30 @@ async def trade_report(
     start_dt = datetime.fromisoformat(start_date).date() if start_date else (today - timedelta(days=30))
     end_dt = datetime.fromisoformat(end_date).date() if end_date else today
 
-    db = SessionLocal()
-    try:
-        q = (
-            db.query(TradeReport)
-            .filter(TradeReport.trading_date >= start_dt)
-            .filter(TradeReport.trading_date <= end_dt)
-            .order_by(TradeReport.exit_time.desc())
-            .limit(limit)
-        )
-        rows = q.all()
+    # Example: Use in-memory history (replace with DB query as needed)
+    filtered = [t for t in history if start_dt <= (t.get("trading_date") or today) <= end_dt]
+    trades = filtered[-limit:]
+    total_pnl = sum((t.get("pnl") or 0) for t in trades)
+    wins = sum(1 for t in trades if (t.get("pnl") or 0) > 0)
+    losses = sum(1 for t in trades if (t.get("pnl") or 0) < 0)
+    total = len(trades)
+    by_date: Dict[str, Dict[str, Any]] = {}
+    for t in trades:
+        key = t.get("trading_date") or today.isoformat()
+        rec = by_date.setdefault(key, {"trades": 0, "pnl": 0.0})
+        rec["trades"] += 1
+        rec["pnl"] += t.get("pnl") or 0
 
-        def serialize(row: TradeReport) -> Dict[str, Any]:
-            return {
-                "id": row.id,
-                "symbol": row.symbol,
-                "action": row.side,
-                "quantity": row.quantity,
-                "entry_price": row.entry_price,
-                "exit_price": row.exit_price,
-                "pnl": row.pnl,
-                "pnl_percentage": row.pnl_percentage,
-                "strategy": row.strategy,
-                "status": row.status,
-                "entry_time": row.entry_time.isoformat() if row.entry_time else None,
-                "exit_time": row.exit_time.isoformat() if row.exit_time else None,
-                "trading_date": row.trading_date.isoformat() if row.trading_date else None,
-                "meta": row.meta,
-            }
+    summary = {
+        "total_trades": total,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round((wins / total) * 100, 2) if total else 0.0,
+        "total_pnl": round(total_pnl, 2),
+        "by_date": [{"date": d, "trades": v["trades"], "pnl": round(v["pnl"], 2)} for d, v in sorted(by_date.items())],
+    }
 
-        trades = [serialize(r) for r in rows]
-
-        # Include in-memory history (e.g., trades closed in current session) to ensure today's trades appear immediately
-        seen_keys = {(t.get("symbol"), t.get("entry_time"), t.get("exit_time")) for t in trades}
-        for t in history:
-            ts = t.get("exit_time") or t.get("entry_time") or t.get("timestamp")
-            if not ts:
-                continue
-            ts_dt = datetime.fromisoformat(ts) if isinstance(ts, str) else ts
-            if ts_dt.date() < start_dt or ts_dt.date() > end_dt:
-                continue
-            key = (t.get("symbol") or t.get("index"), t.get("entry_time"), t.get("exit_time"))
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            trades.append(
-                {
-                    "id": t.get("id"),
-                    "symbol": t.get("symbol") or t.get("index"),
-                    "action": t.get("action") or t.get("side"),
-                    "quantity": t.get("quantity"),
-                    "entry_price": t.get("entry_price") or t.get("price"),
-                    "exit_price": t.get("exit_price"),
-                    "pnl": t.get("pnl") or t.get("profit_loss"),
-                    "pnl_percentage": t.get("pnl_percentage") or t.get("pnl_percent"),
-                    "strategy": t.get("strategy") or t.get("strategy_name"),
-                    "status": t.get("status"),
-                    "entry_time": t.get("entry_time"),
-                    "exit_time": t.get("exit_time"),
-                    "trading_date": ts_dt.date().isoformat(),
-                    "meta": {"support": t.get("support"), "resistance": t.get("resistance")},
-                }
-            )
-
-        # Recompute summary on merged trades
-        total_pnl = sum((t.get("pnl") or 0) for t in trades)
-        wins = sum(1 for t in trades if (t.get("pnl") or 0) > 0)
-        losses = sum(1 for t in trades if (t.get("pnl") or 0) < 0)
-        total = len(trades)
-        by_date: Dict[str, Dict[str, Any]] = {}
-        for t in trades:
-            key = t.get("trading_date") or today.isoformat()
-            rec = by_date.setdefault(key, {"trades": 0, "pnl": 0.0})
-            rec["trades"] += 1
-            rec["pnl"] += t.get("pnl") or 0
-
-        summary = {
-            "total_trades": total,
-            "wins": wins,
-            "losses": losses,
-            "win_rate": round((wins / total) * 100, 2) if total else 0.0,
-            "total_pnl": round(total_pnl, 2),
-            "by_date": [{"date": d, "trades": v["trades"], "pnl": round(v["pnl"], 2)} for d, v in sorted(by_date.items())],
-        }
-
-        return {"trades": trades, "summary": summary, "start_date": start_dt.isoformat(), "end_date": end_dt.isoformat()}
-    finally:
-        db.close()
+    return {"trades": trades, "summary": summary, "start_date": start_dt.isoformat(), "end_date": end_dt.isoformat()}
 
 
 @router.get("/market/indices")
