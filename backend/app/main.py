@@ -100,6 +100,13 @@ app = FastAPI(
 # CORS middleware
 settings = get_settings()
 allowed_origins = [origin.strip() for origin in settings.ALLOWED_ORIGINS.split(",") if origin.strip()]
+placeholder_hosts = {"https://yourdomain.com", "https://www.yourdomain.com"}
+if not allowed_origins or placeholder_hosts.intersection(allowed_origins):
+    # Fallback to known frontend URLs when env var still has placeholders.
+    allowed_origins = [
+        settings.FRONTEND_URL,
+        settings.FRONTEND_ALT_URL,
+    ]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
