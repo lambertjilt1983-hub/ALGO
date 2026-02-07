@@ -14,7 +14,10 @@ from app.models.schemas import UserCreate, UserLogin, TokenResponse, OtpVerify
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from twilio.rest import Client
+try:
+    from twilio.rest import Client
+except Exception:
+    Client = None
 import os
 
 settings = get_settings()
@@ -65,7 +68,7 @@ class AuthService:
         mobile_to = user.mobile
         sms_body = f"Your OTP code is: {otp}"
 
-        if mobile_to and twilio_sid and twilio_token and twilio_from:
+        if mobile_to and twilio_sid and twilio_token and twilio_from and Client:
             try:
                 client = Client(twilio_sid, twilio_token)
                 message = client.messages.create(
@@ -77,7 +80,10 @@ class AuthService:
             except Exception as e:
                 print(f"[OTP] Failed to send SMS: {e}")
         else:
-            print("[OTP] SMS not sent (missing credentials or mobile number).")
+            if not Client:
+                print("[OTP] SMS not sent (twilio package missing).")
+            else:
+                print("[OTP] SMS not sent (missing credentials or mobile number).")
     
     @staticmethod
     def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:

@@ -23,6 +23,40 @@ except Exception as e:
 # --- FastAPI lifespan event handler (replaces deprecated on_event) ---
 from contextlib import asynccontextmanager
 import logging
+import importlib.util
+from pathlib import Path
+
+def _check_required_dependencies(logger: logging.Logger) -> None:
+    requirements_path = Path(__file__).resolve().parent.parent / "requirements.txt"
+    if not requirements_path.exists():
+        logger.warning("[STARTUP] requirements.txt not found; skipping dependency check.")
+        return
+
+    import_map = {
+        "python-dotenv": "dotenv",
+        "pydantic-settings": "pydantic_settings",
+        "python-jose": "jose",
+        "passlib": "passlib",
+        "psycopg2-binary": "psycopg2",
+        "scikit-learn": "sklearn",
+        "websocket-client": "websocket",
+    }
+
+    missing = []
+    for line in requirements_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        package = line.split("==")[0].strip()
+        module = import_map.get(package, package.replace("-", "_"))
+        if importlib.util.find_spec(module) is None:
+            missing.append(package)
+
+    if missing:
+        logger.error("[STARTUP] Missing Python dependencies: %s", ", ".join(missing))
+        logger.error("[STARTUP] Install with: pip install -r backend/requirements.txt")
+    else:
+        logger.info("[STARTUP] Dependency check passed.")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -30,6 +64,7 @@ async def lifespan(app: FastAPI):
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("startup")
     logger.info("[STARTUP] FastAPI startup event triggered.")
+    _check_required_dependencies(logger)
     db = SessionLocal()
     try:
         logger.info("[STARTUP] Ensuring default admin user...")

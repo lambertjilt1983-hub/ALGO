@@ -1,5 +1,6 @@
 import asyncio
 from fastapi import APIRouter, Body, Header, HTTPException, BackgroundTasks
+from pydantic import BaseModel
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
 
 # Demo trades storage for demo mode
@@ -1218,6 +1219,13 @@ async def analyze(
     }
 
     return response
+
+
+try:
+    BaseModel
+except NameError:
+    from pydantic import BaseModel as _BaseModel
+    BaseModel = _BaseModel
 
 
 class TradeRequest(BaseModel):
