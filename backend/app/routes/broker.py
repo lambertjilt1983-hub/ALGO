@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from typing import List
@@ -7,10 +7,60 @@ from app.models.schemas import BrokerCredentialCreate, BrokerCredentialResponse
 from app.models.auth import BrokerCredential, User
 from app.core.database import get_db
 from app.core.token_manager import token_manager
+from app.core.security import encryption_manager
 from app.core.config import get_settings
 import urllib.parse
+import requests
 
 router = APIRouter(prefix="/brokers", tags=["brokers"])
+
+
+def _safe_decrypt(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return encryption_manager.decrypt_credentials(value)
+    except Exception:
+        return value
+
+
+def _api_key_preview(value: str | None) -> str | None:
+    if not value:
+        return None
+    return f"{value[:8]}..." if len(value) > 8 else value
+
+
+def _build_broker_response(credential: BrokerCredential) -> dict:
+    api_key = _safe_decrypt(getattr(credential, "api_key", None))
+    has_access_token = bool(getattr(credential, "access_token", None))
+    token_status = None
+    requires_reauth = None
+
+    if credential.broker_name and "zerodha" in credential.broker_name.lower():
+        if has_access_token:
+            is_valid = token_manager.validate_zerodha_token(credential)
+            token_status = "valid" if is_valid else "expired"
+            requires_reauth = not is_valid
+        else:
+            token_status = "missing"
+            requires_reauth = True
+    else:
+        token_status = "missing" if not has_access_token else "unknown"
+        requires_reauth = not has_access_token
+
+    return {
+        "id": credential.id,
+        "broker_name": credential.broker_name,
+        "is_active": credential.is_active,
+        "created_at": credential.created_at,
+        "updated_at": credential.updated_at,
+        "api_key_preview": _api_key_preview(api_key),
+        "has_access_token": has_access_token,
+        "token_expiry": credential.token_expiry,
+        "token_status": token_status,
+        "requires_reauth": requires_reauth,
+        "last_used": credential.updated_at,
+    }
 
 @router.post("/credentials", response_model=BrokerCredentialResponse)
 async def add_broker_credentials(
@@ -28,20 +78,19 @@ async def add_broker_credentials(
         (BrokerCredential.broker_name == credentials.broker_name)
     ).first()
     
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Broker {credentials.broker_name} already exists. Please delete the old one first."
-        )
-    
     broker_cred = BrokerAuthService.store_credentials(
         user_id=user_id,
         broker_name=credentials.broker_name,
         api_key=credentials.api_key,
         api_secret=credentials.api_secret,
-        db=db
+        db=db,
+        access_token=credentials.access_token
     )
-    return broker_cred
+    if existing and broker_cred:
+        broker_cred.is_active = True
+        db.commit()
+        db.refresh(broker_cred)
+    return _build_broker_response(broker_cred)
 
 @router.get("/credentials", response_model=List[BrokerCredentialResponse])
 async def list_broker_credentials(
@@ -56,18 +105,7 @@ async def list_broker_credentials(
         BrokerCredential.user_id == user_id
     ).all()
     
-    # Debug: Print what's in database
-    print(f"\n{'='*60}")
-    print(f"DEBUG: User {user_id} credentials")
-    for cred in credentials:
-        print(f"  Broker {cred.id}: {cred.broker_name}")
-        print(f"    Has API Key: {bool(cred.api_key)}")
-        print(f"    Has Access Token: {bool(cred.access_token)}")
-        if cred.access_token:
-            print(f"    Token: {cred.access_token[:50]}...")
-    print(f"{'='*60}\n")
-    
-    return credentials
+    return [_build_broker_response(cred) for cred in credentials]
 
 @router.get("/credentials/{broker_name}", response_model=BrokerCredentialResponse)
 async def get_broker_credentials(
@@ -85,7 +123,7 @@ async def get_broker_credentials(
         broker_name=broker_name,
         db=db
     )
-    return credential
+    return _build_broker_response(credential)
 
 @router.delete("/credentials/{broker_name}")
 async def delete_broker_credentials(
@@ -122,20 +160,8 @@ async def get_broker_balance(
         (BrokerCredential.user_id == user_id)
     ).first()
     
-    if credential:
-        print(f"\n{'='*60}")
-        print(f"DEBUG: Broker credential found")
-        print(f"  ID: {credential.id}")
-        print(f"  User ID: {user_id}")
-        print(f"  Broker: {credential.broker_name}")
-        print(f"  Has API Key: {bool(credential.api_key)}")
-        print(f"  Has Access Token: {bool(credential.access_token)}")
-        if credential.access_token:
-            print(f"  Token Preview: {credential.access_token[:30]}...")
-        print(f"{'='*60}\n")
-    
     # Use automated token manager to handle token refresh and fallback
-    result = token_manager.get_balance_with_fallback(broker_id, db, user_id)
+    result = await token_manager.get_balance_with_fallback(broker_id, db, user_id)
     
     # If token is expired, suggest re-authentication
     if result.get("status") == "token_expired":
@@ -165,7 +191,6 @@ async def zerodha_oauth_login(
         )
     
     # Decrypt API key before using it
-    from app.core.security import encryption_manager
     try:
         decrypted_api_key = encryption_manager.decrypt_credentials(credential.api_key)
     except Exception as e:
@@ -183,7 +208,8 @@ async def zerodha_oauth_login(
     state = f"{user_id}:{broker_id}"
     
     # Zerodha login URL (redirect URL is configured in the developer console)
-    login_url = f"https://kite.zerodha.com/connect/login?api_key={decrypted_api_key}&v=3"
+    encoded_state = urllib.parse.quote(state)
+    login_url = f"https://kite.zerodha.com/connect/login?api_key={decrypted_api_key}&v=3&state={encoded_state}"
     
     return {
         "login_url": login_url,
@@ -191,6 +217,133 @@ async def zerodha_oauth_login(
         "state": state,
         "message": "Redirect user to login_url, then handle callback"
     }
+
+
+@router.get("/upstox/login/{broker_id}")
+async def upstox_oauth_login(
+    broker_id: int,
+    db: Session = Depends(get_db),
+    token: str = Depends(AuthService.verify_bearer_token)
+):
+    """Initiate Upstox OAuth flow to get access token"""
+    payload = AuthService.verify_token(token)
+    user_id = int(payload.get("sub"))
+
+    credential = db.query(BrokerCredential).filter(
+        (BrokerCredential.user_id == user_id) &
+        (BrokerCredential.id == broker_id)
+    ).first()
+
+    if not credential:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Broker credential not found"
+        )
+
+    try:
+        decrypted_api_key = encryption_manager.decrypt_credentials(credential.api_key)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Credentials encrypted with old key. Please delete and re-add this broker."
+        )
+
+    settings = get_settings()
+    redirect_uri = settings.UPSTOX_REDIRECT_URL or settings.FRONTEND_URL
+    state = f"upstox:{user_id}:{broker_id}"
+    encoded_state = urllib.parse.quote(state)
+    encoded_redirect = urllib.parse.quote(redirect_uri)
+
+    login_url = (
+        "https://api.upstox.com/v2/login/authorization/dialog"
+        f"?response_type=code&client_id={decrypted_api_key}"
+        f"&redirect_uri={encoded_redirect}&state={encoded_state}"
+    )
+
+    return {
+        "login_url": login_url,
+        "redirect_url": redirect_uri,
+        "state": state,
+        "message": "Redirect user to login_url, then exchange code for token"
+    }
+
+
+@router.post("/upstox/exchange/{broker_id}")
+def upstox_token_exchange(
+    broker_id: int,
+    code: str = Body(..., embed=True),
+    db: Session = Depends(get_db),
+    token: str = Depends(AuthService.verify_bearer_token)
+):
+    """Exchange Upstox auth code for access token and persist it"""
+    payload = AuthService.verify_token(token)
+    user_id = int(payload.get("sub"))
+
+    credential = db.query(BrokerCredential).filter(
+        (BrokerCredential.user_id == user_id) &
+        (BrokerCredential.id == broker_id)
+    ).first()
+
+    if not credential:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Broker credential not found"
+        )
+
+    settings = get_settings()
+    try:
+        api_key = encryption_manager.decrypt_credentials(credential.api_key)
+        api_secret = encryption_manager.decrypt_credentials(credential.api_secret)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to decrypt credentials: {e}"
+        )
+
+    api_key = api_key or settings.UPSTOX_API_KEY
+    api_secret = api_secret or settings.UPSTOX_API_SECRET
+    redirect_uri = settings.UPSTOX_REDIRECT_URL or settings.FRONTEND_URL
+
+    if not api_key or not api_secret:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Upstox API key/secret missing"
+        )
+
+    try:
+        resp = requests.post(
+            "https://api.upstox.com/v2/login/authorization/token",
+            headers={"accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "code": code,
+                "client_id": api_key,
+                "client_secret": api_secret,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code"
+            },
+            timeout=20
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Upstox token request failed: {e}")
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+    data = resp.json() if resp.content else {}
+    access_token = data.get("access_token") or data.get("data", {}).get("access_token")
+    refresh_token = data.get("refresh_token") or data.get("data", {}).get("refresh_token")
+
+    if not access_token:
+        raise HTTPException(status_code=400, detail="Upstox access token missing in response")
+
+    credential.access_token = encryption_manager.encrypt_credentials(access_token)
+    if refresh_token:
+        credential.refresh_token = encryption_manager.encrypt_credentials(refresh_token)
+    db.add(credential)
+    db.commit()
+    db.refresh(credential)
+
+    return {"status": "success", "broker_id": credential.id}
 
 @router.get("/debug/tokens")
 async def debug_tokens(
@@ -283,7 +436,8 @@ async def zerodha_oauth_callback(
         
         # Update credential with access token - CRITICAL: Save to DB immediately
         print(f"Saving access token to broker ID: {credential.id}")
-        credential.access_token = access_token
+        safe_access_token = access_token.strip() if isinstance(access_token, str) else access_token
+        credential.access_token = encryption_manager.encrypt_credentials(safe_access_token)
         db.add(credential)  # Explicitly add to session
         db.commit()
         

@@ -23,7 +23,7 @@ class NewsAnalyzer:
         self.news_sources = {
             'economic_times': 'https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms',
             'moneycontrol': 'https://www.moneycontrol.com/rss/marketreports.xml',
-            'business_standard': 'https://www.business-standard.com/rss/markets-106.rss'
+            # Removed business_standard - returns 403 Forbidden
         }
         self.request_timeout = 6
         
@@ -61,7 +61,11 @@ class NewsAnalyzer:
         items: List[Dict[str, Any]] = []
 
         try:
-            response = requests.get(url, timeout=self.request_timeout)
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8',
+            }
+            response = requests.get(url, headers=headers, timeout=self.request_timeout)
             response.raise_for_status()
             root = ET.fromstring(response.content)
 
@@ -223,37 +227,42 @@ class MarketTrendAnalyzer:
             return 'Bearish'
 
     def _fetch_live_quotes(self) -> Dict[str, Dict[str, Any]]:
-        """Fetch live index quotes with Zerodha preferred; fallback to Moneycontrol then Yahoo."""
+        """Fetch LIVE index quotes from Zerodha ONLY when connected.
+        Falls back to NSE/Moneycontrol ONLY if Zerodha is not available.
+        """
         market_data: Dict[str, Dict[str, Any]] = {}
 
+        # PRIMARY: Zerodha (Real broker connection)
         zerodha_rows = self._fetch_zerodha_quotes()
         if zerodha_rows:
             market_data.update(zerodha_rows)
-
-        # NSE direct feed (cookie-primed) to avoid Yahoo 401 blocks and Moneycontrol gaps.
+            return market_data  # RETURN ONLY ZERODHA DATA - NO FALLBACKS
+        
+        # SECONDARY: NSE direct feed (only if Zerodha failed)
         missing_indices = [idx for idx in self.indices if idx not in market_data]
         if missing_indices:
             nse_rows = self._fetch_nse_indices(missing_indices)
-            market_data.update(nse_rows)
+            if nse_rows:
+                market_data.update(nse_rows)
+                return market_data  # Return NSE data - no further fallbacks
 
-        # Next try Moneycontrol price feed for anything missing.
+        # TERTIARY: Moneycontrol (last resort)
         missing_indices = [idx for idx in self.indices if idx not in market_data]
         if missing_indices:
             mc_rows = self._fetch_moneycontrol_quotes(missing_indices)
-            market_data.update(mc_rows)
-
-        # Finally fall back to Yahoo.
-        missing_indices = [idx for idx in self.indices if idx not in market_data]
-        if missing_indices:
-            yahoo_rows = self._fetch_yahoo_quotes(missing_indices)
-            market_data.update(yahoo_rows)
+            if mc_rows:
+                market_data.update(mc_rows)
+                return market_data
 
         return market_data
 
     def _fetch_zerodha_quotes(self) -> Dict[str, Dict[str, Any]]:
-        """Fetch live quotes from Zerodha Kite if API key + access token are set."""
+        """Fetch REAL live quotes from Zerodha Kite API.
+        This is the PRIMARY source when broker is connected.
+        """
         # Always re-hydrate in case tokens rotated.
         self._hydrate_tokens_from_db()
+
         if not self.kite_api_key or not self.kite_access_token:
             return {}
 
@@ -270,8 +279,7 @@ class MarketTrendAnalyzer:
             instruments = [sym for sym in mapping.values() if sym]
             quotes = kite.ltp(instruments)
         except Exception as exc:
-            err = str(exc)
-            print(f"[MarketIntelligence] Zerodha quote fetch failed: {err}")
+            # Silently fail and fallback to NSE if Zerodha credentials invalid
             return {}
 
         rows: Dict[str, Dict[str, Any]] = {}

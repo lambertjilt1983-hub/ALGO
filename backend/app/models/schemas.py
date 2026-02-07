@@ -12,6 +12,7 @@ class UserCreate(BaseModel):
 class UserLogin(BaseModel):
     username: str
     password: str
+    otp: Optional[str] = None
 
 
 class OtpVerify(BaseModel):
@@ -39,12 +40,20 @@ class BrokerCredentialCreate(BaseModel):
     broker_name: str
     api_key: str
     api_secret: str
+    access_token: Optional[str] = None
 
 class BrokerCredentialResponse(BaseModel):
     id: int
     broker_name: str
     is_active: bool
     created_at: datetime
+    updated_at: Optional[datetime] = None
+    api_key_preview: Optional[str] = None
+    has_access_token: bool = False
+    token_expiry: Optional[datetime] = None
+    token_status: Optional[str] = None
+    requires_reauth: Optional[bool] = None
+    last_used: Optional[datetime] = None
     
     class Config:
         from_attributes = True

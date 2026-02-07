@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import config from './config/api';
-import AutoTradingDashboard from './components/AutoTradingDashboard';
 import AdminPanel from './components/AdminPanel';
 
 function Dashboard() {
@@ -11,6 +10,7 @@ function Dashboard() {
   const [showBrokerForm, setShowBrokerForm] = useState(false);
   const [showOrderForm, setShowOrderForm] = useState(false);
   const [showStrategyForm, setShowStrategyForm] = useState(false);
+  const [deletingBroker, setDeletingBroker] = useState(null);
   const navigate = useNavigate();
 
   // New Broker Form States
@@ -49,6 +49,8 @@ function Dashboard() {
     console.log('🔍 URL params object:', Object.fromEntries(urlParams.entries()));
     
     const zerodhaAuth = urlParams.get('zerodha_auth');
+    const upstoxCode = urlParams.get('code');
+    const upstoxState = urlParams.get('state');
     
     // Handle direct Zerodha redirect (when redirect_url is set to frontend)
     const status = urlParams.get('status');
@@ -57,8 +59,19 @@ function Dashboard() {
     console.log('🔍 Status:', status, 'Request Token:', requestToken);
     
     if (status === 'success' && requestToken) {
+      const state = urlParams.get('state');
+      const storedBrokerId = localStorage.getItem('zerodha_last_broker_id');
+      const parsedBrokerId = state?.includes(':') ? state.split(':')[1] : state;
+      const brokerId = parsedBrokerId || storedBrokerId;
       console.log('✅ Zerodha redirect detected, exchanging token...');
-      handleZerodhaCallback(requestToken);
+      handleZerodhaCallback(requestToken, brokerId);
+      return;
+    }
+
+    if (upstoxCode && upstoxState?.startsWith('upstox:')) {
+      const parts = upstoxState.split(':');
+      const brokerId = parts[2];
+      handleUpstoxCallback(upstoxCode, brokerId);
       return;
     }
     
@@ -78,19 +91,25 @@ function Dashboard() {
     }
   }, []);
 
-  const handleZerodhaCallback = async (requestToken) => {
+  const handleZerodhaCallback = async (requestToken, brokerId) => {
     try {
       const token = localStorage.getItem('access_token');
+
+      if (!brokerId) {
+        alert('Missing broker id for Zerodha token refresh. Please retry login from Brokers page.');
+        return;
+      }
       
       console.log('🔄 Exchanging Zerodha request token:', requestToken);
       
       // Call backend to exchange request token for access token
-      const response = await fetch(`${config.API_BASE_URL}/brokers/zerodha/callback?request_token=${requestToken}&status=success`, {
-        method: 'GET',
+      const response = await fetch(`${config.API_BASE_URL}/api/tokens/refresh/${brokerId}`, {
+        method: 'POST',
         headers: {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json'
-        }
+        },
+        body: JSON.stringify({ request_token: requestToken })
       });
       
       console.log('📥 Callback response status:', response.status);
@@ -128,6 +147,49 @@ function Dashboard() {
     } catch (error) {
       console.error('💥 Failed to complete Zerodha authentication:', error);
       alert('Network error during Zerodha authentication. Please check if backend is running and try again.');
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+  };
+
+  const handleUpstoxCallback = async (code, brokerId) => {
+    try {
+      const token = localStorage.getItem('access_token');
+
+      if (!brokerId) {
+        alert('Missing broker id for Upstox token exchange. Please retry login from Brokers page.');
+        return;
+      }
+
+      const response = await fetch(`${config.API_BASE_URL}/brokers/upstox/exchange/${brokerId}`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ code })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.status === 'success') {
+          alert('✅ Upstox connected! Access token saved.');
+          window.history.replaceState({}, document.title, window.location.pathname);
+          setTimeout(() => {
+            fetchBrokers();
+            if (data.broker_id) {
+              fetchBrokerBalance(data.broker_id);
+            }
+          }, 500);
+          return;
+        }
+      }
+
+      const errorText = await response.text();
+      alert(`Upstox authentication failed: ${errorText}`);
+      window.history.replaceState({}, document.title, window.location.pathname);
+    } catch (error) {
+      console.error('Upstox auth error:', error);
+      alert('Network error during Upstox authentication. Please check if backend is running and try again.');
       window.history.replaceState({}, document.title, window.location.pathname);
     }
   };
@@ -192,11 +254,7 @@ function Dashboard() {
         
         // If token is expired, trigger re-authentication flow
         if (balanceData.status === 'token_expired' || balanceData.requires_reauth) {
-          console.warn(`Token expired for broker ${brokerId}, triggering re-auth`);
-          // Automatically redirect to Zerodha login
-          setTimeout(() => {
-            handleZerodhaLogin(brokerId);
-          }, 1000);
+          console.warn(`Token expired for broker ${brokerId}, showing reconnect prompt`);
         }
         
         setBrokerBalances(prev => ({
@@ -208,6 +266,42 @@ function Dashboard() {
       }
     } catch (error) {
       console.error(`Failed to fetch balance for broker ${brokerId}:`, error);
+    }
+  };
+
+  const handleDeleteBroker = async (broker) => {
+    if (!broker?.broker_name) {
+      alert('Missing broker name');
+      return;
+    }
+
+    const confirmed = window.confirm(`Remove broker ${broker.broker_name}? This cannot be undone.`);
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      setDeletingBroker(broker.broker_name);
+      const response = await config.authFetch(
+        config.endpoints.brokers.credentialsByName(encodeURIComponent(broker.broker_name)),
+        { method: 'DELETE' }
+      );
+
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.detail || 'Failed to delete broker');
+      }
+
+      setBrokers((prev) => prev.filter((item) => item.id !== broker.id));
+      setBrokerBalances((prev) => {
+        const next = { ...prev };
+        delete next[broker.id];
+        return next;
+      });
+    } catch (error) {
+      alert(error.message || 'Failed to delete broker');
+    } finally {
+      setDeletingBroker(null);
     }
   };
 
@@ -355,6 +449,7 @@ function Dashboard() {
     
     try {
       window.zerodhaLoginInProgress = true;
+      localStorage.setItem('zerodha_last_broker_id', String(brokerId));
       const token = localStorage.getItem('access_token');
       const response = await fetch(`${config.API_BASE_URL}/brokers/zerodha/login/${brokerId}`, {
         headers: {
@@ -388,6 +483,30 @@ function Dashboard() {
     } catch (error) {
       window.zerodhaLoginInProgress = false;
       alert('Error: ' + error.message);
+    }
+  };
+
+  const handleUpstoxLogin = async (brokerId) => {
+    try {
+      const token = localStorage.getItem('access_token');
+      const response = await fetch(`${config.API_BASE_URL}/brokers/upstox/login/${brokerId}`, {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        alert(`Failed to initiate Upstox login: ${errorText}`);
+        return;
+      }
+
+      const data = await response.json();
+      window.open(data.login_url, 'UpstoxLogin', 'width=600,height=800');
+      alert('Upstox login window opened. After logging in, close this alert and refresh the page.');
+    } catch (error) {
+      console.error('Upstox login error:', error);
+      alert('Failed to initiate Upstox login');
     }
   };
 
@@ -526,7 +645,7 @@ function Dashboard() {
                 }}>
                   ₹{getTotalPortfolioValue().toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                 </div>
-                {Object.values(brokerBalances).some(b => b.data_source === 'real_zerodha_api') ? (
+                {Object.values(brokerBalances).some(b => typeof b.data_source === 'string' && b.data_source.startsWith('real_')) ? (
                   <div style={{
                     fontSize: '12px',
                     opacity: '0.9',
@@ -538,7 +657,8 @@ function Dashboard() {
                   }}>
                     ✓ Live Market Data
                   </div>
-                ) : Object.values(brokerBalances).some(b => b.status === 'token_expired') ? (
+                ) : brokers.some(b => b.broker_name?.toLowerCase().includes('zerodha')) &&
+                  Object.values(brokerBalances).some(b => b.status === 'token_expired' || b.requires_reauth) ? (
                   <div style={{
                     fontSize: '12px',
                     opacity: '0.8',
@@ -549,7 +669,19 @@ function Dashboard() {
                     marginTop: '8px',
                     color: '#ea580c'
                   }}>
-                    ⚠️ Token Expired - Re-authenticating with Zerodha...
+                    ⚠️ Zerodha authentication required
+                  </div>
+                ) : brokers.length > 0 ? (
+                  <div style={{
+                    fontSize: '12px',
+                    opacity: '0.85',
+                    background: 'rgba(255, 255, 255, 0.18)',
+                    padding: '4px 12px',
+                    borderRadius: '12px',
+                    display: 'inline-block',
+                    marginTop: '8px'
+                  }}>
+                    ✓ Brokers connected - balance depends on broker API
                   </div>
                 ) : (
                   <div style={{
@@ -755,7 +887,7 @@ function Dashboard() {
                   </div>
                   
                   {/* Zerodha OAuth Button */}
-                  {broker.broker_name.toLowerCase().includes('zerodha') && !broker.access_token && (
+                  {broker.broker_name.toLowerCase().includes('zerodha') && (broker.requires_reauth || !broker.has_access_token) && (
                     <button
                       onClick={() => handleZerodhaLogin(broker.id)}
                       style={{
@@ -771,9 +903,48 @@ function Dashboard() {
                         marginBottom: '12px'
                       }}
                     >
-                      🔐 Login to Zerodha to Get Access Token
+                      🔐 Reconnect Zerodha
                     </button>
                   )}
+
+                  {broker.broker_name.toLowerCase().includes('upstox') && (broker.requires_reauth || !broker.has_access_token) && (
+                    <button
+                      onClick={() => handleUpstoxLogin(broker.id)}
+                      style={{
+                        width: '100%',
+                        padding: '12px',
+                        background: 'linear-gradient(135deg, #38b2ac 0%, #319795 100%)',
+                        color: 'white',
+                        border: 'none',
+                        borderRadius: '8px',
+                        fontSize: '14px',
+                        fontWeight: '600',
+                        cursor: 'pointer',
+                        marginBottom: '12px'
+                      }}
+                    >
+                      🔐 Connect Upstox
+                    </button>
+                  )}
+
+                  <button
+                    onClick={() => handleDeleteBroker(broker)}
+                    disabled={deletingBroker === broker.broker_name}
+                    style={{
+                      width: '100%',
+                      padding: '10px',
+                      background: '#fff5f5',
+                      color: '#c53030',
+                      border: '1px solid #fed7d7',
+                      borderRadius: '8px',
+                      fontSize: '13px',
+                      fontWeight: '600',
+                      cursor: deletingBroker === broker.broker_name ? 'not-allowed' : 'pointer',
+                      opacity: deletingBroker === broker.broker_name ? 0.6 : 1
+                    }}
+                  >
+                    {deletingBroker === broker.broker_name ? 'Removing...' : 'Remove Broker'}
+                  </button>
                   
                   {brokerBalances[broker.id] && (
                     <div style={{
@@ -843,22 +1014,36 @@ function Dashboard() {
                       <div style={{
                         marginTop: '12px',
                         padding: '8px 12px',
-                        background: brokerBalances[broker.id].data_source === 'real_zerodha_api' ? '#d1fae5' : '#fef5e7',
+                        background: brokerBalances[broker.id].data_source?.startsWith('real_') ? '#d1fae5' : '#fef5e7',
                         borderRadius: '6px',
-                        border: `1px solid ${brokerBalances[broker.id].data_source === 'real_zerodha_api' ? '#6ee7b7' : '#f9e79f'}`,
+                        border: `1px solid ${brokerBalances[broker.id].data_source?.startsWith('real_') ? '#6ee7b7' : '#f9e79f'}`,
                         fontSize: '11px',
-                        color: brokerBalances[broker.id].data_source === 'real_zerodha_api' ? '#065f46' : '#856404'
+                        color: brokerBalances[broker.id].data_source?.startsWith('real_') ? '#065f46' : '#856404'
                       }}>
-                        {brokerBalances[broker.id].data_source === 'real_zerodha_api' 
-                          ? '✓ Live Data from Zerodha Account' 
-                          : brokerBalances[broker.id].error 
-                            ? `⚠️ ${brokerBalances[broker.id].error}`
-                            : '⚠️ Demo/Simulated Data - Connect Zerodha with access token for real balance'}
+                        {brokerBalances[broker.id].data_source?.startsWith('real_')
+                          ? `✓ Live Data from ${broker.broker_name}`
+                          : brokerBalances[broker.id].message
+                            ? `⚠️ ${brokerBalances[broker.id].message}`
+                            : brokerBalances[broker.id].error
+                              ? `⚠️ ${brokerBalances[broker.id].error}`
+                              : `⚠️ Connect ${broker.broker_name} with access token for real balance`}
                       </div>
                     </div>
                   )}
                 </div>
               ))}
+            </div>
+            {/* Auto Trading Engine Link */}
+            <div style={{ marginTop: '32px', display: 'flex', alignItems: 'center' }}>
+              <span style={{ marginRight: '8px' }}>🤖</span>
+              <a
+                href="/autotrading"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: '#2563eb', textDecoration: 'underline', fontWeight: 600 }}
+              >
+                Auto Trading Engine
+              </a>
             </div>
           </div>
         )}
@@ -1418,9 +1603,6 @@ function Dashboard() {
             </div>
           </div>
         )}
-
-        {/* Auto Trading Dashboard */}
-        <AutoTradingDashboard />
 
         {/* Market Intelligence Section */}
         <div style={{

@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import toast from 'react-hot-toast';
 import axios from 'axios';
 import config from '../config/api';
+import AutoTradingDashboard from '../components/AutoTradingDashboard';
 
 const API_URL = config.API_BASE_URL;
 
@@ -61,6 +62,7 @@ export default function BrokersPage() {
   const handleZerodhaLogin = async (brokerId) => {
     try {
       const token = localStorage.getItem('access_token');
+      localStorage.setItem('zerodha_last_broker_id', String(brokerId));
       const response = await axios.get(
         `${API_URL}/brokers/zerodha/login/${brokerId}`,
         {
@@ -207,32 +209,43 @@ export default function BrokersPage() {
                       {broker.broker_name}
                     </h3>
                     <span className={`px-3 py-1 rounded-full text-sm font-medium ${
-                      broker.access_token 
-                        ? 'bg-green-100 text-green-800' 
-                        : 'bg-yellow-100 text-yellow-800'
+                      broker.token_status === 'valid'
+                        ? 'bg-green-100 text-green-800'
+                        : broker.token_status === 'expired'
+                          ? 'bg-red-100 text-red-800'
+                          : 'bg-yellow-100 text-yellow-800'
                     }`}>
-                      {broker.access_token ? '✓ Connected' : '⚠ Authentication Required'}
+                      {broker.token_status === 'valid'
+                        ? '✓ Connected'
+                        : broker.token_status === 'expired'
+                          ? '⚠ Token Expired'
+                          : '⚠ Authentication Required'}
                     </span>
                   </div>
 
                   <div className="space-y-2 text-sm text-gray-600">
-                    <p><strong>API Key:</strong> {broker.api_key.substring(0, 8)}...</p>
+                    <p><strong>API Key:</strong> {broker.api_key_preview || 'Hidden'}</p>
                     <p><strong>Added:</strong> {new Date(broker.created_at).toLocaleDateString()}</p>
                     {broker.last_used && (
                       <p><strong>Last Used:</strong> {new Date(broker.last_used).toLocaleString()}</p>
                     )}
+                    {broker.token_expiry && (
+                      <p><strong>Token Expiry:</strong> {new Date(broker.token_expiry).toLocaleString()}</p>
+                    )}
                   </div>
 
-                  {broker.broker_name.toLowerCase() === 'zerodha' && !broker.access_token && (
+                  {broker.broker_name.toLowerCase() === 'zerodha' && (broker.requires_reauth || !broker.has_access_token) && (
                     <div className="mt-4 bg-blue-50 border border-blue-200 rounded-lg p-3">
                       <p className="text-sm text-blue-800 mb-2">
-                        Complete Zerodha login to activate real-time trading
+                        {broker.token_status === 'expired'
+                          ? 'Your Zerodha token expired. Please reconnect.'
+                          : 'Complete Zerodha login to activate real-time trading'}
                       </p>
                       <button
                         onClick={() => handleZerodhaLogin(broker.id)}
                         className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700 transition"
                       >
-                        🔐 Login to Zerodha
+                        🔐 Reconnect Zerodha
                       </button>
                     </div>
                   )}
@@ -251,6 +264,21 @@ export default function BrokersPage() {
           ))
         )}
       </div>
+
+      {/* Auto Trading Engine Link - Only show if Zerodha is connected */}
+      {brokers.some(b => b.broker_name.toLowerCase() === 'zerodha' && b.token_status === 'valid') && (
+        <div className="mt-8 flex items-center">
+          <span className="mr-2">🤖</span>
+          <a
+            href="/autotrading"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-blue-600 hover:underline font-semibold"
+          >
+            Auto Trading Engine
+          </a>
+        </div>
+      )}
 
       {/* Instructions */}
       <div className="mt-8 bg-gray-50 rounded-lg p-6">

@@ -1,14 +1,20 @@
 import React, { useState, useEffect } from 'react';
+
+import { Routes, Route, useNavigate } from 'react-router-dom';
 import Dashboard from './Dashboard';
+import AutoTradingDashboard from './components/AutoTradingDashboard';
 import config from './config/api';
+import useTokenRefresh from './hooks/useTokenRefresh';
 import './App.css';
 import { Routes, Route } from 'react-router-dom';
 import ZerodhaCallbackPage from './pages/ZerodhaCallbackPage';
 
+
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [isLogin, setIsLogin] = useState(true);
-   const [pendingOtpUser, setPendingOtpUser] = useState('');
+  const [pendingOtpUser, setPendingOtpUser] = useState('');
+  const [otpMode, setOtpMode] = useState(null);
   const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
   const [mobile, setMobile] = useState('');
@@ -17,35 +23,25 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const navigate = useNavigate();
 
-  console.log('App rendering - isLoggedIn:', isLoggedIn, 'loading:', loading);
+  // 🔄 AUTO TOKEN REFRESH - Prevents login expiration every 5 minutes
+  useTokenRefresh();
 
-  // Check if user is already logged in when app mounts
   useEffect(() => {
-    console.log('App useEffect running');
     const token = localStorage.getItem('access_token');
-    console.log('Token found:', !!token);
+    console.log('[App] Checking auth token:', !!token);
     if (token) {
       setIsLoggedIn(true);
+      console.log('[App] User is logged in');
+    } else {
+      console.log('[App] No token found, showing login');
     }
     setLoading(false);
   }, []);
 
-  console.log('After useEffect - loading:', loading, 'isLoggedIn:', isLoggedIn);
-
-  if (loading) {
-    console.log('Rendering loading state');
-    return <div style={{ textAlign: 'center', padding: '50px' }}>Loading...</div>;
-  }
-
-  // Show dashboard if logged in
-  if (isLoggedIn) {
-    console.log('Rendering Dashboard');
-    return <Dashboard />;
-  }
-
-  console.log('Rendering login form');
-
+  console.log('[App] Rendering - isLoggedIn:', isLoggedIn, 'loading:', loading);
+  
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
@@ -84,11 +80,13 @@ export default function App() {
           // Force immediate re-render
           setTimeout(() => {
             setIsLoggedIn(true);
+            navigate('/');
           }, 100);
         } else {
           alert('✓ Registration successful! Enter the OTP sent to your email/mobile.');
           setPendingOtpUser(username);
           setOtp('');
+          setOtpMode('register');
           setIsLogin(false);
           setSubmitting(false);
           return;
@@ -96,6 +94,7 @@ export default function App() {
       } else if (response.status === 403 && data.detail && data.detail.toLowerCase().includes('otp')) {
         setPendingOtpUser(username);
         setOtp('');
+        setOtpMode('login');
         setError('Enter the OTP sent to your email/mobile to continue.');
         setSubmitting(false);
         return;
@@ -114,9 +113,18 @@ export default function App() {
     setError('');
     setSubmitting(true);
     try {
-      const response = await config.authFetch(config.endpoints.auth.verifyOtp || '/auth/verify-otp', {
+      const otpPayload = { username: pendingOtpUser || username, otp };
+      const otpEndpoint = otpMode === 'login'
+        ? config.endpoints.auth.login
+        : (config.endpoints.auth.verifyOtp || '/auth/verify-otp');
+
+      const response = await config.authFetch(otpEndpoint, {
         method: 'POST',
-        body: JSON.stringify({ username: pendingOtpUser || username, otp }),
+        body: JSON.stringify(
+          otpMode === 'login'
+            ? { ...otpPayload, password }
+            : otpPayload
+        ),
       });
 
       const data = await response.json();
@@ -124,6 +132,7 @@ export default function App() {
         localStorage.setItem('access_token', data.access_token);
         localStorage.setItem('refresh_token', data.refresh_token);
         setIsLoggedIn(true);
+        setOtpMode(null);
       } else {
         setError(data.detail || 'Invalid OTP');
       }

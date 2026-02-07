@@ -174,3 +174,21 @@ async def delete_user(
     db.commit()
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.delete("/brokers/{broker_id}", status_code=204)
+async def delete_broker(
+    broker_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(AuthService.get_current_user),
+):
+    _require_admin(current_user)
+
+    broker = db.query(BrokerCredential).filter(BrokerCredential.id == broker_id).first()
+    if not broker:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Broker credentials not found")
+
+    db.delete(broker)
+    db.commit()
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

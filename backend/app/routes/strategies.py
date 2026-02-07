@@ -1,190 +1,216 @@
+from datetime import datetime
+from typing import List
+
+import numpy as np
+import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from typing import List
+
 from app.auth.service import AuthService
-from app.models.schemas import StrategyCreate, StrategyResponse, BacktestRequest, BacktestResponse
-from app.models.auth import User
-from app.models.trading import Strategy, BacktestResult
 from app.core.database import get_db
-from app.strategies.base import StrategyFactory
+from app.engine.option_signal_generator import generate_signals_advanced, select_best_signal
+from app.models.auth import User
+from app.models.schemas import (
+    BacktestRequest,
+    BacktestResponse,
+    StrategyCreate,
+    StrategyResponse,
+)
+from app.models.trading import BacktestResult, Strategy
 from app.strategies.backtester import Backtester
-from app.core.logger import logger
-import pandas as pd
-from datetime import datetime
+from app.strategies.base import StrategyFactory
 
 router = APIRouter(prefix="/strategies", tags=["strategies"])
 
-@router.post("/", response_model=StrategyResponse)
-async def create_strategy(
-    strategy_data: StrategyCreate,
-    db: Session = Depends(get_db),
-    token: str = Depends(AuthService.verify_bearer_token)
+
+@router.get("/live/professional-signal")
+async def get_live_professional_signal(
+    current_user: User = Depends(AuthService.get_current_user),
 ):
-    """Create a new trading strategy"""
-    payload = AuthService.verify_token(token)
-    user_id = int(payload.get("sub"))
-    
+    """Return the same best live signal used by option signals and auto-trade analyze."""
+    signals = await generate_signals_advanced(user_id=getattr(current_user, "id", None))
+    best = select_best_signal(signals)
+    if not best:
+        raise HTTPException(status_code=503, detail="No live option signals available.")
+
+    action = (best.get("action") or "HOLD").lower()
+    return {
+        "symbol": best.get("symbol"),
+        "signal": action,
+        "entry_price": best.get("entry_price"),
+        "stop_loss": best.get("stop_loss"),
+        "target": best.get("target"),
+        "index": best.get("index"),
+        "option_type": best.get("option_type"),
+        "source": "zerodha_option_chain",
+    }
+
+
+@router.post("/", response_model=StrategyResponse)
+def create_strategy(
+    payload: StrategyCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(AuthService.get_current_user),
+):
     strategy = Strategy(
-        user_id=user_id,
-        name=strategy_data.name,
-        description=strategy_data.description,
-        strategy_type=strategy_data.strategy_type,
-        parameters=strategy_data.parameters
+        user_id=current_user.id,
+        name=payload.name,
+        description=payload.description,
+        strategy_type=payload.strategy_type,
+        parameters=payload.parameters,
+        status="inactive",
+        is_live=False,
     )
     db.add(strategy)
     db.commit()
     db.refresh(strategy)
     return strategy
 
+
 @router.get("/", response_model=List[StrategyResponse])
-async def list_strategies(
+def list_strategies(
     db: Session = Depends(get_db),
-    token: str = Depends(AuthService.verify_bearer_token)
+    current_user: User = Depends(AuthService.get_current_user),
 ):
-    """List all strategies for current user"""
-    payload = AuthService.verify_token(token)
-    user_id = int(payload.get("sub"))
-    
-    strategies = db.query(Strategy).filter(Strategy.user_id == user_id).all()
-    return strategies
+    return (
+        db.query(Strategy)
+        .filter(Strategy.user_id == current_user.id)
+        .order_by(Strategy.created_at.desc())
+        .all()
+    )
+
 
 @router.get("/{strategy_id}", response_model=StrategyResponse)
-async def get_strategy(
+def get_strategy(
     strategy_id: int,
     db: Session = Depends(get_db),
-    token: str = Depends(AuthService.verify_bearer_token)
+    current_user: User = Depends(AuthService.get_current_user),
 ):
-    """Get strategy details"""
-    payload = AuthService.verify_token(token)
-    user_id = int(payload.get("sub"))
-    
-    strategy = db.query(Strategy).filter(
-        (Strategy.id == strategy_id) & (Strategy.user_id == user_id)
-    ).first()
-    
+    strategy = (
+        db.query(Strategy)
+        .filter(Strategy.id == strategy_id, Strategy.user_id == current_user.id)
+        .first()
+    )
     if not strategy:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    
+        raise HTTPException(status_code=404, detail="Strategy not found")
     return strategy
 
-@router.post("/{strategy_id}/backtest", response_model=BacktestResponse)
-async def backtest_strategy(
-    strategy_id: int,
-    backtest_req: BacktestRequest,
-    db: Session = Depends(get_db),
-    token: str = Depends(AuthService.verify_bearer_token)
-):
-    """Backtest a strategy"""
-    payload = AuthService.verify_token(token)
-    user_id = int(payload.get("sub"))
-    
-    strategy = db.query(Strategy).filter(
-        (Strategy.id == strategy_id) & (Strategy.user_id == user_id)
-    ).first()
-    
-    if not strategy:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    
-    try:
-        # Create strategy instance
-        strat = StrategyFactory.create_strategy(
-            strategy.strategy_type,
-            strategy.parameters
-        )
-        
-        # Create sample data (in production, fetch from data provider)
-        # This is a placeholder - replace with actual historical data
-        dates = pd.date_range(start=backtest_req.start_date, end=backtest_req.end_date)
-        data = pd.DataFrame({
-            "open": [100 + i*0.1 for i in range(len(dates))],
-            "high": [101 + i*0.1 for i in range(len(dates))],
-            "low": [99 + i*0.1 for i in range(len(dates))],
-            "close": [100.5 + i*0.1 for i in range(len(dates))],
-            "volume": [1000000] * len(dates)
-        }, index=dates)
-        
-        # Run backtest
-        backtester = Backtester(strat, backtest_req.initial_capital)
-        metrics = backtester.backtest(data)
-        
-        # Store results
-        result = BacktestResult(
-            strategy_id=strategy_id,
-            user_id=user_id,
-            total_return=metrics.total_return,
-            sharpe_ratio=metrics.sharpe_ratio,
-            max_drawdown=metrics.max_drawdown,
-            win_rate=metrics.win_rate,
-            total_trades=metrics.total_trades,
-            results_data={
-                "annual_return": metrics.annual_return,
-                "winning_trades": metrics.winning_trades,
-                "losing_trades": metrics.losing_trades,
-                "avg_win": metrics.avg_win,
-                "avg_loss": metrics.avg_loss,
-                "profit_factor": metrics.profit_factor
-            }
-        )
-        
-        db.add(result)
-        db.commit()
-        db.refresh(result)
-        
-        logger.log_trade({
-            "strategy": strategy.name,
-            "backtest": "completed",
-            "total_return": metrics.total_return
-        })
-        
-        return result
-    except Exception as e:
-        logger.log_error("Backtest failed", {"error": str(e)})
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 @router.put("/{strategy_id}", response_model=StrategyResponse)
-async def update_strategy(
+def update_strategy(
     strategy_id: int,
-    strategy_data: StrategyCreate,
+    payload: StrategyCreate,
     db: Session = Depends(get_db),
-    token: str = Depends(AuthService.verify_bearer_token)
+    current_user: User = Depends(AuthService.get_current_user),
 ):
-    """Update strategy"""
-    payload = AuthService.verify_token(token)
-    user_id = int(payload.get("sub"))
-    
-    strategy = db.query(Strategy).filter(
-        (Strategy.id == strategy_id) & (Strategy.user_id == user_id)
-    ).first()
-    
+    strategy = (
+        db.query(Strategy)
+        .filter(Strategy.id == strategy_id, Strategy.user_id == current_user.id)
+        .first()
+    )
     if not strategy:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    
-    strategy.name = strategy_data.name
-    strategy.description = strategy_data.description
-    strategy.parameters = strategy_data.parameters
-    strategy.updated_at = datetime.utcnow()
-    
+        raise HTTPException(status_code=404, detail="Strategy not found")
+
+    strategy.name = payload.name
+    strategy.description = payload.description
+    strategy.strategy_type = payload.strategy_type
+    strategy.parameters = payload.parameters
     db.commit()
     db.refresh(strategy)
     return strategy
 
+
 @router.delete("/{strategy_id}")
-async def delete_strategy(
+def delete_strategy(
     strategy_id: int,
     db: Session = Depends(get_db),
-    token: str = Depends(AuthService.verify_bearer_token)
+    current_user: User = Depends(AuthService.get_current_user),
 ):
-    """Delete strategy"""
-    payload = AuthService.verify_token(token)
-    user_id = int(payload.get("sub"))
-    
-    strategy = db.query(Strategy).filter(
-        (Strategy.id == strategy_id) & (Strategy.user_id == user_id)
-    ).first()
-    
+    strategy = (
+        db.query(Strategy)
+        .filter(Strategy.id == strategy_id, Strategy.user_id == current_user.id)
+        .first()
+    )
     if not strategy:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    
+        raise HTTPException(status_code=404, detail="Strategy not found")
+
     db.delete(strategy)
     db.commit()
     return {"message": "Strategy deleted"}
+
+
+@router.post(
+    "/{strategy_id}/backtest",
+    response_model=BacktestResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def backtest_strategy(
+    strategy_id: int,
+    payload: BacktestRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(AuthService.get_current_user),
+):
+    strategy = (
+        db.query(Strategy)
+        .filter(Strategy.id == strategy_id, Strategy.user_id == current_user.id)
+        .first()
+    )
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+
+    try:
+        strat = StrategyFactory.create_strategy(strategy.strategy_type, strategy.parameters)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # Generate a simple synthetic OHLC dataset for backtest window
+    try:
+        start = pd.to_datetime(payload.start_date)
+        end = pd.to_datetime(payload.end_date)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid date range")
+
+    if start >= end:
+        raise HTTPException(status_code=400, detail="Invalid date range")
+
+    dates = pd.date_range(start=start, end=end, freq="D")
+    if len(dates) < 10:
+        raise HTTPException(status_code=400, detail="Backtest range too short")
+
+    prices = 100 + np.cumsum(np.random.normal(0, 1, len(dates)))
+    data = pd.DataFrame(
+        {
+            "open": prices + np.random.normal(0, 0.5, len(dates)),
+            "high": prices + np.random.normal(0.5, 0.5, len(dates)),
+            "low": prices - np.random.normal(0.5, 0.5, len(dates)),
+            "close": prices,
+            "volume": np.random.randint(1000, 5000, len(dates)),
+        },
+        index=dates,
+    )
+
+    backtester = Backtester(strat, initial_capital=payload.initial_capital)
+    metrics = backtester.backtest(data, symbol=strategy.name)
+
+    result = BacktestResult(
+        strategy_id=strategy.id,
+        user_id=current_user.id,
+        total_return=metrics.total_return,
+        sharpe_ratio=metrics.sharpe_ratio,
+        max_drawdown=metrics.max_drawdown,
+        win_rate=metrics.win_rate,
+        total_trades=metrics.total_trades,
+        results_data={"trades": metrics.trades},
+        created_at=datetime.utcnow(),
+    )
+    db.add(result)
+    db.commit()
+
+    return {
+        "total_return": metrics.total_return,
+        "sharpe_ratio": metrics.sharpe_ratio,
+        "max_drawdown": metrics.max_drawdown,
+        "win_rate": metrics.win_rate,
+        "total_trades": metrics.total_trades,
+        "created_at": result.created_at,
+    }

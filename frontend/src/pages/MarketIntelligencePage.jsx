@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import config from '../config/api';
 
-const REFRESH_INTERVAL_MS = 1000; // 1 second auto-refresh cadence
+const REFRESH_INTERVAL_MS = 5000; // 5 second auto-refresh cadence
 
 const MarketIntelligencePage = () => {
   const [sentiment, setSentiment] = useState(null);

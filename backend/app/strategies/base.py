@@ -209,20 +209,118 @@ class MomentumStrategy(Strategy):
             strength=0
         )
 
+
+# --- Import the professional strategy ---
+from app.strategies.intraday_professional import generate_signals as professional_generate_signals
+
+class IntradayProfessionalStrategy(Strategy):
+    """Professional Intraday Strategy Wrapper for API integration"""
+    def __init__(self, parameters: Dict[str, Any]):
+        super().__init__("Intraday Professional", parameters)
+        self.capital = parameters.get("capital", 100000)
+        self.data = None
+
+    def validate_data(self, data: pd.DataFrame) -> bool:
+        required_cols = ["open", "high", "low", "close", "volume"]
+        return all(col in data.columns for col in required_cols)
+
+    def generate_signal(self, data: pd.DataFrame) -> Signal:
+        self.data = professional_generate_signals(data, self.capital)
+        df = self.data  # Use the enriched dataframe
+        
+        # Find the last non-empty signal
+        signals_df = df[df['Signal'] != '']
+        
+        if not signals_df.empty:
+            last_row = signals_df.iloc[-1]
+            signal_idx = signals_df.index[-1]
+            current_idx = df.index[-1]
+            
+            # If signal is very recent (within last 5 candles), use it
+            if current_idx - signal_idx <= 5:
+                action = last_row['Signal'].lower()
+                if 'long' in action:
+                    action = 'buy'
+                elif 'short' in action:
+                    action = 'sell'
+                elif 'exit' in action:
+                    action = 'hold'
+                    
+                return Signal(
+                    timestamp=datetime.now(),
+                    symbol=self.parameters.get('symbol', ''),
+                    action=action,
+                    strength=1.0,
+                    entry_price=df['close'].iloc[-1],
+                    stop_loss=df['Supertrend'].iloc[-1] if 'Supertrend' in df.columns else None,
+                    take_profit=None
+                )
+        
+        # No recent signal - determine current market bias
+        last_row = df.iloc[-1]
+        price = last_row['close']
+        ema9 = last_row['EMA9']
+        ema21 = last_row['EMA21']
+        rsi = last_row['RSI']
+        macd_hist = last_row['MACD_hist']
+        vwap = last_row['VWAP']
+        
+        # Count bullish/bearish indicators
+        bullish_count = 0
+        bearish_count = 0
+        
+        if price > vwap:
+            bullish_count += 1
+        else:
+            bearish_count += 1
+            
+        if ema9 > ema21:
+            bullish_count += 1
+        else:
+            bearish_count += 1
+            
+        if macd_hist > 0:
+            bullish_count += 1
+        else:
+            bearish_count += 1
+            
+        if rsi > 50:
+            bullish_count += 1
+        elif rsi < 50:
+            bearish_count += 1
+        
+        # Determine action based on majority
+        if bullish_count >= 3:
+            action = 'buy'
+            strength = bullish_count / 4.0
+        elif bearish_count >= 3:
+            action = 'sell'
+            strength = bearish_count / 4.0
+        else:
+            action = 'hold'
+            strength = 0
+        
+        return Signal(
+            timestamp=datetime.now(),
+            symbol=self.parameters.get('symbol', ''),
+            action=action,
+            strength=strength,
+            entry_price=price,
+            stop_loss=last_row['Supertrend'] if 'Supertrend' in df.columns else None,
+            take_profit=None
+        )
+
 class StrategyFactory:
     """Factory for creating strategy instances"""
-    
     _strategies = {
         "ma_crossover": MovingAverageCrossover,
         "rsi": RSIStrategy,
-        "momentum": MomentumStrategy
+        "momentum": MomentumStrategy,
+        "intraday_professional": IntradayProfessionalStrategy
     }
-    
     @classmethod
     def create_strategy(cls, strategy_type: str, parameters: Dict[str, Any]) -> Strategy:
-        """Create strategy instance"""
         strategy_class = cls._strategies.get(strategy_type.lower())
         if not strategy_class:
             raise ValueError(f"Unknown strategy: {strategy_type}")
-        
         return strategy_class(parameters)

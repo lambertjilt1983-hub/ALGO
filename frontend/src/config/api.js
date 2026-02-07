@@ -75,10 +75,12 @@ export const config = {
       analyze: '/autotrade/analyze',
       execute: '/autotrade/execute',
       activeTrades: '/autotrade/trades/active',
+      closeTrade: '/autotrade/trades/close',
       tradeHistory: '/autotrade/trades/history',
       report: '/autotrade/report',
       liveIndices: '/autotrade/market/indices',
       monitor: '/autotrade/monitor',
+      resetDailyLoss: '/autotrade/reset_daily_loss',
     },
 
     // Admin
@@ -86,6 +88,7 @@ export const config = {
       overview: '/admin/overview',
       updateUser: (id) => `/admin/users/${id}`,
       deleteUser: (id) => `/admin/users/${id}`,
+      deleteBroker: (id) => `/admin/brokers/${id}`,
     },
   },
   

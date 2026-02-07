@@ -27,7 +27,12 @@ async def start_auto_close_trades():
 """Auto Trading Engine wired to live market data (no mocks)."""
 
 import math
-from datetime import datetime, timedelta
+import time
+import asyncio
+import re
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta, time as dt_time
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -37,9 +42,15 @@ from app.routes.option_chain_utils import get_option_chain
 
 from app.strategies.ai_model import ai_model
 from app.strategies.market_intelligence import trend_analyzer
+from app.engine.option_signal_generator import generate_signals, select_best_signal, _get_kite
+from app.engine.paper_trade_updater import _quote_symbol
 from app.core.database import SessionLocal
 from app.models.trading import TradeReport
 from sqlalchemy import func
+from app.engine.auto_trading_engine import AutoTradingEngine
+from app.engine.zerodha_broker import ZerodhaBroker
+from app.engine.simple_momentum_strategy import SimpleMomentumStrategy
+from app.core.market_hours import ist_now, is_market_open
 
 
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
@@ -69,30 +80,56 @@ MIN_WIN_SAMPLE = 8          # minimum closed trades before applying win-rate gat
 
 # Risk controls (can be made configurable later)
 risk_config = {
-    "max_daily_loss": 5000.0,         # hard stop on daily drawdown
-    "max_position_pct": 0.15,         # 15% per position so a single options lot fits on 100k balance
-    "max_portfolio_pct": 0.45,        # allow multiple lots while keeping portfolio cap
-    "cooldown_minutes": 5,            # cooldown after a stop (placeholder)
-    "min_momentum_pct": 0.05,         # very low floor so quiet sessions still signal
+    "max_daily_loss": 5000.0,        # ₹5000 max daily loss (hardstop to protect capital)
+    "max_daily_profit": 10000.0,     # ₹10000 daily profit target (auto-stop at profit)
+    "max_per_trade_loss": 600.0,     # ₹600 max loss per trade (prevent single trade disaster)
+    "max_consecutive_losses": 0,     # NO consecutive loss limit - immediate loss checking
+    "max_position_pct": 0.10,        # 10% max per position
+    "max_portfolio_pct": 0.10,       # 10% total exposure
+    "cooldown_minutes": 0,           # NO COOLDOWN - trade immediately if conditions met
+    "symbol_cooldown_minutes": 10,   # Cooldown after SL on same symbol/root
+    "min_momentum_pct": 0.5,         # Very strong momentum (0.5%) - avoid weak entries
+    "min_trend_strength": 0.8,       # HIGH trend strength (80%) required - quality only
+    "require_trend_confirmation": True,  # STRICT: Confirm trend before entry
+    "min_win_rate_threshold": 0.70,  # Only trade if win rate > 70%
+    "avoid_high_volatility": True,   # Skip trades in extremely volatile markets
 }
 
 trade_window = {
-    "start": (9, 20),   # HH, MM local server time
-    "end": (15, 20),    # HH, MM local server time
+    "start": (9, 15),   # HH, MM IST
+    "end": (15, 29),    # HH, MM IST (exit before close)
 }
 
 trail_config = {
     "enabled": True,
-    "trigger_pct": 0.2,   # start trailing earlier to lock gains
-    "step_pct": 0.1,      # move stop every additional +0.1% move
-    "buffer_pct": 0.05,   # keep a small buffer from entry when arming
+    "trigger_pct": 0.3,   # Start trailing at 0.3% profit to lock in gains
+    "step_pct": 0.15,     # Move stop every additional +0.15% move (wider steps)
+    "buffer_pct": 0.1,    # Keep 0.1% buffer to avoid premature exits
 }
-BREAKEVEN_TRIGGER_PCT = 0.2  # move stop to breakeven once price moves this much in favor
+BREAKEVEN_TRIGGER_PCT = 0.4  # Move stop to breakeven at 0.4% profit (lock in gains earlier)
 
-state = {"is_demo_mode": False, "live_armed": True, "daily_loss": 0.0, "daily_date": datetime.now().date()}
+state = {
+    "is_demo_mode": False,
+    "live_armed": True,
+    "daily_loss": 0.0,
+    "daily_profit": 0.0,  # NEW: Track daily profit
+    "daily_date": ist_now().date(),
+    "consecutive_losses": 0,
+    "last_loss_time": None,
+    "trading_paused": False,  # NEW: Pause if profit/loss limits hit
+    "pause_reason": None,  # NEW: Why trading is paused
+    "symbol_cooldowns": {},  # Track recent exits to avoid immediate re-entry
+}
 active_trades: List[Dict] = []
 history: List[Dict] = []
 broker_logs: List[Dict] = []
+live_price_cache: Dict[str, float] = {}
+live_update_state = {
+    "failure_count": 0,
+    "backoff_until": 0.0,
+    "last_duration": 0.0,
+}
+execute_lock = asyncio.Lock()
 
 # --- ADMIN/DEBUG: Manual reset endpoint ---
 from fastapi import Response
@@ -108,14 +145,100 @@ async def reset_state(authorization: Optional[str] = Header(None)):
 
 
 def _now() -> str:
-    return datetime.now().isoformat()
+    return ist_now().isoformat()
+
+
+def _symbol_root(symbol: str | None) -> str | None:
+    if not symbol:
+        return None
+    match = re.match(r"^([A-Z]+)", symbol.upper())
+    return match.group(1) if match else symbol.upper()
+
+
+def _option_kind(symbol: str | None) -> str | None:
+    if not symbol:
+        return None
+    upper = symbol.upper()
+    if upper.endswith("CE"):
+        return "CE"
+    if upper.endswith("PE"):
+        return "PE"
+    return None
+
+
+def _best_signal_by_quality(signals: List[Dict]) -> Optional[Dict]:
+    if not signals:
+        return None
+    return max(signals, key=lambda s: (s.get("quality_score", 0), s.get("confidence", 0)))
+
+
+def _best_signals_by_kind(signals: List[Dict]) -> Dict[str, Dict]:
+    best: Dict[str, Dict] = {}
+    for kind in ("CE", "PE"):
+        candidates = [s for s in signals if _option_kind(s.get("symbol")) == kind]
+        if candidates:
+            best[kind] = _best_signal_by_quality(candidates)
+    return best
+
+
+def _apply_fixed_option_levels(signal: Dict) -> Dict:
+    kind = _option_kind(signal.get("symbol"))
+    if not kind:
+        return signal
+    entry = float(signal.get("entry_price") or 0)
+    action = (signal.get("action") or "BUY").upper()
+    if entry <= 0:
+        return signal
+    stop_move = entry * (STOP_PCT_OPTIONS / 100)
+    if action == "SELL":
+        target = entry - TARGET_POINTS
+        stop_loss = entry + stop_move
+    else:
+        target = entry + TARGET_POINTS
+        stop_loss = entry - stop_move
+    qty = int(signal.get("quantity") or 1)
+    signal["target"] = round(target, 2)
+    signal["stop_loss"] = round(stop_loss, 2)
+    signal["target_points"] = float(TARGET_POINTS)
+    signal["potential_profit"] = round(abs(target - entry) * qty, 2)
+    signal["risk"] = round(abs(entry - stop_loss) * qty, 2)
+    return signal
+
+
+def _pnl_for_trade(trade: Dict[str, Any], price: float) -> float:
+    qty = trade.get("quantity", 0) or 0
+    side = trade.get("side", "BUY").upper()
+    entry = trade.get("price", 0.0) or 0.0
+    pnl = (price - entry) * qty
+    return pnl if side == "BUY" else -pnl
+
+
+def _should_exit_by_currency(trade: Dict[str, Any], price: float) -> str | None:
+    kind = _option_kind(trade.get("symbol"))
+    if not kind:
+        return None
+    pnl = _pnl_for_trade(trade, price)
+    peak_pnl = float(trade.get("peak_pnl") or pnl)
+    trade["peak_pnl"] = max(peak_pnl, pnl)
+    if kind == "CE":
+        # Exit if we hit profit >= threshold and then fall back below it.
+        if trade.get("peak_pnl", 0) >= PROFIT_EXIT_AMOUNT and pnl <= PROFIT_EXIT_AMOUNT and trade.get("peak_pnl", 0) > pnl:
+            return "PROFIT_TRAIL"
+    if kind == "PE" and pnl <= -LOSS_CAP_AMOUNT:
+        return "LOSS_CAP"
+    return None
 
 
 def _reset_daily_if_needed():
-    today = datetime.now().date()
+    today = ist_now().date()
     if state.get("daily_date") != today:
         state["daily_date"] = today
         state["daily_loss"] = 0.0
+        state["daily_profit"] = 0.0  # Reset daily profit
+        state["consecutive_losses"] = 0
+        state["last_loss_time"] = None
+        state["trading_paused"] = False  # Reset pause flag
+        state["pause_reason"] = None
 
 
 def _recent_win_rate(limit: int = 20) -> Tuple[float, int]:
@@ -145,12 +268,206 @@ def _capital_in_use() -> float:
 
 
 def _within_trade_window() -> bool:
-    now = datetime.now()
     start_h, start_m = trade_window["start"]
     end_h, end_m = trade_window["end"]
-    start = now.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
-    end = now.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
-    return start <= now <= end
+    start = dt_time(start_h, start_m)
+    end = dt_time(end_h, end_m)
+    return is_market_open(start, end)
+
+
+def _analyze_trend_strength(symbol: str) -> Dict[str, float]:
+    """
+    Advanced AI-based trend analysis with multiple indicators
+    Returns trend strength score (0-1) and directional bias
+    """
+    try:
+        import yfinance as yf
+        import pandas as pd
+        import numpy as np
+        
+        # Fetch multi-timeframe data for comprehensive analysis
+        ticker = yf.Ticker(symbol)
+        df_5m = ticker.history(period="1d", interval="5m")
+        df_15m = ticker.history(period="5d", interval="15m")
+        df_1h = ticker.history(period="1mo", interval="1h")
+        
+        if df_5m.empty or df_15m.empty or df_1h.empty:
+            return {"strength": 0.0, "direction": 0, "quality": "poor"}
+        
+        scores = []
+        
+        # 1. Moving Average Alignment (30% weight)
+        for df, weight in [(df_5m, 0.3), (df_15m, 0.4), (df_1h, 0.3)]:
+            if len(df) < 20:
+                continue
+            df['MA5'] = df['Close'].rolling(5).mean()
+            df['MA10'] = df['Close'].rolling(10).mean()
+            df['MA20'] = df['Close'].rolling(20).mean()
+            
+            last = df.iloc[-1]
+            # Check alignment: MA5 > MA10 > MA20 (bullish) or reverse (bearish)
+            if last['Close'] > last['MA5'] > last['MA10'] > last['MA20']:
+                scores.append(weight * 1.0)  # Strong bullish alignment
+            elif last['Close'] < last['MA5'] < last['MA10'] < last['MA20']:
+                scores.append(weight * 1.0)  # Strong bearish alignment
+            elif last['Close'] > last['MA5'] > last['MA10']:
+                scores.append(weight * 0.7)  # Moderate bullish
+            elif last['Close'] < last['MA5'] < last['MA10']:
+                scores.append(weight * 0.7)  # Moderate bearish
+            else:
+                scores.append(0.0)  # Mixed/choppy
+        
+        # 2. RSI Momentum (20% weight)
+        df_close = df_5m['Close']
+        delta = df_close.diff()
+        gain = delta.where(delta > 0, 0).rolling(14).mean()
+        loss = -delta.where(delta < 0, 0).rolling(14).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        last_rsi = rsi.iloc[-1]
+        
+        # RSI between 40-60 = weak/choppy, >70 or <30 = strong trend
+        if last_rsi > 70 or last_rsi < 30:
+            scores.append(0.2 * 1.0)  # Strong momentum
+        elif last_rsi > 60 or last_rsi < 40:
+            scores.append(0.2 * 0.6)  # Moderate
+        else:
+            scores.append(0.0)  # Neutral/choppy
+        
+        # 3. Volume Confirmation (20% weight)
+        avg_vol = df_5m['Volume'].rolling(20).mean().iloc[-1]
+        recent_vol = df_5m['Volume'].iloc[-5:].mean()
+        if recent_vol > avg_vol * 1.2:
+            scores.append(0.2 * 1.0)  # Strong volume surge
+        elif recent_vol > avg_vol:
+            scores.append(0.2 * 0.5)  # Moderate volume
+        else:
+            scores.append(0.0)  # Weak volume
+        
+        # 4. Price Action Consistency (30% weight)
+        last_5_candles = df_5m.iloc[-5:]
+        bullish_candles = sum(1 for _, row in last_5_candles.iterrows() if row['Close'] > row['Open'])
+        bearish_candles = 5 - bullish_candles
+        
+        if bullish_candles >= 4:
+            scores.append(0.3 * 1.0)  # Strong bullish consistency
+        elif bearish_candles >= 4:
+            scores.append(0.3 * 1.0)  # Strong bearish consistency
+        elif bullish_candles == 3:
+            scores.append(0.3 * 0.6)  # Moderate bullish
+        elif bearish_candles == 3:
+            scores.append(0.3 * 0.6)  # Moderate bearish
+        else:
+            scores.append(0.0)  # Choppy/mixed
+        
+        # Compute final strength score
+        total_strength = sum(scores)
+        
+        # Determine direction
+        current_price = df_5m['Close'].iloc[-1]
+        ma20_5m = df_5m['Close'].rolling(20).mean().iloc[-1]
+        direction = 1 if current_price > ma20_5m else -1
+        
+        # Quality assessment
+        if total_strength >= 0.7:
+            quality = "excellent"
+        elif total_strength >= 0.5:
+            quality = "good"
+        elif total_strength >= 0.3:
+            quality = "fair"
+        else:
+            quality = "poor"
+        
+        return {
+            "strength": round(total_strength, 2),
+            "direction": direction,
+            "quality": quality,
+            "rsi": round(last_rsi, 2),
+            "volume_ratio": round(recent_vol / avg_vol, 2) if avg_vol > 0 else 0
+        }
+    
+    except Exception as e:
+        print(f"[TREND ANALYSIS ERROR] {symbol}: {e}")
+        return {"strength": 0.0, "direction": 0, "quality": "error"}
+
+
+def _detect_market_regime(symbol: str) -> Dict[str, any]:
+    """
+    AI-based market regime detection to determine optimal trading conditions
+    Identifies: TRENDING, RANGING, VOLATILE, QUIET
+    """
+    try:
+        import yfinance as yf
+        import numpy as np
+        
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period="5d", interval="5m")
+        
+        if df.empty or len(df) < 50:
+            return {"regime": "UNKNOWN", "score": 0.0, "tradeable": False}
+        
+        # Calculate ATR (Average True Range) for volatility
+        high_low = df['High'] - df['Low']
+        high_close = abs(df['High'] - df['Close'].shift())
+        low_close = abs(df['Low'] - df['Close'].shift())
+        true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        atr = true_range.rolling(14).mean().iloc[-1]
+        avg_price = df['Close'].iloc[-1]
+        atr_pct = (atr / avg_price) * 100
+        
+        # Calculate ADX (Average Directional Index) for trend strength
+        high = df['High']
+        low = df['Low']
+        close = df['Close']
+        
+        plus_dm = high.diff()
+        minus_dm = -low.diff()
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm < 0] = 0
+        
+        tr = true_range
+        atr_14 = tr.rolling(14).mean()
+        
+        plus_di = 100 * (plus_dm.rolling(14).mean() / atr_14)
+        minus_di = 100 * (minus_dm.rolling(14).mean() / atr_14)
+        
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+        adx = dx.rolling(14).mean().iloc[-1]
+        
+        # Detect regime
+        regime = "UNKNOWN"
+        tradeable = False
+        score = 0.0
+        
+        if adx > 25 and atr_pct > 0.3:
+            regime = "TRENDING"
+            tradeable = True  # Best for our strategy
+            score = min(1.0, adx / 40)
+        elif adx < 20 and atr_pct < 0.2:
+            regime = "RANGING"
+            tradeable = False  # Avoid choppy markets
+            score = 0.2
+        elif atr_pct > 0.5:
+            regime = "VOLATILE"
+            tradeable = False  # Too risky for 10-point stops
+            score = 0.1
+        else:
+            regime = "QUIET"
+            tradeable = False  # Not enough momentum
+            score = 0.3
+        
+        return {
+            "regime": regime,
+            "adx": round(adx, 2),
+            "atr_pct": round(atr_pct, 3),
+            "tradeable": tradeable,
+            "score": round(score, 2),
+            "recommendation": "ENTER" if tradeable and score > 0.6 else "WAIT"
+        }
+    
+    except Exception as e:
+        print(f"[REGIME DETECTION ERROR] {symbol}: {e}")
+        return {"regime": "ERROR", "score": 0.0, "tradeable": False}
 
 
 @router.post("/toggle")
@@ -236,14 +553,39 @@ def _close_trade(trade: Dict[str, any], exit_price: float) -> None:
     side = trade.get("side", "BUY").upper()
     entry = trade.get("price", 0.0)
     pnl = (exit_price - entry) * qty * (1 if side == "BUY" else -1)
+    pnl_percentage = (pnl / (entry * qty) * 100) if entry and qty else 0.0
+    exit_dt = datetime.utcnow()
     trade.update({
         "status": "CLOSED",
         "exit_price": exit_price,
-        "exit_time": _now(),
+        "exit_time": exit_dt.isoformat(),
         "pnl": round(pnl, 2),
+        "pnl_percentage": round(pnl_percentage, 2),
     })
+    root = _symbol_root(trade.get("symbol") or trade.get("index"))
+    if root:
+        state.setdefault("symbol_cooldowns", {})[root] = {
+            "status": trade.get("status"),
+            "exit_time": exit_dt.isoformat(),
+        }
     history.append(trade.copy())
+    
+    # Track daily P&L (both loss and profit)
     state["daily_loss"] += pnl
+    state["daily_profit"] = state.get("daily_profit", 0.0) + max(0, pnl)  # Track only wins
+    
+    print(f"\n[TRADE CLOSED] P&L: ₹{pnl:.2f}")
+    print(f"  Daily Loss: ₹{state['daily_loss']:.2f} / ₹{risk_config['max_daily_loss']}")
+    print(f"  Daily Profit: ₹{state['daily_profit']:.2f} / ₹{risk_config['max_daily_profit']}")
+    
+    # Track consecutive losses for risk management (NO COOLDOWN - just log)
+    if pnl < 0:
+        state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
+        state["last_loss_time"] = datetime.now()
+        print(f"  ⚠️ Consecutive losses: {state['consecutive_losses']}")
+    else:
+        state["consecutive_losses"] = 0
+        print(f"  ✅ Win! Resetting consecutive loss counter")
 
     # Persist closed trade to database for reporting
     try:
@@ -257,7 +599,7 @@ def _close_trade(trade: Dict[str, any], exit_price: float) -> None:
             entry_price=entry,
             exit_price=exit_price,
             pnl=round(pnl, 2),
-            pnl_percentage=trade.get("profit_percentage") or trade.get("pnl_percent"),
+            pnl_percentage=round(pnl_percentage, 2),
             strategy=trade.get("strategy") or trade.get("strategy_name"),
             status=trade.get("status") or "CLOSED",
             entry_time=entry_dt,
@@ -276,16 +618,76 @@ def _close_trade(trade: Dict[str, any], exit_price: float) -> None:
             pass
 
 
+def close_all_active_trades(reason: str = "Market close") -> int:
+    """Force-close all open active trades with a market exit order."""
+    if not active_trades:
+        return 0
+
+    closed_count = 0
+    for trade in list(active_trades):
+        if trade.get("status") != "OPEN":
+            continue
+
+        symbol = trade.get("symbol")
+        qty = int(trade.get("quantity") or 0)
+        side = (trade.get("side") or "BUY").upper()
+        exit_side = "SELL" if side == "BUY" else "BUY"
+        exchange = trade.get("exchange") or "NFO"
+        product = trade.get("product") or "MIS"
+        exit_price = trade.get("current_price") or trade.get("price") or 0.0
+
+        if not symbol or qty <= 0:
+            continue
+
+        exit_order = place_zerodha_order(
+            symbol=symbol,
+            quantity=qty,
+            side=exit_side,
+            order_type="MARKET",
+            product=product,
+            exchange=exchange,
+        )
+
+        if exit_order.get("success"):
+            trade["exit_reason"] = reason
+            trade["exit_order_id"] = exit_order.get("order_id")
+            _close_trade(trade, exit_price)
+            closed_count += 1
+        else:
+            trade["exit_error"] = exit_order.get("error")
+
+    if closed_count > 0:
+        active_trades[:] = [t for t in active_trades if t.get("status") == "OPEN"]
+
+    return closed_count
+
+
 def _stop_hit(trade: Dict[str, any], price: float) -> bool:
+    """Check if stop loss is hit, with emergency stop buffer to prevent slippage losses"""
     side = trade.get("side", "BUY").upper()
     stop_loss = trade.get("stop_loss")
     trail_stop = trade.get("trail_stop") if trade.get("trail_active") else None
     if stop_loss is None:
         return False
+    
     effective_stop = trail_stop if trail_stop is not None else stop_loss
+    entry_price = trade.get("price", 0)
+    
+    # Calculate emergency stop (slightly before actual stop to prevent slippage)
+    if entry_price > 0:
+        stop_distance = abs(entry_price - effective_stop)
+        emergency_distance = stop_distance * EMERGENCY_STOP_MULTIPLIER
+        if side == "BUY":
+            emergency_stop = entry_price - emergency_distance
+        else:
+            emergency_stop = entry_price + emergency_distance
+    else:
+        emergency_stop = effective_stop
+    
+    # Check emergency stop first (tighter), then regular stop
     if side == "BUY":
-        return price <= effective_stop
-    return price >= effective_stop
+        return price <= emergency_stop or price <= effective_stop
+    return price >= emergency_stop or price >= effective_stop
 
 
 def _calc_weekly_expiry(today: datetime) -> datetime:
@@ -484,7 +886,19 @@ async def _live_signals(symbols: List[str], instrument_type: str, qty_override: 
 
 def _build_demo_trades(signals: List[Dict]) -> None:
     demo_trades.clear()
-    for idx, sig in enumerate(signals[:2], 1):
+    best_by_kind = _best_signals_by_kind(signals)
+    preferred = []
+    if best_by_kind.get("CE"):
+        preferred.append(best_by_kind["CE"])
+    if best_by_kind.get("PE"):
+        preferred.append(best_by_kind["PE"])
+    if len(preferred) < 2:
+        for sig in signals:
+            if sig not in preferred:
+                preferred.append(sig)
+            if len(preferred) >= 2:
+                break
+    for idx, sig in enumerate(preferred[:2], 1):
         qty = sig["quantity"]
         current_price = sig["entry_price"]
         pnl = (current_price - sig["entry_price"]) * qty
@@ -549,6 +963,12 @@ async def status(authorization: Optional[str] = Header(None)):
         "win_rate": round(win_rate * 100, 2),
         "win_sample": win_sample,
         "daily_pnl": state.get("daily_loss", 0.0),
+        "daily_loss": state.get("daily_loss", 0.0),
+        "daily_loss_limit": risk_config["max_daily_loss"],
+        "daily_profit": state.get("daily_profit", 0.0),
+        "daily_profit_limit": risk_config["max_daily_profit"],
+        "trading_paused": state.get("trading_paused", False),
+        "pause_reason": state.get("pause_reason"),
         "capital_in_use": round(capital_in_use, 2),
         "timestamp": _now(),
     }
@@ -789,6 +1209,7 @@ async def analyze(
         "mode": "DEMO" if state["is_demo_mode"] else "LIVE",
         "data_source": data_source,
         "can_trade": can_trade,
+        "available_sides": available_sides,
         "remaining_capital": round(max(0.0, remaining_cap), 2),
         "capital_in_use": round(capital_in_use, 2),
         "portfolio_cap": round(balance * risk_config.get("max_portfolio_pct", 1.0), 2),
@@ -798,6 +1219,24 @@ async def analyze(
 
     return response
 
+
+class TradeRequest(BaseModel):
+    symbol: str
+    price: float = 0.0
+    balance: float = 50000.0
+    quantity: Optional[int] = None
+    side: str = "BUY"
+    stop_loss: Optional[float] = None
+    target: Optional[float] = None
+    support: Optional[float] = None
+    resistance: Optional[float] = None
+    broker_id: int = 1
+    expiry: Optional[str] = None
+
+
+class CloseTradeRequest(BaseModel):
+    trade_id: Optional[int] = None
+    symbol: Optional[str] = None
 
 @router.post("/execute")
 async def execute(
@@ -816,51 +1255,260 @@ async def execute(
     # Ignore balance, demo mode, trading window, and max trades. Always execute trade if market is live.
     mode = "LIVE"
 
+    option_kind = _option_kind(trade.symbol)
+
+    # ═══════════════════════════════════════════════════════════════
+    # 10-POINT MAX STOP LOSS VALIDATION (NEW)
+    # ═══════════════════════════════════════════════════════════════
+    
     pct = STOP_PCT / 100
-    derived_stop = stop_loss
-    if derived_stop is None:
-        if side.upper() == "BUY":
-            derived_stop = round(price * (1 - pct), 2)
+    derived_stop = trade.stop_loss
+    if option_kind:
+        stop_move = trade.price * (STOP_PCT_OPTIONS / 100)
+        if trade.side.upper() == "SELL":
+            derived_stop = round(trade.price + stop_move, 2)
         else:
-            derived_stop = round(price * (1 + pct), 2)
-
-    derived_target = target
-    if derived_target is None:
-        if side.upper() == "BUY":
-            derived_target = round(price * (1 + pct * (TARGET_PCT / STOP_PCT)), 2)
+            derived_stop = round(trade.price - stop_move, 2)
+    elif derived_stop is None:
+        if trade.side.upper() == "BUY":
+            derived_stop = round(trade.price * (1 - pct), 2)
         else:
-            derived_target = round(price * (1 - pct * (TARGET_PCT / STOP_PCT)), 2)
+            derived_stop = round(trade.price * (1 + pct), 2)
+    
+    # Calculate stop loss in points
+    stop_points = abs(trade.price - derived_stop)
+    if stop_points > MAX_STOP_POINTS and not auto_demo:
+        # Adjust to max allowed points
+        if trade.side.upper() == "BUY":
+            derived_stop = trade.price - MAX_STOP_POINTS
+        else:
+            derived_stop = trade.price + MAX_STOP_POINTS
+        print(f"[RISK CONTROL] Stop loss adjusted to {MAX_STOP_POINTS} points: ₹{derived_stop:.2f}")
+        stop_points = abs(trade.price - derived_stop)
+    
+    # Validate max loss amount
+    qty = trade.quantity or 1
+    potential_loss = stop_points * qty
+    max_loss_allowed = risk_config.get("max_per_trade_loss", 650)
+    
+    if potential_loss > max_loss_allowed and not auto_demo:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Potential loss ₹{potential_loss:.2f} exceeds limit ₹{max_loss_allowed}. Reduce qty or tighten stop."
+        )
+    
+    # ═══════════════════════════════════════════════════════════════
 
-    broker_response: Dict[str, any] = {}
+    derived_target = trade.target
+    if option_kind:
+        if trade.side.upper() == "SELL":
+            derived_target = round(trade.price - TARGET_POINTS, 2)
+        else:
+            derived_target = round(trade.price + TARGET_POINTS, 2)
+    elif derived_target is None:
+        if trade.side.upper() == "BUY":
+            derived_target = round(trade.price * (1 + pct * (TARGET_PCT / STOP_PCT)), 2)
+        else:
+            derived_target = round(trade.price * (1 - pct * (TARGET_PCT / STOP_PCT)), 2)
 
-    trail_fields = _init_trailing_fields(price, side)
+    async with execute_lock:
+        if len(active_trades) >= MAX_TRADES and not auto_demo:
+            raise HTTPException(status_code=429, detail="Max active trades reached")
 
-    trade = {
-        "id": len(active_trades) + 1,
-        "symbol": symbol,
-        "price": price,
-        "side": side.upper(),
-        "quantity": quantity or 1,
-        "status": "OPEN",
-        "broker_id": broker_id,
-        "timestamp": _now(),
-        "stop_loss": derived_stop,
-        "target": derived_target,
-        "support": support,
-        "resistance": resistance,
-        **trail_fields,
-    }
+        if not auto_demo:
+            existing = next((t for t in active_trades if t.get("status") == "OPEN"), None)
+            if existing:
+                raise HTTPException(status_code=429, detail="Another trade is already open")
 
-    active_trades.append(trade)
-    # TODO: integrate broker SDK here
-    broker_response = {
-        "broker_id": broker_id,
-        "symbol": symbol,
-        "price": price,
-        "status": "accepted (stub)",
-        "timestamp": _now(),
-    }
-    broker_logs.append({"trade": trade, "response": broker_response})
+        broker_response: Dict[str, any] = {}
+
+        trail_fields = _init_trailing_fields(trade.price, trade.side)
+
+        trade_obj = {
+            "id": len(active_trades) + 1,
+            "symbol": trade.symbol,
+            "price": trade.price,
+            "side": trade.side.upper(),
+            "quantity": trade.quantity or 1,
+            "status": "OPEN",
+            "broker_id": trade.broker_id,
+            "exchange": "NFO",
+            "product": "MIS",
+            "timestamp": _now(),
+            "stop_loss": derived_stop,
+            "target": derived_target,
+            "support": trade.support,
+            "resistance": trade.resistance,
+            **trail_fields,
+        }
+
+        # --- REAL ZERODHA ORDER PLACEMENT ---
+        # Map your signal to the correct Zerodha symbol (tradingsymbol)
+        zerodha_symbol = trade.symbol  # You may need to convert to e.g. 'BANKNIFTY24FEB48000CE'
+        print(f"[API /execute] ▶ Placing {mode} order to Zerodha...")
+        print(f"[API /execute] ▶ Order Details: {zerodha_symbol}, {trade.quantity or 1} qty, {trade.side} at ₹{trade.price}")
+        real_order = place_zerodha_order(
+            symbol=zerodha_symbol,
+            quantity=trade.quantity or 1,
+            side=trade.side,
+            order_type="MARKET",
+            product="MIS",
+            exchange="NFO"  # Use 'NFO' for options
+        )
+        if real_order["success"]:
+            print(f"[API /execute] ✓ Zerodha order ACCEPTED - Order ID: {real_order.get('order_id', 'N/A')}")
+            broker_response = real_order
+            active_trades.append(trade_obj)
+        else:
+            print(f"[API /execute] ✗ Zerodha order REJECTED - Error: {real_order.get('error', 'Unknown')}")
+            return {
+                "success": False,
+                "message": real_order["error"],
+                "timestamp": _now(),
+            }
+
+        broker_logs.append({"trade": trade_obj, "response": broker_response})
+
+        return {
+            "success": True,
+            "is_demo_mode": auto_demo,
+            "message": f"{mode} trade accepted for {trade.symbol} at {trade.price}",
+            "timestamp": _now(),
+            "broker_response": broker_response,
+            "stop_loss": derived_stop,
+            "target": derived_target,
+        }
+
+
+@router.get("/trades/active")
+async def get_active_trades(authorization: Optional[str] = Header(None)):
+    print(f"[API /trades/active] Returning {len(active_trades)} active trades from Zerodha")
+    trades = active_trades
+    return {"trades": trades, "is_demo_mode": False, "count": len(trades)}
+
+
+@router.post("/trades/update-prices")
+async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
+    now = time.time()
+    if live_update_state["backoff_until"] > now:
+        return {
+            "success": False,
+            "updated_count": 0,
+            "message": "Zerodha throttled - backing off",
+            "retry_after": round(live_update_state["backoff_until"] - now, 2),
+        }
+
+    open_trades = [t for t in active_trades if t.get("status") == "OPEN"]
+    if not open_trades:
+        return {"success": True, "updated_count": 0, "message": "No open trades to update"}
+
+    kite = _get_kite()
+    if not kite:
+        return {"success": False, "message": "Zerodha credentials missing or invalid", "updated_count": 0}
+
+    quote_symbols = []
+    trade_symbol_map: Dict[str, List[Dict[str, Any]]] = {}
+    for trade in open_trades:
+        try:
+            quote_symbol = _quote_symbol(trade.get("symbol"), trade.get("index"))
+            quote_symbols.append(quote_symbol)
+            trade_symbol_map.setdefault(quote_symbol, []).append(trade)
+        except Exception:
+            continue
+
+    async def _retry_ltp(symbols: List[str]) -> Dict[str, Any]:
+        delays = [0.2, 0.5, 1.0, 1.5, 2.0]
+        for attempt, delay in enumerate(delays, 1):
+            try:
+                return kite.ltp(symbols)
+            except Exception:
+                if attempt == len(delays):
+                    raise
+                await asyncio.sleep(delay)
+
+    async def _retry_quote(symbols: List[str]) -> Dict[str, Any]:
+        delays = [0.2, 0.5, 1.0]
+        for attempt, delay in enumerate(delays, 1):
+            try:
+                return kite.quote(symbols)
+            except Exception:
+                if attempt == len(delays):
+                    raise
+                await asyncio.sleep(delay)
+
+    start = time.time()
+    try:
+        quotes = await _retry_ltp(quote_symbols)
+    except Exception as e:
+        live_update_state["failure_count"] += 1
+        backoff = min(12.0, 4.0 + live_update_state["failure_count"] * 2.0)
+        live_update_state["backoff_until"] = time.time() + backoff
+        return {
+            "success": False,
+            "message": f"Failed to fetch prices: {str(e)}",
+            "updated_count": 0,
+            "retry_after": round(backoff, 2),
+        }
+    finally:
+        live_update_state["last_duration"] = time.time() - start
+
+    updated_count = 0
+    missing_symbols: List[str] = []
+    for quote_symbol, trades in trade_symbol_map.items():
+        data = quotes.get(quote_symbol) or {}
+        live_price = data.get("last_price")
+        if live_price is None:
+            missing_symbols.append(quote_symbol)
+            continue
+        new_price = float(live_price)
+        live_price_cache[quote_symbol] = new_price
+        for trade in trades:
+            trade["current_price"] = new_price
+            if _option_kind(trade.get("symbol")):
+                entry = float(trade.get("price") or 0)
+                if entry > 0:
+                    profit_points = new_price - entry
+                    if profit_points >= TRAIL_START_POINTS:
+                        trail_stop = new_price - TRAIL_GAP_POINTS
+                        current_sl = trade.get("stop_loss")
+                        if current_sl is None or trail_stop > current_sl:
+                            trade["stop_loss"] = round(trail_stop, 2)
+            updated_count += 1
+
+    if missing_symbols:
+        try:
+            fallback_quotes = await _retry_quote(missing_symbols)
+        except Exception:
+            fallback_quotes = {}
+        for quote_symbol in missing_symbols:
+            data = fallback_quotes.get(quote_symbol) or {}
+            live_price = data.get("last_price")
+            if live_price is None:
+                cached = live_price_cache.get(quote_symbol)
+                if cached is None:
+                    continue
+                live_price = cached
+            new_price = float(live_price)
+            live_price_cache[quote_symbol] = new_price
+            for trade in trade_symbol_map.get(quote_symbol, []):
+                trade["current_price"] = new_price
+                if _option_kind(trade.get("symbol")):
+                    entry = float(trade.get("price") or 0)
+                    if entry > 0:
+                        profit_points = new_price - entry
+                        if profit_points >= TRAIL_START_POINTS:
+                            trail_stop = new_price - TRAIL_GAP_POINTS
+                            current_sl = trade.get("stop_loss")
+                            if current_sl is None or trail_stop > current_sl:
+                                trade["stop_loss"] = round(trail_stop, 2)
+                updated_count += 1
+
+    if live_update_state["last_duration"] > 2.5:
+        live_update_state["failure_count"] += 1
+        backoff = min(10.0, 3.0 + live_update_state["failure_count"])
+        live_update_state["backoff_until"] = time.time() + backoff
+    else:
+        live_update_state["failure_count"] = 0
 
     return {
         "success": True,
@@ -898,6 +1546,13 @@ async def update_trade_price(symbol: str, price: float, authorization: Optional[
             _maybe_update_trail(trade, price)
             trade["current_price"] = price
             updated += 1
+            exit_reason = _should_exit_by_currency(trade, price)
+            if exit_reason:
+                trade["exit_reason"] = exit_reason
+                _close_trade(trade, price)
+                to_close.append(trade)
+                closed += 1
+                continue
             if _stop_hit(trade, price):
                 _close_trade(trade, price)
                 to_close.append(trade)
@@ -973,16 +1628,35 @@ async def trade_report(
 
 @router.get("/market/indices")
 async def market_indices():
+    """Return LIVE market indices from Zerodha (real broker connected)."""
+    print("\n[API /market/indices] Called - fetching LIVE data from Zerodha...")
     trends = await trend_analyzer.get_market_trends()
     indices = trends.get("indices", {}) if trends else {}
+    
+    if not indices:
+        print("[API /market/indices] ⚠ WARNING: No indices data - broker may not be connected!")
+    else:
+        print(f"[API /market/indices] ✓ Got indices: {list(indices.keys())}")
+    
     payload = [
-        {"symbol": sym, "price": data.get("current"), "change_pct": data.get("change_percent")}
+        {
+            "symbol": sym, 
+            "price": data.get("current"), 
+            "change_pct": data.get("change_percent"),
+            "trend": data.get("trend"),
+            "source": "zerodha_live"
+        }
         for sym, data in indices.items()
     ]
-    return {
+    
+    response = {
         "indices": payload,
         "timestamp": _now(),
+        "count": len(payload),
+        "source": "zerodha" if payload else "none"
     }
+    print(f"[API /market/indices] ✓ Response: indices={len(payload)}, timestamp={response['timestamp']}")
+    return response
 
 
 @router.post("/monitor")
@@ -996,3 +1670,16 @@ async def monitor(authorization: Optional[str] = Header(None)):
         "timestamp": _now(),
     }
     return {"monitor": payload, **payload}
+
+@router.post("/run-strategy")
+async def run_strategy(market_data: dict, credentials: dict, authorization: Optional[str] = Header(None)):
+    # Connect broker
+    if not engine.connect_broker("zerodha", credentials):
+        return {"success": False, "error": "Failed to connect to Zerodha broker"}
+    # Strategy pipeline
+    opportunities = strategy.scan(market_data)
+    signals = strategy.identify(opportunities)
+    analyzed = strategy.analyze(signals)
+    results = strategy.execute(analyzed, engine)
+    engine.disconnect_broker("zerodha")
+    return {"success": True, "results": results}

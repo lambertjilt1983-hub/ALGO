@@ -8,6 +8,10 @@ class GrowwAPI(BrokerInterface):
     """Groww Broker API integration"""
     
     BASE_URL = "https://api.groww.in"
+
+    def __init__(self, api_key: str, api_secret: str, access_token: Optional[str] = None):
+        super().__init__(api_key, api_secret, access_token)
+        self._last_error: Optional[str] = None
     
     async def authenticate(self) -> bool:
         """Authenticate with Groww"""
@@ -17,10 +21,14 @@ class GrowwAPI(BrokerInterface):
                 async with session.get(f"{self.BASE_URL}/v1/user/profile", headers=headers) as resp:
                     if resp.status == 200:
                         logger.log_api_call("groww", "authenticate", "success")
+                        self._last_error = None
                         return True
+                    body = await resp.text()
+                    self._last_error = f"HTTP {resp.status}: {body}"
             return False
         except Exception as e:
             logger.log_error("Groww auth failed", {"error": str(e)})
+            self._last_error = str(e)
             return False
     
     async def place_order(self, order: OrderData) -> OrderResponse:
@@ -96,9 +104,26 @@ class GrowwAPI(BrokerInterface):
                 async with session.get(f"{self.BASE_URL}/v1/user/margin", headers=headers) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        return Account(0, 0, 0, 0, 0)
+                        payload = data.get("data", data) if isinstance(data, dict) else {}
+
+                        available = payload.get("available", payload.get("available_balance", payload.get("availableMargin", 0)))
+                        used = payload.get("used", payload.get("used_margin", payload.get("utilised", payload.get("utilized", 0))))
+                        free = payload.get("free", payload.get("free_margin", payload.get("freeMargin", 0)))
+                        net = payload.get("net", payload.get("total", payload.get("total_balance", 0)))
+                        balance = payload.get("balance", payload.get("net", net))
+
+                        return Account(
+                            balance=float(balance or 0),
+                            available_balance=float(available or 0),
+                            used_margin=float(used or 0),
+                            free_margin=float(free or 0),
+                            net_worth=float(net or 0)
+                        )
+                    body = await resp.text()
+                    self._last_error = f"HTTP {resp.status}: {body}"
         except Exception as e:
             logger.log_error("Groww account info fetch failed", {"error": str(e)})
+            self._last_error = str(e)
         return Account(0, 0, 0, 0, 0)
     
     async def get_order_status(self, order_id: str) -> OrderResponse:
