@@ -260,11 +260,15 @@ class BrokerAuthService:
         broker_name: str,
         api_key: str,
         api_secret: str,
-        db: Session
+        db: Session,
+        access_token: Optional[str] = None
     ) -> BrokerCredential:
         """Store encrypted broker credentials"""
         encrypted_key = encryption_manager.encrypt_credentials(api_key)
         encrypted_secret = encryption_manager.encrypt_credentials(api_secret)
+        encrypted_access = None
+        if access_token:
+            encrypted_access = encryption_manager.encrypt_credentials(access_token)
         
         # Check if credentials exist
         existing = db.query(BrokerCredential).filter(
@@ -275,6 +279,8 @@ class BrokerAuthService:
         if existing:
             existing.api_key = encrypted_key
             existing.api_secret = encrypted_secret
+            if encrypted_access:
+                existing.access_token = encrypted_access
             existing.updated_at = datetime.utcnow()
             db.commit()
             db.refresh(existing)
@@ -284,7 +290,8 @@ class BrokerAuthService:
             user_id=user_id,
             broker_name=broker_name,
             api_key=encrypted_key,
-            api_secret=encrypted_secret
+            api_secret=encrypted_secret,
+            access_token=encrypted_access
         )
         db.add(credential)
         db.commit()

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from typing import List
@@ -10,6 +10,7 @@ from app.core.token_manager import token_manager
 from app.core.security import encryption_manager
 from app.core.config import get_settings
 import urllib.parse
+import requests
 
 router = APIRouter(prefix="/brokers", tags=["brokers"])
 
@@ -44,8 +45,8 @@ def _build_broker_response(credential: BrokerCredential) -> dict:
             token_status = "missing"
             requires_reauth = True
     else:
-        token_status = "unknown"
-        requires_reauth = False
+        token_status = "missing" if not has_access_token else "unknown"
+        requires_reauth = not has_access_token
 
     return {
         "id": credential.id,
@@ -77,19 +78,18 @@ async def add_broker_credentials(
         (BrokerCredential.broker_name == credentials.broker_name)
     ).first()
     
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Broker {credentials.broker_name} already exists. Please delete the old one first."
-        )
-    
     broker_cred = BrokerAuthService.store_credentials(
         user_id=user_id,
         broker_name=credentials.broker_name,
         api_key=credentials.api_key,
         api_secret=credentials.api_secret,
-        db=db
+        db=db,
+        access_token=credentials.access_token
     )
+    if existing and broker_cred:
+        broker_cred.is_active = True
+        db.commit()
+        db.refresh(broker_cred)
     return _build_broker_response(broker_cred)
 
 @router.get("/credentials", response_model=List[BrokerCredentialResponse])
@@ -160,7 +160,7 @@ async def get_broker_balance(
     ).first()
     
     # Use automated token manager to handle token refresh and fallback
-    result = token_manager.get_balance_with_fallback(broker_id, db, user_id)
+    result = await token_manager.get_balance_with_fallback(broker_id, db, user_id)
     
     # If token is expired, suggest re-authentication
     if result.get("status") == "token_expired":
@@ -216,6 +216,133 @@ async def zerodha_oauth_login(
         "state": state,
         "message": "Redirect user to login_url, then handle callback"
     }
+
+
+@router.get("/upstox/login/{broker_id}")
+async def upstox_oauth_login(
+    broker_id: int,
+    db: Session = Depends(get_db),
+    token: str = Depends(AuthService.verify_bearer_token)
+):
+    """Initiate Upstox OAuth flow to get access token"""
+    payload = AuthService.verify_token(token)
+    user_id = int(payload.get("sub"))
+
+    credential = db.query(BrokerCredential).filter(
+        (BrokerCredential.user_id == user_id) &
+        (BrokerCredential.id == broker_id)
+    ).first()
+
+    if not credential:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Broker credential not found"
+        )
+
+    try:
+        decrypted_api_key = encryption_manager.decrypt_credentials(credential.api_key)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Credentials encrypted with old key. Please delete and re-add this broker."
+        )
+
+    settings = get_settings()
+    redirect_uri = settings.UPSTOX_REDIRECT_URL or settings.FRONTEND_URL
+    state = f"upstox:{user_id}:{broker_id}"
+    encoded_state = urllib.parse.quote(state)
+    encoded_redirect = urllib.parse.quote(redirect_uri)
+
+    login_url = (
+        "https://api.upstox.com/v2/login/authorization/dialog"
+        f"?response_type=code&client_id={decrypted_api_key}"
+        f"&redirect_uri={encoded_redirect}&state={encoded_state}"
+    )
+
+    return {
+        "login_url": login_url,
+        "redirect_url": redirect_uri,
+        "state": state,
+        "message": "Redirect user to login_url, then exchange code for token"
+    }
+
+
+@router.post("/upstox/exchange/{broker_id}")
+def upstox_token_exchange(
+    broker_id: int,
+    code: str = Body(..., embed=True),
+    db: Session = Depends(get_db),
+    token: str = Depends(AuthService.verify_bearer_token)
+):
+    """Exchange Upstox auth code for access token and persist it"""
+    payload = AuthService.verify_token(token)
+    user_id = int(payload.get("sub"))
+
+    credential = db.query(BrokerCredential).filter(
+        (BrokerCredential.user_id == user_id) &
+        (BrokerCredential.id == broker_id)
+    ).first()
+
+    if not credential:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Broker credential not found"
+        )
+
+    settings = get_settings()
+    try:
+        api_key = encryption_manager.decrypt_credentials(credential.api_key)
+        api_secret = encryption_manager.decrypt_credentials(credential.api_secret)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to decrypt credentials: {e}"
+        )
+
+    api_key = api_key or settings.UPSTOX_API_KEY
+    api_secret = api_secret or settings.UPSTOX_API_SECRET
+    redirect_uri = settings.UPSTOX_REDIRECT_URL or settings.FRONTEND_URL
+
+    if not api_key or not api_secret:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Upstox API key/secret missing"
+        )
+
+    try:
+        resp = requests.post(
+            "https://api.upstox.com/v2/login/authorization/token",
+            headers={"accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "code": code,
+                "client_id": api_key,
+                "client_secret": api_secret,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code"
+            },
+            timeout=20
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Upstox token request failed: {e}")
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+    data = resp.json() if resp.content else {}
+    access_token = data.get("access_token") or data.get("data", {}).get("access_token")
+    refresh_token = data.get("refresh_token") or data.get("data", {}).get("refresh_token")
+
+    if not access_token:
+        raise HTTPException(status_code=400, detail="Upstox access token missing in response")
+
+    credential.access_token = encryption_manager.encrypt_credentials(access_token)
+    if refresh_token:
+        credential.refresh_token = encryption_manager.encrypt_credentials(refresh_token)
+    db.add(credential)
+    db.commit()
+    db.refresh(credential)
+
+    return {"status": "success", "broker_id": credential.id}
 
 @router.get("/debug/tokens")
 async def debug_tokens(

@@ -17,7 +17,7 @@ import asyncio
 import re
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.strategies.market_intelligence import trend_analyzer
@@ -29,6 +29,7 @@ from sqlalchemy import func
 from app.engine.auto_trading_engine import AutoTradingEngine
 from app.engine.zerodha_broker import ZerodhaBroker
 from app.engine.simple_momentum_strategy import SimpleMomentumStrategy
+from app.core.market_hours import ist_now, is_market_open
 
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
 
@@ -66,8 +67,8 @@ risk_config = {
 }
 
 trade_window = {
-    "start": (9, 20),   # HH, MM local server time
-    "end": (15, 29),    # HH, MM local server time
+    "start": (9, 15),   # HH, MM IST
+    "end": (15, 29),    # HH, MM IST (exit before close)
 }
 
 trail_config = {
@@ -83,7 +84,7 @@ state = {
     "live_armed": True,
     "daily_loss": 0.0,
     "daily_profit": 0.0,  # NEW: Track daily profit
-    "daily_date": datetime.now().date(),
+    "daily_date": ist_now().date(),
     "consecutive_losses": 0,
     "last_loss_time": None,
     "trading_paused": False,  # NEW: Pause if profit/loss limits hit
@@ -108,7 +109,7 @@ engine.register_broker("zerodha", zerodha_broker)
 strategy = SimpleMomentumStrategy()
 
 def _now() -> str:
-    return datetime.now().isoformat()
+    return ist_now().isoformat()
 
 
 def _symbol_root(symbol: str | None) -> str | None:
@@ -193,7 +194,7 @@ def _should_exit_by_currency(trade: Dict[str, Any], price: float) -> str | None:
 
 
 def _reset_daily_if_needed():
-    today = datetime.now().date()
+    today = ist_now().date()
     if state.get("daily_date") != today:
         state["daily_date"] = today
         state["daily_loss"] = 0.0
@@ -231,12 +232,11 @@ def _capital_in_use() -> float:
 
 
 def _within_trade_window() -> bool:
-    now = datetime.now()
     start_h, start_m = trade_window["start"]
     end_h, end_m = trade_window["end"]
-    start = now.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
-    end = now.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
-    return start <= now <= end
+    start = dt_time(start_h, start_m)
+    end = dt_time(end_h, end_m)
+    return is_market_open(start, end)
 
 
 def _analyze_trend_strength(symbol: str) -> Dict[str, float]:

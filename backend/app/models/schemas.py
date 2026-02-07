@@ -40,6 +40,7 @@ class BrokerCredentialCreate(BaseModel):
     broker_name: str
     api_key: str
     api_secret: str
+    access_token: Optional[str] = None
 
 class BrokerCredentialResponse(BaseModel):
     id: int

@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     # Broker Credentials (Upstox)
     UPSTOX_API_KEY: str = ""
     UPSTOX_API_SECRET: str = ""
+    UPSTOX_REDIRECT_URL: str = ""
     
     # Broker Credentials (Angel One)
     ANGEL_API_KEY: str = ""
@@ -37,6 +38,10 @@ class Settings(BaseSettings):
     
     # Logging
     LOG_LEVEL: str = "INFO"
+
+    # Market hours
+    MARKET_TIMEZONE: str = "Asia/Kolkata"
+    MARKET_HOLIDAYS: str = ""
     
     # Frontend URLs (for OAuth redirects)
     FRONTEND_URL: str = "https://algo-trade-frontend.up.railway.app"

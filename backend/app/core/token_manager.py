@@ -8,6 +8,7 @@ from app.models.auth import BrokerCredential
 from app.core.security import encryption_manager
 from app.core.logger import logger
 from app.core.config import get_settings
+from app.brokers.base import BrokerFactory, Account
 from kiteconnect import KiteConnect
 import requests
 
@@ -132,7 +133,7 @@ class TokenManager:
         return decrypted.strip() if isinstance(decrypted, str) else decrypted
     
     @staticmethod
-    def get_balance_with_fallback(broker_id: int, db: Session, user_id: int) -> dict:
+    async def get_balance_with_fallback(broker_id: int, db: Session, user_id: int) -> dict:
         """
         Get balance with automatic token refresh on failure
         Falls back to demo data if token is invalid
@@ -149,6 +150,8 @@ class TokenManager:
                 "message": "Broker credential not found"
             }
         
+        broker_name = (credential.broker_name or "").lower()
+
         # Check if access token exists - if not, require re-authentication
         if not credential.access_token:
             logger.log_error("No access token stored", {
@@ -164,9 +167,12 @@ class TokenManager:
                 "data_source": "no_token",
                 "status": "token_expired",
                 "requires_reauth": True,
-                "message": "No access token found. Please authenticate with Zerodha.",
-                "action": "redirect_to_zerodha_login"
+                "message": "No access token found. Please authenticate with broker.",
+                "action": "redirect_to_broker_login"
             }
+
+        if "zerodha" not in broker_name:
+            return await TokenManager._get_generic_balance(credential)
         
         # First, try with current token
         try:
@@ -223,6 +229,85 @@ class TokenManager:
                 "data_source": "api_error",
                 "status": "error",
                 "message": f"Zerodha API error: {error_msg}"
+            }
+
+    @staticmethod
+    async def _get_generic_balance(credential: BrokerCredential) -> dict:
+        settings = get_settings()
+        broker_name = (credential.broker_name or "").lower()
+        api_key = TokenManager._maybe_decrypt(credential.api_key)
+        api_secret = TokenManager._maybe_decrypt(credential.api_secret)
+        access_token = TokenManager._maybe_decrypt(credential.access_token)
+
+        if not api_key and "groww" in broker_name:
+            api_key = settings.GROWW_API_KEY
+        if not api_secret and "groww" in broker_name:
+            api_secret = settings.GROWW_API_SECRET
+
+        try:
+            broker = BrokerFactory.create_broker(
+                broker_name,
+                api_key or "",
+                api_secret or "",
+                access_token
+            )
+        except Exception as e:
+            return {
+                "broker_id": credential.id,
+                "broker_name": credential.broker_name,
+                "available_balance": 0,
+                "used_margin": 0,
+                "total_balance": 0,
+                "data_source": "broker_error",
+                "status": "error",
+                "message": f"Broker not supported: {e}"
+            }
+
+        try:
+            is_auth = await broker.authenticate()
+            if not is_auth:
+                last_error = getattr(broker, "_last_error", None)
+                return {
+                    "broker_id": credential.id,
+                    "broker_name": credential.broker_name,
+                    "available_balance": 0,
+                    "used_margin": 0,
+                    "total_balance": 0,
+                    "data_source": "token_expired",
+                    "status": "token_expired",
+                    "requires_reauth": True,
+                    "message": last_error or "Access token expired. Please re-authenticate with broker.",
+                    "action": "redirect_to_broker_login"
+                }
+
+            account = await broker.get_account_info()
+            account = account or Account(0, 0, 0, 0, 0)
+            total = account.net_worth or account.balance or 0
+
+            return {
+                "broker_id": credential.id,
+                "broker_name": credential.broker_name,
+                "available_balance": float(account.available_balance or 0),
+                "used_margin": float(account.used_margin or 0),
+                "total_balance": float(total),
+                "data_source": f"real_{broker_name}_api",
+                "status": "success"
+            }
+        except Exception as e:
+            logger.log_error("Broker balance fetch failed", {
+                "broker_id": credential.id,
+                "broker_name": credential.broker_name,
+                "error": str(e)
+            })
+            return {
+                "broker_id": credential.id,
+                "broker_name": credential.broker_name,
+                "available_balance": 0,
+                "used_margin": 0,
+                "total_balance": 0,
+                "data_source": "api_error",
+                "status": "error",
+                "message": f"Broker API error: {str(e)}"
             }
 
 token_manager = TokenManager()

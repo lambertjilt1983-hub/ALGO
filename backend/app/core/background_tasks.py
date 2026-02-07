@@ -11,7 +11,8 @@ from app.models.trading import PaperTrade
 from app.core.token_manager import token_manager
 from app.core.logger import logger
 from app.engine.paper_trade_updater import update_open_paper_trades
-from datetime import datetime, time
+from datetime import datetime, time as dt_time
+from app.core.market_hours import ist_now, is_after_close
 
 # Create a session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -115,14 +116,13 @@ def close_market_close_trades():
     db = SessionLocal()
     try:
         # Get current time in IST (India Standard Time)
-        current_time = datetime.now()
+        current_time = ist_now()
         
         # Market closing time: 3:29 PM (15:29) - exit before close
-        market_close = time(15, 29)
+        market_close = dt_time(15, 29)
         
         # Check if current time is after market close (3:29 PM IST)
-        current_time_only = current_time.time()
-        if current_time_only >= market_close:
+        if is_after_close(market_close, current_time):
             # Close all open trades
             open_trades = db.query(PaperTrade).filter(PaperTrade.status == "OPEN").all()
             
@@ -210,7 +210,7 @@ def start_background_tasks():
         scheduler.start()
         logger.log_info("Background tasks started", {
             "jobs": len(scheduler.get_jobs()),
-            "market_close_time": "3:25 PM IST (3:25-3:30 PM IST window)"
+            "market_close_time": "3:29 PM IST"
         })
         
     except Exception as e:
