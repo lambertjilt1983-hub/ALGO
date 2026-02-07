@@ -1,9 +1,4 @@
 import os
-from dotenv import load_dotenv
-dotenv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env.qa')
-load_dotenv(dotenv_path)
-from dotenv import load_dotenv
-load_dotenv('.env.qa')
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routes import auth, broker, orders, strategies, market_intelligence, auto_trading_simple, test_market, token_refresh, admin, option_signals, zerodha_postback, paper_trading
