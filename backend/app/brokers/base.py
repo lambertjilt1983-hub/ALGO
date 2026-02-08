@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import importlib
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from datetime import datetime
@@ -109,11 +110,25 @@ class BrokerFactory:
     """Factory to create broker instances"""
     
     _brokers = {}
+    _broker_modules = {
+        "zerodha": "app.brokers.zerodha",
+        "upstox": "app.brokers.upstox",
+        "groww": "app.brokers.groww",
+        "angel_one": "app.brokers.angel_one",
+    }
     
     @classmethod
     def register_broker(cls, broker_name: str, broker_class):
         """Register a new broker implementation"""
         cls._brokers[broker_name.lower()] = broker_class
+
+    @classmethod
+    def _ensure_broker_registered(cls, broker_name: str) -> None:
+        if broker_name in cls._brokers:
+            return
+        module_path = cls._broker_modules.get(broker_name)
+        if module_path:
+            importlib.import_module(module_path)
     
     @classmethod
     def create_broker(
@@ -124,7 +139,9 @@ class BrokerFactory:
         access_token: Optional[str] = None
     ) -> BrokerInterface:
         """Create broker instance"""
-        broker_class = cls._brokers.get(broker_name.lower())
+        broker_key = broker_name.lower()
+        cls._ensure_broker_registered(broker_key)
+        broker_class = cls._brokers.get(broker_key)
         if not broker_class:
             raise ValueError(f"Unknown broker: {broker_name}")
         

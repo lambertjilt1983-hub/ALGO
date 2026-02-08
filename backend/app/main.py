@@ -1,9 +1,20 @@
 import os
 from dotenv import load_dotenv
-dotenv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env.qa')
-load_dotenv(dotenv_path)
-from dotenv import load_dotenv
-load_dotenv('.env.qa')
+# Standardized env loading: use ENV_FILE or ENVIRONMENT
+env_file = os.environ.get("ENV_FILE")
+if not env_file:
+    env = os.environ.get("ENVIRONMENT", "production").lower()
+    if env == "qa":
+        env_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env.qa")
+    elif env == "local":
+        env_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env.local")
+    else:
+        env_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+if os.path.exists(env_file):
+    load_dotenv(env_file)
+    print(f"[ENV] Loaded environment from {env_file}")
+else:
+    print(f"[ENV] WARNING: Env file {env_file} not found!")
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routes import auth, broker, orders, strategies, market_intelligence, auto_trading_simple, test_market, token_refresh, admin, option_signals, zerodha_postback, paper_trading

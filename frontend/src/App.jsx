@@ -6,7 +6,6 @@ import AutoTradingDashboard from './components/AutoTradingDashboard';
 import config from './config/api';
 import useTokenRefresh from './hooks/useTokenRefresh';
 import './App.css';
-import { Routes, Route } from 'react-router-dom';
 import ZerodhaCallbackPage from './pages/ZerodhaCallbackPage';
 
 
@@ -146,6 +145,40 @@ export default function App() {
   return (
     <Routes>
       <Route path="/zerodha-callback" element={<ZerodhaCallbackPage />} />
+      <Route
+        path="/autotrading"
+        element={isLoggedIn ? <AutoTradingDashboard /> : (
+          <div style={{ minHeight: '100vh', backgroundColor: '#f3f4f6' }}>
+            <nav style={{
+              backgroundColor: '#1e40af',
+              color: 'white',
+              padding: '1rem 2rem',
+              boxShadow: '0 1px 3px rgba(0,0,0,0.1)'
+            }}>
+              <h1 style={{ margin: 0, fontSize: '1.5rem' }}>🚀 AlgoTrade Pro</h1>
+            </nav>
+            <div style={{
+              display: 'flex',
+              justifyContent: 'center',
+              alignItems: 'center',
+              minHeight: 'calc(100vh - 60px)'
+            }}>
+              <div style={{
+                backgroundColor: 'white',
+                borderRadius: '0.5rem',
+                boxShadow: '0 10px 25px rgba(0,0,0,0.1)'
+              , padding: '2rem',
+                width: '100%'
+              , maxWidth: '420px'
+              , textAlign: 'center'
+              }}>
+                <h2 style={{ marginTop: 0, color: '#1e40af' }}>Login required</h2>
+                <p style={{ color: '#6b7280' }}>Please log in to access Auto Trading.</p>
+              </div>
+            </div>
+          </div>
+        )}
+      />
       <Route path="*" element={
         isLoggedIn ? <Dashboard /> : (
           <div style={{ minHeight: '100vh', backgroundColor: '#f3f4f6' }}>

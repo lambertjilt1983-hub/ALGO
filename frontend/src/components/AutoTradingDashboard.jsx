@@ -281,10 +281,15 @@ const AutoTradingDashboard = () => {
       
       const data = await res.json();
       const allSignals = data.signals || [];
+      const intradayOnly = allSignals.filter((signal) => {
+        const signalType = String(signal?.signal_type || signal?.type || signal?.strategy || '').toLowerCase();
+        const hasOptionType = signal?.option_type === 'CE' || signal?.option_type === 'PE';
+        return signalType.includes('intraday') || hasOptionType;
+      });
       const winRate = stats?.win_rate ? (stats.win_rate / 100) : 0.5;
       
       // Calculate quality for each signal
-      const qualityScores = allSignals.map(signal => {
+      const qualityScores = intradayOnly.map(signal => {
         const quality = calculateTradeQuality(signal, winRate);
         const { rr, optimalRR } = calculateOptimalRR(signal, winRate);
         return {
@@ -302,6 +307,20 @@ const AutoTradingDashboard = () => {
       const qualityOnly = qualityScores
         .filter(s => s.quality >= 50)
         .sort((a, b) => b.quality - a.quality);
+
+      // Count today's executed trades (active + closed)
+      const today = new Date().toISOString().slice(0, 10);
+      const tradesToday = tradeHistory.filter((t) => {
+        const ts = t.exit_time || t.entry_time || t.timestamp;
+        if (!ts) return false;
+        return new Date(ts).toISOString().slice(0, 10) === today;
+      });
+      const activeToday = activeTrades.filter((t) => {
+        const ts = t.entry_time || t.timestamp;
+        if (!ts) return false;
+        return new Date(ts).toISOString().slice(0, 10) === today;
+      });
+      const totalTradesToday = tradesToday.length + activeToday.length;
       
       console.log(`✅ Market Scan Complete: ${qualityOnly.length} quality trades found (${allSignals.length} total signals)`);
       console.log(`📊 All Signal Scores:`, qualityScores.map(s => ({ symbol: s.symbol, quality: s.quality, confidence: s.factors?.confidenceScore })));
@@ -359,7 +378,20 @@ const AutoTradingDashboard = () => {
       const history = historyData.trades || [];
       const backendStatus = statusData.status || statusData;
 
-      setActiveTrades(active);
+      // Deduplicate active trades by symbol, action, entry_price, and entry_time
+      const dedupedActive = Array.isArray(active)
+        ? active.filter((trade, idx, arr) => {
+            return (
+              arr.findIndex(t =>
+                t.symbol === trade.symbol &&
+                (t.action || t.side) === (trade.action || trade.side) &&
+                Number(t.entry_price ?? t.price) === Number(trade.entry_price ?? trade.price) &&
+                (t.entry_time || t.timestamp) === (trade.entry_time || trade.timestamp)
+              ) === idx
+            );
+          })
+        : active;
+      setActiveTrades(dedupedActive);
       setTradeHistory(history);
       setReportSummary(perfData);
       setHasActiveTrade(active.length > 0);
@@ -388,7 +420,7 @@ const AutoTradingDashboard = () => {
         daily_loss_limit: Number(backendStatus?.daily_loss_limit ?? 5000),
         daily_profit_limit: Number(backendStatus?.daily_profit_limit ?? 10000),
         active_trades_count: active.length,
-        max_trades: 2,
+        max_trades: 1,
         target_points_per_trade: Math.round(targetPoints),
         capital_in_use: capitalInUse,
         win_rate: backendStatus?.win_rate ?? 0,
@@ -397,6 +429,10 @@ const AutoTradingDashboard = () => {
         today_losses: lossCount,
         trading_paused: backendStatus?.trading_paused ?? false,
         pause_reason: backendStatus?.pause_reason,
+        market_open: typeof backendStatus?.market_open === 'boolean' ? backendStatus.market_open : null,
+        market_reason: backendStatus?.market_reason ?? null,
+        market_date: backendStatus?.market_date ?? null,
+        market_time: backendStatus?.market_time ?? null,
         remaining_capital: null,
         portfolio_cap: null,
       });
@@ -685,8 +721,9 @@ const AutoTradingDashboard = () => {
       // This ensures we only ENTER quality trades, even though we DISPLAY more signals
       const highQualitySignals = scoredSignals.filter(s => {
         const baseConfidence = s.confirmation_score ?? s.confidence ?? 0;
-        // CRITICAL: Must have 80%+ base confidence to execute
-        if (baseConfidence < 80) return false;
+        // Only allow if quality is 99 or above
+        const quality = s.quality ?? 0;
+        if (quality < 99) return false;
         // Must have high final score (100+) after all factors
         if (s.finalScore < 100) return false;
         // Must have strong momentum
@@ -695,12 +732,8 @@ const AutoTradingDashboard = () => {
       });
       
       if (highQualitySignals.length === 0) {
-        console.log('❌ No signals meet EXECUTION criteria (80%+ confidence, 100+ score, 75+ momentum)');
-        console.log('   Signals visible but below quality threshold for trading');
-        console.log('   Best available:', scoredSignals.length > 0 ? 
-          `Confidence ${Math.max(...scoredSignals.map(s => s.confirmation_score ?? s.confidence ?? 0)).toFixed(1)}%, ` +
-          `Score ${Math.max(...scoredSignals.map(s => s.finalScore)).toFixed(1)}, ` +
-          `Momentum ${Math.max(...scoredSignals.map(s => s.indexMomentum?.score || 0))}` : 'None');
+        console.log('❌ No signals meet EXECUTION criteria (quality 99+, 100+ score, 75+ momentum)');
+        // No trade if no 99% quality signal, just wait
         return;
       }
 
@@ -861,12 +894,9 @@ const AutoTradingDashboard = () => {
   // Use quality trade if available, otherwise use best signal
   const activeSignal = selectedSignal || bestQualityTrade || bestSignal;
 
-  const liveMarketSignal = professionalSignal && !professionalSignal.error
-    ? professionalSignal
-    : null;
-  const displayEntryPrice = liveMarketSignal?.entry_price ?? activeSignal?.entry_price;
-  const displayTarget = liveMarketSignal?.target ?? activeSignal?.target;
-  const displayStopLoss = liveMarketSignal?.stop_loss ?? activeSignal?.stop_loss;
+  const displayEntryPrice = activeSignal?.entry_price;
+  const displayTarget = activeSignal?.target;
+  const displayStopLoss = activeSignal?.stop_loss;
   const displayTargetPoints =
     displayTarget != null && displayEntryPrice != null
       ? Math.abs(Number(displayTarget) - Number(displayEntryPrice))
@@ -881,6 +911,23 @@ const AutoTradingDashboard = () => {
     (displayEntryPrice != null
       ? Number(displayEntryPrice) * Number(displayQuantity) * Number(lotMultiplier)
       : 0);
+
+  const liveDisplaySignal = bestQualityTrade
+    || (professionalSignal && !professionalSignal.error ? professionalSignal : null)
+    || activeSignal;
+  const liveEntryPrice = liveDisplaySignal?.entry_price;
+  const liveTarget = liveDisplaySignal?.target;
+  const liveStopLoss = liveDisplaySignal?.stop_loss;
+  const liveTargetPoints =
+    liveTarget != null && liveEntryPrice != null
+      ? Math.abs(Number(liveTarget) - Number(liveEntryPrice))
+      : null;
+  const liveSlPoints =
+    liveStopLoss != null && liveEntryPrice != null
+      ? Math.abs(Number(liveEntryPrice) - Number(liveStopLoss))
+      : null;
+  const liveQuantity = liveDisplaySignal?.quantity ?? activeSignal?.quantity ?? 0;
+  const liveExpiryDate = liveDisplaySignal?.expiry_date || liveDisplaySignal?.expiry;
 
   // Render option signals table - Side by side CE and PE
   const renderOptionSignalsTable = () => (
@@ -1019,6 +1066,7 @@ const AutoTradingDashboard = () => {
   // Auto-execute ONLY after user explicitly starts auto-trading (LIVE mode)
   useEffect(() => {
     if (!autoTradingActive || !isLiveMode || executing) return;
+    if (!isMarketOpen) return;
     const maxTrades = stats?.max_trades ?? 2;
     if (activeTrades.length >= maxTrades) return;
 
@@ -1042,6 +1090,11 @@ const AutoTradingDashboard = () => {
     
     // ONLY execute real trades when user explicitly starts auto-trading (LIVE mode)
     if (!autoTradingActive || !isLiveMode) return;
+
+    if (!isMarketOpen) {
+      console.log('⏸️ Market closed - auto trade blocked');
+      return;
+    }
 
     // Hard stop: no trades after any daily loss
     if (isLossLimitHit()) {
@@ -1568,23 +1621,48 @@ const AutoTradingDashboard = () => {
   const { hour: istHour, minute: istMinute, weekday: istWeekday, iso: istIso } = getIstDateParts();
   const isWeekend = istWeekday === 'Sat' || istWeekday === 'Sun';
   const isHoliday = MARKET_HOLIDAYS.includes(istIso);
-  const isMarketOpen = !isWeekend && !isHoliday && (
-    istHour > MARKET_OPEN_HOUR || (istHour === MARKET_OPEN_HOUR && istMinute >= MARKET_OPEN_MINUTE)
-  ) && (
-    istHour < MARKET_CLOSE_HOUR || (istHour === MARKET_CLOSE_HOUR && istMinute <= MARKET_CLOSE_MINUTE)
-  );
+  const isBeforeOpen = istHour < MARKET_OPEN_HOUR || (istHour === MARKET_OPEN_HOUR && istMinute < MARKET_OPEN_MINUTE);
+  const isAfterClose = istHour > MARKET_CLOSE_HOUR || (istHour === MARKET_CLOSE_HOUR && istMinute > MARKET_CLOSE_MINUTE);
+  const localMarketOpen = !isWeekend && !isHoliday && !isBeforeOpen && !isAfterClose;
+  const localMarketReason = isWeekend
+    ? 'Weekend'
+    : isHoliday
+      ? 'Holiday'
+      : isBeforeOpen
+        ? 'Before market open'
+        : isAfterClose
+          ? 'After market close'
+          : 'Open';
+
+  const backendMarketOpen = typeof stats?.market_open === 'boolean' ? stats.market_open : null;
+  const backendMarketReason = stats?.market_reason || null;
+  const isMarketOpen = backendMarketOpen !== null ? backendMarketOpen : localMarketOpen;
+  const marketClosedReason = isMarketOpen ? null : (backendMarketReason || localMarketReason);
 
   // --- Professional Signal Integration ---
   // ...existing code...
 
   return (
-    <div style={{
-      background: 'rgba(255, 255, 255, 0.95)',
-      borderRadius: '16px',
-      padding: '32px',
-      marginBottom: '32px',
-      boxShadow: '0 8px 32px rgba(0, 0, 0, 0.1)'
-    }}>
+    <div style={{ minHeight: '100vh', background: '#f3f4f6', padding: '24px' }}>
+      <div style={{
+        textAlign: 'center',
+        fontSize: '2.2rem',
+        fontWeight: 700,
+        color: '#b0b7c3',
+        letterSpacing: '2px',
+        margin: '0 0 18px 0',
+        fontFamily: 'inherit',
+      }}>
+        ALGORITHM BASED AUTO TRADING
+      </div>
+      <div style={{ maxWidth: '1400px', margin: '24px auto 0' }}>
+        <div style={{
+          background: 'rgba(255, 255, 255, 0.95)',
+          borderRadius: '16px',
+          padding: '32px',
+          marginBottom: '32px',
+          boxShadow: '0 8px 32px rgba(0, 0, 0, 0.1)'
+        }}>
       {!isMarketOpen && (
         <div style={{
           marginBottom: '16px',
@@ -1596,7 +1674,7 @@ const AutoTradingDashboard = () => {
           fontSize: '13px',
           fontWeight: '600'
         }}>
-          🚫 Market Closed / Holiday. Trading allowed only during market hours (9:15 AM – 3:30 PM IST).
+          🚫 Market Closed{marketClosedReason ? ` (${marketClosedReason})` : ''}. Trading allowed only during market hours (9:15 AM – 3:30 PM IST).
         </div>
       )}
       <style>{`
@@ -2252,51 +2330,51 @@ const AutoTradingDashboard = () => {
                 🔴 Live Entry Price
               </div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#1a202c' }}>
-                ₹{displayEntryPrice != null ? Number(displayEntryPrice).toFixed(2) : '--'}
+                ₹{liveEntryPrice != null ? Number(liveEntryPrice).toFixed(2) : '--'}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>
-                Target (+{displayTargetPoints != null ? displayTargetPoints.toFixed(2) : '--'}pts)
+                Target (+{liveTargetPoints != null ? liveTargetPoints.toFixed(2) : '--'}pts)
               </div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#48bb78' }}>
-                ₹{displayTarget != null ? Number(displayTarget).toFixed(2) : '--'}
+                ₹{liveTarget != null ? Number(liveTarget).toFixed(2) : '--'}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>
-                Stop Loss (-{displaySlPoints != null ? displaySlPoints.toFixed(2) : '--'}pts)
+                Stop Loss (-{liveSlPoints != null ? liveSlPoints.toFixed(2) : '--'}pts)
               </div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#f56565' }}>
-                ₹{displayStopLoss != null ? Number(displayStopLoss).toFixed(2) : '--'}
+                ₹{liveStopLoss != null ? Number(liveStopLoss).toFixed(2) : '--'}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Potential Profit</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#38a169' }}>
-                ₹{displayTarget != null && displayEntryPrice != null
-                  ? ((Number(displayTarget) - Number(displayEntryPrice)) * displayQuantity * lotMultiplier).toLocaleString()
+                ₹{liveTarget != null && liveEntryPrice != null
+                  ? ((Number(liveTarget) - Number(liveEntryPrice)) * liveQuantity * lotMultiplier).toLocaleString()
                   : '--'}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Max Risk</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#e53e3e' }}>
-                ₹{displayStopLoss != null && displayEntryPrice != null
-                  ? ((Number(displayEntryPrice) - Number(displayStopLoss)) * displayQuantity * lotMultiplier).toLocaleString()
+                ₹{liveStopLoss != null && liveEntryPrice != null
+                  ? ((Number(liveEntryPrice) - Number(liveStopLoss)) * liveQuantity * lotMultiplier).toLocaleString()
                   : '--'}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Quantity</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#5a67d8' }}>
-                {activeSignal.quantity * lotMultiplier}
+                {liveQuantity * lotMultiplier}
               </div>
             </div>
             <div>
               <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Expiry Date</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#2d3748' }}>
-                {activeSignal.expiry_date || 'N/A'}
+                {liveExpiryDate || 'N/A'}
               </div>
             </div>
           </div>
@@ -2917,6 +2995,8 @@ const AutoTradingDashboard = () => {
         </div>
       )}
       
+        </div>
+      </div>
     </div>
   );
 }

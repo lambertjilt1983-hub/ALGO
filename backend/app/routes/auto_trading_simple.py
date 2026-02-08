@@ -1,5 +1,6 @@
 import asyncio
 from fastapi import APIRouter, Body, Header, HTTPException, BackgroundTasks
+from pydantic import BaseModel
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
 
 # Demo trades storage for demo mode
@@ -50,7 +51,7 @@ from sqlalchemy import func
 from app.engine.auto_trading_engine import AutoTradingEngine
 from app.engine.zerodha_broker import ZerodhaBroker
 from app.engine.simple_momentum_strategy import SimpleMomentumStrategy
-from app.core.market_hours import ist_now, is_market_open
+from app.core.market_hours import ist_now, is_market_open, market_status
 
 
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
@@ -72,6 +73,7 @@ async def option_chain(
         raise HTTPException(status_code=500, detail=f"Failed to fetch option chain: {str(e)}")
 
 MAX_TRADES = 10000  # allow more intraday trades when signals align
+SINGLE_ACTIVE_TRADE = True  # hard lock: only one live trade at a time
 TARGET_PCT = 0.6  # target move in percent (slightly above stop for RR >= 1)
 STOP_PCT = 0.4    # stop move in percent (tighter risk)
 CONFIRM_MOMENTUM_PCT = 0.1  # very loose confirmation so signals appear on small moves
@@ -956,6 +958,8 @@ async def status(authorization: Optional[str] = Header(None)):
     active = active_trades
     win_rate, win_sample = _recent_win_rate()
     capital_in_use = _capital_in_use()
+    market = market_status(dt_time(9, 15), dt_time(15, 30))
+    print("[DEBUG] /autotrade/status market_status:", market, flush=True)
     payload = {
         "enabled": True,
         "is_demo_mode": state["is_demo_mode"],
@@ -970,8 +974,13 @@ async def status(authorization: Optional[str] = Header(None)):
         "trading_paused": state.get("trading_paused", False),
         "pause_reason": state.get("pause_reason"),
         "capital_in_use": round(capital_in_use, 2),
+        "market_open": market["is_open"],
+        "market_reason": market["reason"],
+        "market_date": market["current_date"],
+        "market_time": market["current_time"],
         "timestamp": _now(),
     }
+    print("[DEBUG] /autotrade/status payload:", payload, flush=True)
     return {"status": payload, **payload}
 
 
@@ -1161,6 +1170,8 @@ async def analyze(
     can_trade = (
         len(active_trades) < MAX_TRADES and remaining_cap >= required_capital and required_capital > 0
     )
+    if SINGLE_ACTIVE_TRADE and any(t.get("status") == "OPEN" for t in active_trades):
+        can_trade = False
 
 
     # Optionally auto-trigger trade execution for each recommendation
@@ -1255,6 +1266,20 @@ async def execute(
     # Ignore balance, demo mode, trading window, and max trades. Always execute trade if market is live.
     mode = "LIVE"
 
+    auto_demo = bool(state.get("is_demo_mode"))
+    trade = TradeRequest(
+        symbol=symbol,
+        price=price,
+        balance=balance,
+        quantity=quantity,
+        side=side,
+        stop_loss=stop_loss,
+        target=target,
+        support=support,
+        resistance=resistance,
+        broker_id=broker_id,
+    )
+
     option_kind = _option_kind(trade.symbol)
 
     # ═══════════════════════════════════════════════════════════════
@@ -1315,10 +1340,9 @@ async def execute(
         if len(active_trades) >= MAX_TRADES and not auto_demo:
             raise HTTPException(status_code=429, detail="Max active trades reached")
 
-        if not auto_demo:
-            existing = next((t for t in active_trades if t.get("status") == "OPEN"), None)
-            if existing:
-                raise HTTPException(status_code=429, detail="Another trade is already open")
+        existing = next((t for t in active_trades if t.get("status") == "OPEN"), None)
+        if existing:
+            raise HTTPException(status_code=429, detail="Another trade is already open")
 
         broker_response: Dict[str, any] = {}
 

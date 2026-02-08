@@ -1,4 +1,22 @@
+
 import os
+from dotenv import load_dotenv
+# Standardized env loading: use ENV_FILE or ENVIRONMENT
+env_file = os.environ.get("ENV_FILE")
+if not env_file:
+    env = os.environ.get("ENVIRONMENT", "production").lower()
+    if env == "qa":
+        env_file = os.path.join(os.path.dirname(__file__), ".env.qa")
+    elif env == "local":
+        env_file = os.path.join(os.path.dirname(__file__), ".env.local")
+    else:
+        env_file = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(env_file):
+    load_dotenv(env_file)
+    print(f"[ENV] Loaded environment from {env_file}")
+else:
+    print(f"[ENV] WARNING: Env file {env_file} not found!")
+
 from app.core.database import SessionLocal
 from app.models.auth import User
 from app.core.security import encryption_manager
