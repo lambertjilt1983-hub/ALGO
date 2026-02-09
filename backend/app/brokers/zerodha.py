@@ -18,7 +18,7 @@ from app.auth.service import AuthService
 from app.core.security import encryption_manager
 from app.models.auth import BrokerCredential
 from app.core.database import SessionLocal
-from datetime import datetime
+from app.core.security import encryption_manager
 
 class ZerodhaKite(BrokerInterface):
     """Zerodha Kite Connect API integration (always loads credentials from DB)"""

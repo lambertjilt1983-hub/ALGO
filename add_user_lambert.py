@@ -7,16 +7,23 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment variables from .env files
-env_paths = [
-    Path('f:/ALGO/backend/.env'),
-    Path('f:/ALGO/.env')
-]
 
-for env_path in env_paths:
-    if env_path.exists():
-        load_dotenv(env_path)
-        print(f"✅ Loaded environment from {env_path}")
+# Standardized env loading: use ENV_FILE or ENVIRONMENT
+env_file = os.environ.get("ENV_FILE")
+if not env_file:
+    env = os.environ.get("ENVIRONMENT", "production").lower()
+    base_dir = Path(__file__).parent
+    if env == "qa":
+        env_file = base_dir / "backend" / ".env.qa"
+    elif env == "local":
+        env_file = base_dir / "backend" / ".env.local"
+    else:
+        env_file = base_dir / "backend" / ".env"
+if Path(env_file).exists():
+    load_dotenv(env_file)
+    print(f"[ENV] Loaded environment from {env_file}")
+else:
+    print(f"[ENV] WARNING: Env file {env_file} not found!")
 
 sys.path.insert(0, 'f:/ALGO/backend')
 
