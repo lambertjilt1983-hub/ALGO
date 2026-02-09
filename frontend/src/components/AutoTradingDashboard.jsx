@@ -46,7 +46,7 @@ const AUTO_TRADE_UPDATE_API = `${config.API_BASE_URL}/autotrade/trades/update-pr
 // === AGGRESSIVE LOSS MANAGEMENT SYSTEM ===
 const DEFAULT_DAILY_LOSS_LIMIT = 5000; // ₹5000 max daily loss - hardstop
 const DEFAULT_DAILY_PROFIT_TARGET = 10000; // ₹10000 profit target - auto-stop at profit
-const MIN_SIGNAL_CONFIDENCE = 80; // 80%+ confidence (AI adjusts dynamically)
+const MIN_SIGNAL_CONFIDENCE = 98; // 98%+ confidence required to start trade
 const MIN_RR = 1.2; // Minimum risk:reward for entries
 const MIN_PAPER_CONFIDENCE = 50; // Lower threshold for demo/paper trades
 const MIN_PAPER_RR = 1.0; // Lower RR threshold for demo/paper trades
@@ -732,8 +732,9 @@ const AutoTradingDashboard = () => {
       });
       
       if (highQualitySignals.length === 0) {
-        console.log('❌ No signals meet EXECUTION criteria (quality 99+, 100+ score, 75+ momentum)');
-        // No trade if no 99% quality signal, just wait
+        console.log('❌ No signals meet EXECUTION criteria (quality 98+, 100+ score, 75+ momentum)');
+        // No trade if no 98% quality signal, just wait
+        setStatusMessage('Waiting for signal...');
         return;
       }
 
@@ -778,6 +779,7 @@ const AutoTradingDashboard = () => {
       const signalQuality = bestSignal.confirmation_score || bestSignal.confidence || 0;
       if (signalQuality < MIN_SIGNAL_CONFIDENCE) {
         console.warn(`⚠️ REJECTED: Signal confidence ${signalQuality}% below minimum ${MIN_SIGNAL_CONFIDENCE}%`);
+        setStatusMessage('Waiting for signal...');
         return;
       }
       

@@ -51,13 +51,16 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: str = "https://algo-trade-frontend.up.railway.app"
     
     class Config:
-        env_file = os.environ.get("ENV_FILE", ".env")
-        if env_file == "env.qa":
-            env_file = ".env.qa"
-        elif env_file == "env.local":
-            env_file = ".env.local"
-        else:
-            env_file = ".env"
+        # Robust env file selection for local/production
+        env_file = os.environ.get("ENV_FILE")
+        if not env_file:
+            env = os.environ.get("ENVIRONMENT", "production").lower()
+            if env == "qa":
+                env_file = ".env.qa"
+            elif env == "local":
+                env_file = ".env.local"
+            else:
+                env_file = ".env"
         case_sensitive = True
         extra = "ignore"  # Allow extra fields in .env file
 

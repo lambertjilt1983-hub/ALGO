@@ -1,3 +1,237 @@
+## Explicit OPTIONS handler removed; CORSMiddleware will handle preflight requests
+
+# Move explicit CORS preflight handler after app instance
+
+# ...existing code...
+
+
+# Import required modules before app instance
+import os
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.requests import Request
+from app.routes import auth, broker, orders, strategies, market_intelligence, auto_trading_simple, test_market, token_refresh, admin, option_signals, zerodha_postback, paper_trading
+from app.core.database import Base, engine, SessionLocal
+from app.core.config import get_settings
+from app.core.background_tasks import start_background_tasks, stop_background_tasks
+from app import brokers  # Import brokers to trigger registration
+from app.auth.service import AuthService
+
+
+# --- FastAPI lifespan event handler (replaces deprecated on_event) ---
+from contextlib import asynccontextmanager
+import logging
+import importlib.util
+from pathlib import Path
+
+def _check_required_dependencies(logger: logging.Logger) -> None:
+    requirements_path = Path(__file__).resolve().parent.parent / "requirements.txt"
+    if not requirements_path.exists():
+        logger.warning("[STARTUP] requirements.txt not found; skipping dependency check.")
+        return
+
+    import_map = {
+        "python-dotenv": "dotenv",
+        "pydantic-settings": "pydantic_settings",
+        "python-jose": "jose",
+        "passlib": "passlib",
+        "psycopg2-binary": "psycopg2",
+        "scikit-learn": "sklearn",
+        "websocket-client": "websocket",
+    }
+
+    missing = []
+    for line in requirements_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        package = line.split("==")[0].strip()
+        module = import_map.get(package, package.replace("-", "_"))
+        if importlib.util.find_spec(module) is None:
+            missing.append(package)
+
+    if missing:
+        logger.error("[STARTUP] Missing Python dependencies: %s", ", ".join(missing))
+        logger.error("[STARTUP] Install with: pip install -r backend/requirements.txt")
+    else:
+        logger.info("[STARTUP] Dependency check passed.")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("startup")
+    logger.info("[STARTUP] FastAPI startup event triggered.")
+    _check_required_dependencies(logger)
+    db = SessionLocal()
+    try:
+        logger.info("[STARTUP] Ensuring default admin user...")
+        AuthService.ensure_default_admin(db)
+        logger.info("[STARTUP] Default admin ensured.")
+    except Exception as e:
+        logger.error(f"[STARTUP] Exception during startup: {e}", exc_info=True)
+    finally:
+        db.close()
+        logger.info("[STARTUP] Database session closed.")
+    # Start background tasks
+    logger.info("[STARTUP] Starting background tasks...")
+    start_background_tasks()
+    logger.info("[STARTUP] Background tasks started.")
+    yield
+    # Shutdown
+    logger.info("[SHUTDOWN] FastAPI shutdown event triggered.")
+    logger.info("[SHUTDOWN] Stopping background tasks...")
+    stop_background_tasks()
+    logger.info("[SHUTDOWN] Background tasks stopped.")
+
+# Single app instance with all config
+app = FastAPI(
+    title="AlgoTrade Pro",
+    description="Enterprise Algorithmic Trading Platform",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# ...existing code...
+
+# Explicit CORS preflight handler for OPTIONS requests
+from fastapi.responses import JSONResponse
+from fastapi.requests import Request
+@app.options("/{path:path}")
+async def preflight_handler(request: Request, path: str):
+    origin = request.headers.get("origin")
+    allowed = origin if origin in allowed_origins else allowed_origins[0]
+    headers = {
+        "Access-Control-Allow-Origin": allowed,
+        "Access-Control-Allow-Methods": request.headers.get("access-control-request-method", "*"),
+        "Access-Control-Allow-Headers": request.headers.get("access-control-request-headers", "*"),
+        "Access-Control-Allow-Credentials": "true",
+    }
+    return JSONResponse(status_code=200, content={}, headers=headers)
+
+import os
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.requests import Request
+from app.routes import auth, broker, orders, strategies, market_intelligence, auto_trading_simple, test_market, token_refresh, admin, option_signals, zerodha_postback, paper_trading
+from app.core.database import Base, engine, SessionLocal
+from app.core.config import get_settings
+from app.core.background_tasks import start_background_tasks, stop_background_tasks
+from app import brokers  # Import brokers to trigger registration
+from app.auth.service import AuthService
+from contextlib import asynccontextmanager
+
+# Create tables
+try:
+    Base.metadata.create_all(bind=engine)
+except Exception as e:
+    print(f"Warning: Could not create tables: {e}")
+
+# --- FastAPI lifespan event handler (replaces deprecated on_event) ---
+# ...existing code...
+
+# ...existing code...
+
+# --- FastAPI lifespan event handler (replaces deprecated on_event) ---
+from contextlib import asynccontextmanager
+import logging
+import importlib.util
+from pathlib import Path
+
+def _check_required_dependencies(logger: logging.Logger) -> None:
+    requirements_path = Path(__file__).resolve().parent.parent / "requirements.txt"
+    if not requirements_path.exists():
+        logger.warning("[STARTUP] requirements.txt not found; skipping dependency check.")
+        return
+
+    import_map = {
+        "python-dotenv": "dotenv",
+        "pydantic-settings": "pydantic_settings",
+        "python-jose": "jose",
+        "passlib": "passlib",
+        "psycopg2-binary": "psycopg2",
+        "scikit-learn": "sklearn",
+        "websocket-client": "websocket",
+    }
+
+    missing = []
+    for line in requirements_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        package = line.split("==")[0].strip()
+        module = import_map.get(package, package.replace("-", "_"))
+        if importlib.util.find_spec(module) is None:
+            missing.append(package)
+
+    if missing:
+        logger.error("[STARTUP] Missing Python dependencies: %s", ", ".join(missing))
+        logger.error("[STARTUP] Install with: pip install -r backend/requirements.txt")
+    else:
+        logger.info("[STARTUP] Dependency check passed.")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("startup")
+    logger.info("[STARTUP] FastAPI startup event triggered.")
+    _check_required_dependencies(logger)
+    db = SessionLocal()
+    try:
+        logger.info("[STARTUP] Ensuring default admin user...")
+        AuthService.ensure_default_admin(db)
+        logger.info("[STARTUP] Default admin ensured.")
+    except Exception as e:
+        logger.error(f"[STARTUP] Exception during startup: {e}", exc_info=True)
+    finally:
+        db.close()
+        logger.info("[STARTUP] Database session closed.")
+    # Start background tasks
+    logger.info("[STARTUP] Starting background tasks...")
+    start_background_tasks()
+    logger.info("[STARTUP] Background tasks started.")
+    yield
+    # Shutdown
+    logger.info("[SHUTDOWN] FastAPI shutdown event triggered.")
+    logger.info("[SHUTDOWN] Stopping background tasks...")
+    stop_background_tasks()
+    logger.info("[SHUTDOWN] Background tasks stopped.")
+
+# Single app instance with all config
+app = FastAPI(
+    title="AlgoTrade Pro",
+    description="Enterprise Algorithmic Trading Platform",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# CORS middleware
+settings = get_settings()
+allowed_origins = [origin.strip() for origin in settings.ALLOWED_ORIGINS.split(",") if origin.strip()]
+placeholder_hosts = {"https://yourdomain.com", "https://www.yourdomain.com"}
+if not allowed_origins or placeholder_hosts.intersection(allowed_origins):
+    allowed_origins = [
+        settings.FRONTEND_URL,
+        settings.FRONTEND_ALT_URL,
+    ]
+# Always allow localhost:3000 and localhost:3001 for development
+for dev_origin in ["http://localhost:3000", "http://localhost:3001"]:
+    if dev_origin not in allowed_origins:
+        allowed_origins.append(dev_origin)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+## Removed custom response middleware; rely solely on FastAPI CORSMiddleware
+
+## Explicit CORS preflight handler is no longer needed; handled by CORSMiddleware and response middleware
 import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -84,6 +318,7 @@ async def lifespan(app: FastAPI):
     stop_background_tasks()
     logger.info("[SHUTDOWN] Background tasks stopped.")
 
+
 # Single app instance with all config
 app = FastAPI(
     title="AlgoTrade Pro",
@@ -92,22 +327,25 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS middleware
+# CORS middleware (must be first)
 settings = get_settings()
 allowed_origins = [origin.strip() for origin in settings.ALLOWED_ORIGINS.split(",") if origin.strip()]
 placeholder_hosts = {"https://yourdomain.com", "https://www.yourdomain.com"}
 if not allowed_origins or placeholder_hosts.intersection(allowed_origins):
-    # Fallback to known frontend URLs when env var still has placeholders.
     allowed_origins = [
         settings.FRONTEND_URL,
         settings.FRONTEND_ALT_URL,
     ]
+# Always allow localhost:3000 and localhost:3001 for development
+for dev_origin in ["http://localhost:3000", "http://localhost:3001"]:
+    if dev_origin not in allowed_origins:
+        allowed_origins.append(dev_origin)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"] ,
+    allow_headers=["*"] ,
 )
 
 # Include routers
