@@ -1,9 +1,10 @@
 
 import sys
-from app.brokers.zerodha import ZerodhaKite
-from app.routes.broker import get_broker_credentials
-from app.core.database import SessionLocal
 from datetime import datetime
+from app.auth.service import AuthService, BrokerAuthService
+from app.brokers.zerodha import ZerodhaKite
+from app.core.database import SessionLocal
+from app.core.security import encryption_manager
 
 async def get_option_chain(symbol: str, expiry: str, authorization: str = None):
     """
@@ -16,12 +17,25 @@ async def get_option_chain(symbol: str, expiry: str, authorization: str = None):
         token = authorization.split(" ", 1)[1]
     elif authorization:
         token = authorization
-    # Always pass only the JWT token string
-    broker_cred = await get_broker_credentials(broker_name="zerodha", db=db, token=token)
+    if not token:
+        db.close()
+        raise ValueError("Missing authorization token")
+
+    payload = AuthService.verify_token(token)
+    user_id = int(payload.get("sub"))
+    broker_cred = BrokerAuthService.get_credentials(user_id=user_id, broker_name="zerodha", db=db)
+
+    def _decrypt(value: str | None) -> str | None:
+        if not value:
+            return None
+        try:
+            return encryption_manager.decrypt_credentials(value)
+        except Exception:
+            return value
     # Decrypt credentials if needed
-    api_key = broker_cred.api_key
-    api_secret = broker_cred.api_secret
-    access_token = broker_cred.access_token
+    api_key = _decrypt(broker_cred.api_key)
+    api_secret = _decrypt(broker_cred.api_secret)
+    access_token = _decrypt(broker_cred.access_token)
     refresh_token = getattr(broker_cred, 'refresh_token', None)
     token_expiry = getattr(broker_cred, 'token_expiry', None)
 

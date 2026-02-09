@@ -1231,6 +1231,13 @@ async def analyze(
     return response
 
 
+try:
+    BaseModel
+except NameError:
+    from pydantic import BaseModel as _BaseModel
+    BaseModel = _BaseModel
+
+
 class TradeRequest(BaseModel):
     symbol: str
     price: float = 0.0

@@ -166,11 +166,11 @@ export default function App() {
               <div style={{
                 backgroundColor: 'white',
                 borderRadius: '0.5rem',
-                boxShadow: '0 10px 25px rgba(0,0,0,0.1)'
-              , padding: '2rem',
-                width: '100%'
-              , maxWidth: '420px'
-              , textAlign: 'center'
+                boxShadow: '0 10px 25px rgba(0,0,0,0.1)',
+                padding: '2rem',
+                width: '100%',
+                maxWidth: '420px',
+                textAlign: 'center'
               }}>
                 <h2 style={{ marginTop: 0, color: '#1e40af' }}>Login required</h2>
                 <p style={{ color: '#6b7280' }}>Please log in to access Auto Trading.</p>

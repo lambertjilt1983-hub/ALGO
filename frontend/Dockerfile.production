@@ -27,15 +27,18 @@ COPY --from=builder /app/dist /usr/share/nginx/html
 # Verify files were copied
 RUN ls -la /usr/share/nginx/html/
 
-# Copy nginx configuration
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+# Copy nginx configuration template for built-in envsubst
+COPY nginx.conf /etc/nginx/templates/default.conf.template
 
-# Expose port 80
-EXPOSE 80
+# Expose port 8080 (Railway default)
+EXPOSE 8080
+
+# Default port for platforms that do not set PORT
+ENV PORT=8080
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-  CMD wget --quiet --tries=1 --spider http://localhost/ || exit 1
+  CMD wget --quiet --tries=1 --spider http://localhost:${PORT}/ || exit 1
 
-# Start nginx
+# Start nginx (entrypoint will render templates)
 CMD ["nginx", "-g", "daemon off;"]

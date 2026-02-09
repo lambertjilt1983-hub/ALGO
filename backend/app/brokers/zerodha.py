@@ -14,7 +14,9 @@ def get_zerodha_access_token():
     return os.getenv("ZERODHA_ACCESS_TOKEN")
 
 
-from app.auth.service import AuthService, BrokerAuthService
+from app.auth.service import AuthService
+from app.core.security import encryption_manager
+from app.models.auth import BrokerCredential
 from app.core.database import SessionLocal
 from app.core.security import encryption_manager
 
@@ -27,52 +29,53 @@ class ZerodhaKite(BrokerInterface):
         """Factory: Load credentials from DB, handle expiry/refresh."""
         from app.core.token_manager import TokenManager
         db = SessionLocal()
-        try:
-            token = None
-            if authorization and authorization.startswith("Bearer "):
-                token = authorization.split(" ", 1)[1]
-            elif authorization:
-                token = authorization
-
-            if not token:
-                raise ValueError("Missing authorization token")
-
-            payload = AuthService.verify_token(token)
-            user_id = int(payload.get("sub"))
-            broker_cred = BrokerAuthService.get_credentials(
-                user_id=user_id,
-                broker_name="zerodha",
-                db=db,
-            )
-
-            def _decrypt(value: str | None) -> str | None:
-                if not value:
-                    return None
-                try:
-                    return encryption_manager.decrypt_credentials(value)
-                except Exception:
-                    return value
-
-            api_key = _decrypt(broker_cred.api_key) or ""
-            api_secret = _decrypt(broker_cred.api_secret) or ""
-            access_token = _decrypt(broker_cred.access_token)
-            refresh_token = _decrypt(getattr(broker_cred, "refresh_token", None))
-            token_expiry = getattr(broker_cred, "token_expiry", None)
-            broker_id = getattr(broker_cred, "id", None)
-
-            if token_expiry and datetime.utcnow() >= token_expiry and broker_id:
-                print("[ZERODHA] Access token expired, refreshing...")
-                refresh_result = TokenManager.refresh_zerodha_token(broker_id, db, refresh_token)
-                if refresh_result.get("status") == "success":
-                    broker_cred = db.query(type(broker_cred)).filter_by(id=broker_id).first()
-                    access_token = _decrypt(broker_cred.access_token)
-                    print(f"[ZERODHA] Token refreshed for broker_id={broker_id}")
-                else:
-                    print(f"[ZERODHA] Token refresh failed: {refresh_result}")
-
-            return cls(api_key, api_secret, access_token)
-        finally:
+        token = None
+        if authorization and authorization.startswith("Bearer "):
+            token = authorization.split(" ", 1)[1]
+        elif authorization:
+            token = authorization
+        if not token:
             db.close()
+            raise ValueError("Missing authorization token")
+
+        payload = AuthService.verify_token(token)
+        user_id = int(payload.get("sub"))
+
+        broker_cred = db.query(BrokerCredential).filter(
+            (BrokerCredential.user_id == user_id) &
+            (BrokerCredential.broker_name.ilike("%zerodha%"))
+        ).order_by(BrokerCredential.created_at.desc()).first()
+
+        if not broker_cred:
+            db.close()
+            raise ValueError("No Zerodha broker found for user")
+
+        def _decrypt(value: str | None) -> str | None:
+            if not value:
+                return None
+            try:
+                return encryption_manager.decrypt_credentials(value)
+            except Exception:
+                return value
+
+        api_key = _decrypt(broker_cred.api_key)
+        api_secret = _decrypt(broker_cred.api_secret)
+        access_token = _decrypt(broker_cred.access_token)
+        refresh_token = _decrypt(getattr(broker_cred, 'refresh_token', None))
+        token_expiry = getattr(broker_cred, 'token_expiry', None)
+        broker_id = getattr(broker_cred, 'id', None)
+        # Check expiry and refresh if needed
+        if token_expiry and datetime.utcnow() >= token_expiry and broker_id:
+            print(f"[ZERODHA] Access token expired, refreshing...")
+            refresh_result = TokenManager.refresh_zerodha_token(broker_id, db)
+            if refresh_result.get("status") == "success":
+                # Reload credential from DB to get new access_token
+                broker_cred = db.query(type(broker_cred)).filter_by(id=broker_id).first()
+                access_token = _decrypt(broker_cred.access_token)
+                print(f"[ZERODHA] Token refreshed for broker_id={broker_id}")
+            else:
+                print(f"[ZERODHA] Token refresh failed: {refresh_result}")
+        return cls(api_key or "", api_secret or "", access_token)
 
     def __init__(self, api_key: str, api_secret: str, access_token: Optional[str] = None):
         super().__init__(api_key, api_secret, access_token)

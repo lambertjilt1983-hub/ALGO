@@ -1,20 +1,4 @@
 import os
-from dotenv import load_dotenv
-# Standardized env loading: use ENV_FILE or ENVIRONMENT
-env_file = os.environ.get("ENV_FILE")
-if not env_file:
-    env = os.environ.get("ENVIRONMENT", "production").lower()
-    if env == "qa":
-        env_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env.qa")
-    elif env == "local":
-        env_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env.local")
-    else:
-        env_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
-if os.path.exists(env_file):
-    load_dotenv(env_file)
-    print(f"[ENV] Loaded environment from {env_file}")
-else:
-    print(f"[ENV] WARNING: Env file {env_file} not found!")
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routes import auth, broker, orders, strategies, market_intelligence, auto_trading_simple, test_market, token_refresh, admin, option_signals, zerodha_postback, paper_trading
@@ -34,6 +18,40 @@ except Exception as e:
 # --- FastAPI lifespan event handler (replaces deprecated on_event) ---
 from contextlib import asynccontextmanager
 import logging
+import importlib.util
+from pathlib import Path
+
+def _check_required_dependencies(logger: logging.Logger) -> None:
+    requirements_path = Path(__file__).resolve().parent.parent / "requirements.txt"
+    if not requirements_path.exists():
+        logger.warning("[STARTUP] requirements.txt not found; skipping dependency check.")
+        return
+
+    import_map = {
+        "python-dotenv": "dotenv",
+        "pydantic-settings": "pydantic_settings",
+        "python-jose": "jose",
+        "passlib": "passlib",
+        "psycopg2-binary": "psycopg2",
+        "scikit-learn": "sklearn",
+        "websocket-client": "websocket",
+    }
+
+    missing = []
+    for line in requirements_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        package = line.split("==")[0].strip()
+        module = import_map.get(package, package.replace("-", "_"))
+        if importlib.util.find_spec(module) is None:
+            missing.append(package)
+
+    if missing:
+        logger.error("[STARTUP] Missing Python dependencies: %s", ", ".join(missing))
+        logger.error("[STARTUP] Install with: pip install -r backend/requirements.txt")
+    else:
+        logger.info("[STARTUP] Dependency check passed.")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -41,6 +59,7 @@ async def lifespan(app: FastAPI):
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("startup")
     logger.info("[STARTUP] FastAPI startup event triggered.")
+    _check_required_dependencies(logger)
     db = SessionLocal()
     try:
         logger.info("[STARTUP] Ensuring default admin user...")
@@ -76,6 +95,13 @@ app = FastAPI(
 # CORS middleware
 settings = get_settings()
 allowed_origins = [origin.strip() for origin in settings.ALLOWED_ORIGINS.split(",") if origin.strip()]
+placeholder_hosts = {"https://yourdomain.com", "https://www.yourdomain.com"}
+if not allowed_origins or placeholder_hosts.intersection(allowed_origins):
+    # Fallback to known frontend URLs when env var still has placeholders.
+    allowed_origins = [
+        settings.FRONTEND_URL,
+        settings.FRONTEND_ALT_URL,
+    ]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
