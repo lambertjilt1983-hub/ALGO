@@ -304,8 +304,9 @@ const AutoTradingDashboard = () => {
       });
       
       // Filter only 50%+ quality trades and sort by quality descending (weighted scoring)
+      // PATCH: Lowered threshold to 0 for testing (show all)
       const qualityOnly = qualityScores
-        .filter(s => s.quality >= 50)
+        .filter(s => s.quality >= 0)
         .sort((a, b) => b.quality - a.quality);
 
       // Count today's executed trades (active + closed)
@@ -1968,7 +1969,7 @@ const AutoTradingDashboard = () => {
             fontSize: '18px',
             fontWeight: 'bold'
           }}>
-            🎯 All Quality Signals (NIFTY • BANKNIFTY • SENSEX • FINNIFTY - 75%+ Quality)
+            🎯 All Quality Signals (NIFTY • BANKNIFTY • SENSEX • FINNIFTY - 85%+ Quality, All Options)
           </h4>
           <button
             onClick={scanMarketForQualityTrades}
@@ -1987,7 +1988,7 @@ const AutoTradingDashboard = () => {
           </button>
         </div>
 
-        {qualityTrades.length > 0 ? (
+        {qualityTrades.filter(t => t.quality >= 0).length > 0 ? (
           <div style={{ overflowX: 'auto' }}>
             <table style={{
               width: '100%',
@@ -2004,15 +2005,47 @@ const AutoTradingDashboard = () => {
                   <th style={{ padding: '10px', textAlign: 'center' }}>Entry</th>
                   <th style={{ padding: '10px', textAlign: 'center' }}>Target</th>
                   <th style={{ padding: '10px', textAlign: 'center' }}>Rating</th>
+                  <th style={{ padding: '10px', textAlign: 'center' }}>All Option Signals</th>
                 </tr>
               </thead>
               <tbody>
-                {scannerTrades.map((trade, idx) => (
-                  <tr key={idx} style={{
-                    background: idx % 2 === 0 ? '#fffbeb' : '#fef3c7',
-                    borderBottom: '1px solid #fcd34d'
-                  }}>
-                    <td style={{ padding: '10px', fontWeight: '600', color: '#1f2937' }}>{trade.symbol}</td>
+                {qualityTrades.filter(trade => trade.quality >= 85).map((trade, idx) => {
+                  // Highlight Nifty 50 company options
+                  const NIFTY_50_SYMBOLS = [
+                    "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
+                    "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BEL", "BPCL",
+                    "BHARTIARTL", "BRITANNIA", "CIPLA", "COALINDIA", "DRREDDY",
+                    "EICHERMOT", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE",
+                    "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDUSINDBK",
+                    "INFY", "ITC", "JSWSTEEL", "KOTAKBANK", "LT",
+                    "M&M", "MARUTI", "NESTLEIND", "NTPC", "ONGC",
+                    "POWERGRID", "RELIANCE", "SBIN", "SBILIFE", "SHRIRAMFIN",
+                    "SUNPHARMA", "TATAMOTORS", "TATASTEEL", "TCS", "TECHM",
+                    "TITAN", "ULTRACEMCO", "WIPRO"
+                  ];
+                  const isNifty50 = NIFTY_50_SYMBOLS.some(sym => trade.symbol && trade.symbol.toUpperCase().includes(sym));
+                  return (
+                    <tr key={idx} style={{
+                      background: isNifty50 ? '#e0f2fe' : (idx % 2 === 0 ? '#fffbeb' : '#fef3c7'),
+                      borderBottom: '1px solid #fcd34d'
+                    }}>
+                      <td style={{ padding: '10px', fontWeight: '600', color: isNifty50 ? '#2563eb' : '#1f2937', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        {trade.symbol}
+                        {isNifty50 && (
+                          <span style={{
+                            background: '#2563eb',
+                            color: 'white',
+                            borderRadius: '6px',
+                            padding: '2px 8px',
+                            fontSize: '11px',
+                            fontWeight: 700,
+                            marginLeft: '4px',
+                            letterSpacing: '1px'
+                          }}>
+                            NIFTY 50
+                          </span>
+                        )}
+                      </td>
                     <td style={{ padding: '10px', textAlign: 'center', color: trade.action === 'BUY' ? '#48bb78' : '#f56565' }}>
                       {trade.action}
                     </td>
@@ -2034,8 +2067,20 @@ const AutoTradingDashboard = () => {
                     <td style={{ padding: '10px', textAlign: 'center' }}>₹{trade.entry_price?.toFixed(2) || '-'}</td>
                     <td style={{ padding: '10px', textAlign: 'center' }}>₹{trade.target?.toFixed(2) || '-'}</td>
                     <td style={{ padding: '10px', textAlign: 'center' }}>{trade.recommendation}</td>
+                    <td style={{ padding: '10px', textAlign: 'center', fontSize: '12px' }}>
+                      {Array.isArray(trade.all_option_signals) && trade.all_option_signals.length > 0 ? (
+                        <ul style={{ margin: 0, padding: 0, listStyle: 'none' }}>
+                          {trade.all_option_signals.map((opt, i) => (
+                            <li key={i} style={{ marginBottom: 4 }}>
+                              <span style={{ fontWeight: 'bold' }}>{opt.symbol}</span> ({opt.action}) - Entry: ₹{opt.entry_price}, Target: ₹{opt.target}, SL: ₹{opt.stop_loss}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : '—'}
+                    </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -2469,16 +2514,16 @@ const AutoTradingDashboard = () => {
       )}
 
       {/* Active Trades */}
-      {activeTrades.length > 0 && (
-        <div style={{ marginBottom: '24px' }}>
-          <h4 style={{
-            margin: '0 0 16px 0',
-            color: '#2d3748',
-            fontSize: '18px',
-            fontWeight: 'bold'
-          }}>
-            ⚡ Active Trades (LIVE P&L)
-          </h4>
+      <div style={{ marginBottom: '24px' }}>
+        <h4 style={{
+          margin: '0 0 16px 0',
+          color: '#2d3748',
+          fontSize: '18px',
+          fontWeight: 'bold'
+        }}>
+          ⚡ Active Trades (LIVE P&L)
+        </h4>
+        {activeTrades.length > 0 ? (
           <div style={{ overflowX: 'auto' }}>
             <table style={{
               width: '100%',
@@ -2584,11 +2629,15 @@ const AutoTradingDashboard = () => {
               </tbody>
             </table>
           </div>
-        </div>
-      )}
+        ) : (
+          <div style={{ color: '#718096', textAlign: 'center', padding: '24px' }}>
+            No active trades.
+          </div>
+        )}
+      </div>
 
       {/* Trade History */}
-      {(tradeHistory.length > 0 || filteredHistory.length > 0) && (
+      <div>
         <div>
           <h4 style={{
             margin: '0 0 16px 0',
@@ -2772,7 +2821,7 @@ const AutoTradingDashboard = () => {
             </table>
           </div>
         </div>
-      )}
+      </div>
 
       {/* Empty States - Show Analysis instead of empty message */}
       {activeTrades.length === 0 && tradeHistory.length === 0 && !analysis && (

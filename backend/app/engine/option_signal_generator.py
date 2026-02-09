@@ -1,3 +1,101 @@
+from kiteconnect import KiteConnect
+def fetch_stock_option_chain(
+    stock_symbol,
+    kite: KiteConnect,
+    instruments_nfo: list[dict],
+):
+    import logging
+    logger = logging.getLogger("option_signal_debug")
+    logger.info(f"[DEBUG] Generating stock option chain for: {stock_symbol}")
+    options = [i for i in instruments_nfo if i["name"] == stock_symbol and i["segment"] == "NFO-OPT"]
+    if not options:
+        logger.warning(f"[DEBUG] No options available for {stock_symbol}")
+        return {"index": stock_symbol, "error": "No options available for this stock."}
+    quote_symbol = f"NSE:{stock_symbol}"
+    try:
+        quote = kite.quote([quote_symbol])
+        spot_price = quote[quote_symbol]["last_price"]
+        quote_data = quote[quote_symbol]
+        logger.info(f"[DEBUG] {stock_symbol} spot price: {spot_price}")
+    except Exception as e:
+        logger.error(f"[DEBUG] Quote error for {stock_symbol}: {str(e)}")
+        return {"index": stock_symbol, "error": f"Quote error: {str(e)}"}
+    from datetime import date
+    expiries = sorted(set(i["expiry"] for i in options))
+    today = date.today()
+    valid_expiries = [e for e in expiries if isinstance(e, date) and e >= today]
+    if not valid_expiries:
+        logger.warning(f"[DEBUG] No valid (future) expiries for {stock_symbol}")
+        return {"index": stock_symbol, "error": "No valid (future) expiries found for this stock."}
+    nearest_expiry = valid_expiries[0]
+    strikes = sorted(set(i["strike"] for i in options if i["expiry"] == nearest_expiry))
+    if not strikes:
+        logger.warning(f"[DEBUG] No strikes found for {stock_symbol} expiry {nearest_expiry}")
+        return {"index": stock_symbol, "error": "No strikes found for this expiry."}
+    atm_strike = min(strikes, key=lambda x: abs(x - spot_price))
+    try:
+        ce_symbol = next(i["tradingsymbol"] for i in options if i["strike"] == atm_strike and i["expiry"] == nearest_expiry and i["instrument_type"] == "CE")
+        pe_symbol = next(i["tradingsymbol"] for i in options if i["strike"] == atm_strike and i["expiry"] == nearest_expiry and i["instrument_type"] == "PE")
+        logger.info(f"[DEBUG] {stock_symbol} ATM strike: {atm_strike}, CE: {ce_symbol}, PE: {pe_symbol}")
+    except StopIteration:
+        logger.error(f"[DEBUG] No CE/PE symbol found for {stock_symbol} ATM strike {atm_strike}")
+        return {"index": stock_symbol, "error": "No CE/PE symbol found for ATM strike."}
+    try:
+        ce_key = f"NFO:{ce_symbol}"
+        pe_key = f"NFO:{pe_symbol}"
+        ce_quote = kite.quote([ce_key])[ce_key]["last_price"]
+        pe_quote = kite.quote([pe_key])[pe_key]["last_price"]
+        logger.info(f"[DEBUG] {stock_symbol} CE LTP: {ce_quote}, PE LTP: {pe_quote}")
+    except Exception as e:
+        logger.error(f"[DEBUG] Option quote error for {stock_symbol}: {str(e)}")
+        return {"index": stock_symbol, "error": f"Option quote error: {str(e)}"}
+    ce_instrument = next((i for i in options if i["tradingsymbol"] == ce_symbol), None)
+    lot_size = ce_instrument.get("lot_size", 1) if ce_instrument else 1
+    ce_signal = {
+        "index": stock_symbol,
+        "strike": atm_strike,
+        "ce_signal": f"CE LTP: {ce_quote}",
+        "pe_signal": f"PE LTP: {pe_quote}",
+        "sentiment": "LIVE",
+        "expiry_zone": nearest_expiry,
+        "risk_note": "Live data",
+        "entry_price": ce_quote,
+        "target": ce_quote + 25,
+        "stop_loss": ce_quote - 20,
+        "confidence": 85,
+        "strategy": "ATM Option CE",
+        "action": "BUY",
+        "symbol": ce_symbol,
+        "quantity": lot_size,
+        "expiry_date": str(nearest_expiry),
+        "potential_profit": 25 * lot_size,
+        "risk": 20 * lot_size,
+        "option_type": "CE"
+    }
+    pe_signal = {
+        "index": stock_symbol,
+        "strike": atm_strike,
+        "ce_signal": f"CE LTP: {ce_quote}",
+        "pe_signal": f"PE LTP: {pe_quote}",
+        "sentiment": "LIVE",
+        "expiry_zone": nearest_expiry,
+        "risk_note": "Live data",
+        "entry_price": pe_quote,
+        "target": pe_quote + 25,
+        "stop_loss": pe_quote - 20,
+        "confidence": 85,
+        "strategy": "ATM Option PE",
+        "action": "BUY",
+        "symbol": pe_symbol,
+        "quantity": lot_size,
+        "expiry_date": str(nearest_expiry),
+        "potential_profit": 25 * lot_size,
+        "risk": 20 * lot_size,
+        "option_type": "PE"
+    }
+    ce_signal = _validate_signal_quality(ce_signal, kite, quote_data)
+    pe_signal = _validate_signal_quality(pe_signal, kite, quote_data)
+    return [ce_signal, pe_signal]
 import requests
 from typing import List, Dict
 import functools
@@ -586,14 +684,21 @@ def generate_signals(
                 seen.add(sym)
         signals = []
         for idx in selected_symbols:
-            result = fetch_index_option_chain(
-                idx,
-                kite,
-                instruments_nfo,
-                instruments_bfo,
-                instruments_all,
-                bfo_error_reason,
-            )
+            if idx in ["BANKNIFTY", "NIFTY", "SENSEX", "FINNIFTY"]:
+                result = fetch_index_option_chain(
+                    idx,
+                    kite,
+                    instruments_nfo,
+                    instruments_bfo,
+                    instruments_all,
+                    bfo_error_reason,
+                )
+            else:
+                result = fetch_stock_option_chain(
+                    idx,
+                    kite,
+                    instruments_nfo,
+                )
             # flatten list of signals
             if isinstance(result, list):
                 signals.extend(result)
