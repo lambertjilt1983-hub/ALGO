@@ -332,28 +332,7 @@ const AutoTradingDashboard = () => {
 
 
   // --- Professional Signal Integration ---
-  const [professionalSignal, setProfessionalSignal] = useState(null);
-  useEffect(() => {
-    const fetchProfessionalSignal = async () => {
-      try {
-        const res = await config.authFetch(PROFESSIONAL_SIGNAL_API);
-        const data = await res.json();
-        // Check if API returned an error (detail field indicates error)
-        if (data.detail || data.error) {
-          console.log('⚠️ Professional signal error:', data.detail || data.error);
-          setProfessionalSignal({ error: data.detail || data.error });
-        } else {
-          setProfessionalSignal(data);
-        }
-      } catch (err) {
-        console.error('❌ Failed to fetch professional signal:', err);
-        setProfessionalSignal({ error: err.message });
-      }
-    };
-    fetchProfessionalSignal();
-    const interval = setInterval(fetchProfessionalSignal, 120000); // refresh every 120s (reduced API calls)
-    return () => clearInterval(interval);
-  }, []);
+
 
   // Market Quality Scanner - finds all 75%+ quality trades
   const scanMarketForQualityTrades = async () => {
@@ -1159,7 +1138,7 @@ const AutoTradingDashboard = () => {
       : 0);
 
   const liveDisplaySignal = effectiveBestQualityTrade
-    || (professionalSignal && !professionalSignal.error ? professionalSignal : null)
+    // ...removed professionalSignal fallback...
     || activeSignal;
   const liveEntryPrice = liveDisplaySignal?.entry_price;
   const liveTarget = liveDisplaySignal?.target;
@@ -2020,8 +1999,7 @@ const AutoTradingDashboard = () => {
                 {wakeLockActive ? '😴 AWAKE' : '⚠️ SLEEP MODE'}
               </span>
             </h3>
-            {/* Global Quantity Input and Start Auto Trade Button */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginTop: 8 }}>
               <label style={{ fontSize: '14px', fontWeight: 500, color: '#2d3748' }}>
                 Quantity:
                 <input
@@ -2041,22 +2019,39 @@ const AutoTradingDashboard = () => {
                 />
               </label>
               <button
-                onClick={handleStartAutoTrade}
-                disabled={autoTradingActive || !enabled}
+                onClick={async () => {
+                  if (autoTradingActive) {
+                    setAutoTradingActive(false);
+                  } else {
+                    if (!enabled) {
+                      setArmingInProgress(true);
+                      setArmError(null);
+                      const armed = await armLiveTrading();
+                      setArmingInProgress(false);
+                      if (!armed) return;
+                    }
+                    handleStartAutoTrade();
+                  }
+                }}
                 style={{
-                  background: autoTradingActive ? '#a0aec0' : '#3182ce',
+                  background: autoTradingActive ? '#e53e3e' : '#3182ce',
                   color: 'white',
                   border: 'none',
                   borderRadius: '6px',
                   padding: '6px 16px',
                   fontSize: '14px',
                   fontWeight: 600,
-                  cursor: autoTradingActive || !enabled ? 'not-allowed' : 'pointer',
-                  opacity: autoTradingActive || !enabled ? 0.6 : 1,
+                  cursor: armingInProgress ? 'wait' : 'pointer',
+                  opacity: armingInProgress ? 0.7 : 1,
                   transition: 'background 0.2s'
                 }}
+                disabled={armingInProgress}
               >
-                {autoTradingActive ? 'Auto Trade Running' : 'Start Auto Trade'}
+                {armingInProgress
+                  ? 'Enabling...'
+                  : autoTradingActive
+                    ? 'Disable Auto Trade'
+                    : 'Enable Auto Trade'}
               </button>
             </div>
           </div>
@@ -2336,75 +2331,7 @@ const AutoTradingDashboard = () => {
         )}
       </div>
 
-      {/* Professional Signal Display - uses best quality trade from market scanner */}
-      {bestQualityTrade || (professionalSignal && !professionalSignal.error) ? (
-        <div style={{
-          background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-          borderRadius: '16px',
-          padding: '24px',
-          marginBottom: '24px',
-          color: 'white',
-          boxShadow: '0 10px 40px rgba(102, 126, 234, 0.3)'
-        }}>
-          <h3 style={{ margin: '0 0 16px 0', fontSize: '20px', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '8px' }}>
-            🎯 Professional Intraday Signal
-            <span style={{
-              fontSize: '12px',
-              padding: '4px 10px',
-              borderRadius: '12px',
-              background: 'rgba(255,255,255,0.2)',
-              fontWeight: '600'
-            }}>
-              {bestQualityTrade ? '✨ SCANNED' : 'LIVE'}
-            </span>
-          </h3>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '16px' }}>
-            <div>
-              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Symbol</div>
-              <div style={{ fontSize: '18px', fontWeight: 'bold' }}>{bestQualityTrade?.symbol || professionalSignal?.symbol}</div>
-            </div>
-            <div>
-              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Action</div>
-              <div style={{ fontSize: '20px', fontWeight: 'bold' }}>
-                <span style={{
-                  padding: '6px 16px',
-                  borderRadius: '8px',
-                  background: (bestQualityTrade?.action || professionalSignal?.signal) === 'BUY' || (bestQualityTrade?.action || professionalSignal?.signal) === 'buy' ? '#48bb78' : (bestQualityTrade?.action || professionalSignal?.signal) === 'SELL' || (bestQualityTrade?.action || professionalSignal?.signal) === 'sell' ? '#f56565' : '#cbd5e0',
-                  color: 'white'
-                }}>
-                  {(bestQualityTrade?.action || professionalSignal?.signal || 'HOLD').toUpperCase()}
-                </span>
-              </div>
-            </div>
-            <div>
-              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Entry Price</div>
-              <div style={{ fontSize: '18px', fontWeight: 'bold' }}>
-                ₹{(bestQualityTrade?.entry_price || professionalSignal?.entry_price)?.toFixed(2) || 'N/A'}
-              </div>
-            </div>
-            <div>
-              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Target</div>
-              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#c6f6d5' }}>
-                ₹{(bestQualityTrade?.target || professionalSignal?.target)?.toFixed(2) || 'N/A'}
-              </div>
-            </div>
-            <div>
-              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Stop Loss</div>
-              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#fed7d7' }}>
-                ₹{(bestQualityTrade?.stop_loss || professionalSignal?.stop_loss)?.toFixed(2) || 'N/A'}
-              </div>
-            </div>
-            {bestQualityTrade && (
-              <div>
-                <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Quality Score</div>
-                <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#fbbf24' }}>
-                  {bestQualityTrade.quality}% ✨
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      ) : null}
+
 
       {/* Market Analysis / AI Recommendation */}
       {(activeSignal || filteredOptionSignalsRaw.length > 0) && (
@@ -2430,78 +2357,8 @@ const AutoTradingDashboard = () => {
               }}>
                 {selectedSignal ? `🎯 Selected Signal ${activeSignal.option_type === 'CE' ? '📈 (CALL)' : '📉 (PUT)'}` : '🎯 AI Recommendation (best signal)'}
               </h4>
-              {/* Professional Signal Section - Only show if quality >= 90% */}
-              {filteredOptionSignalsRaw.length > 0 && (
-                (() => {
-                  // Use the same quality threshold as the main table (90 or 96)
-                  const minProfessionalQuality = 90; // Change to 96 if you want stricter
-                  const professionalQuality = bestQualityTrade?.quality || professionalSignal?.quality;
-                  if (professionalQuality >= minProfessionalQuality) {
-                    return (
-                      <div style={{ margin: '32px 0' }}>
-                        <h3>🎯 Professional Intraday Signal
-                          <span style={{
-                            fontSize: '12px',
-                            padding: '4px 10px',
-                            borderRadius: '12px',
-                            background: 'rgba(255,255,255,0.2)',
-                            fontWeight: '600'
-                          }}>
-                            {bestQualityTrade ? '✨ SCANNED' : 'LIVE'}
-                          </span>
-                        </h3>
-                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '16px' }}>
-                          <div>
-                            <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Symbol</div>
-                            <div style={{ fontSize: '18px', fontWeight: 'bold' }}>{bestQualityTrade?.symbol || professionalSignal?.symbol}</div>
-                          </div>
-                          <div>
-                            <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Action</div>
-                            <div style={{ fontSize: '20px', fontWeight: 'bold' }}>
-                              <span style={{
-                                padding: '6px 16px',
-                                borderRadius: '8px',
-                                background: (bestQualityTrade?.action || professionalSignal?.signal) === 'BUY' || (bestQualityTrade?.action || professionalSignal?.signal) === 'buy' ? '#48bb78' : (bestQualityTrade?.action || professionalSignal?.signal) === 'SELL' || (bestQualityTrade?.action || professionalSignal?.signal) === 'sell' ? '#f56565' : '#cbd5e0',
-                                color: 'white'
-                              }}>
-                                {(bestQualityTrade?.action || professionalSignal?.signal || 'HOLD').toUpperCase()}
-                              </span>
-                            </div>
-                          </div>
-                          <div>
-                            <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Entry Price</div>
-                            <div style={{ fontSize: '18px', fontWeight: 'bold' }}>
-                              ₹{(bestQualityTrade?.entry_price || professionalSignal?.entry_price)?.toFixed(2) || 'N/A'}
-                            </div>
-                          </div>
-                          <div>
-                            <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Target</div>
-                            <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#c6f6d5' }}>
-                              ₹{(bestQualityTrade?.target || professionalSignal?.target)?.toFixed(2) || 'N/A'}
-                            </div>
-                          </div>
-                          <div>
-                            <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Stop Loss</div>
-                            <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#fed7d7' }}>
-                              ₹{(bestQualityTrade?.stop_loss || professionalSignal?.stop_loss)?.toFixed(2) || 'N/A'}
-                            </div>
-                          </div>
-                          {bestQualityTrade && (
-                            <div>
-                              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Quality Score</div>
-                              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#fbbf24' }}>
-                                {bestQualityTrade.quality}% ✨
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  } else {
-                    return null;
-                  }
-                })()
-              )}
+
+// ...existing code...
                   <div style={{
                     display: 'flex',
                     gap: '16px',
@@ -2617,70 +2474,7 @@ const AutoTradingDashboard = () => {
             </div>
             <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
               {/* Trend check for enabling/disabling auto-trade */}
-              {(() => {
-                let canTrade = true;
-                let trendMsg = '';
-                if (activeSignal) {
-                  if (typeof window !== 'undefined' && window.momentumAnalysis) {
-                    const mainIndex = window.momentumAnalysis['NIFTY'] ? 'NIFTY' : (window.momentumAnalysis['BANKNIFTY'] ? 'BANKNIFTY' : Object.keys(window.momentumAnalysis)[0]);
-                    const mainMomentum = window.momentumAnalysis[mainIndex] || {};
-                    if (activeSignal.option_type === 'CE' && !(mainMomentum.direction && mainMomentum.direction.includes('BULLISH'))) {
-                      canTrade = false;
-                      trendMsg = 'Trend is not bullish. Waiting for bullish momentum to start trade.';
-                    }
-                    if (activeSignal.option_type === 'PE' && !(mainMomentum.direction && mainMomentum.direction.includes('BEARISH'))) {
-                      canTrade = false;
-                      trendMsg = 'Trend is not bearish. Waiting for bearish momentum to start trade.';
-                    }
-                  }
-                } else {
-                  canTrade = false;
-                  trendMsg = 'No valid signal for auto-trading.';
-                }
-                return <>
-                  <button
-                    onClick={async () => {
-                      if (autoTradingActive) {
-                        setAutoTradingActive(false);
-                        setHasActiveTrade(false);
-                        setIsLiveMode(false);
-                        setArmError(null);
-                        return;
-                      }
-                      const armed = await armLiveTrading(false);
-                      if (armed) {
-                        setAutoTradingActive(true);
-                        setIsLiveMode(true);
-                        setArmError(null);
-                        console.log('🚀 AUTO-TRADING ACTIVATED! (LIVE MODE)');
-                      } else {
-                        setAutoTradingActive(true);
-                        setIsLiveMode(false);
-                        setArmError('Live trading not armed, running in DEMO mode.');
-                        console.log('⚪ AUTO-TRADING ACTIVATED! (DEMO MODE)');
-                      }
-                    }}
-                    disabled={armingInProgress || !canTrade}
-                    style={{
-                      padding: '12px 24px',
-                      background: armingInProgress ? '#cbd5e0' : autoTradingActive ? '#f56565' : canTrade ? '#48bb78' : '#cbd5e0',
-                      color: 'white',
-                      border: 'none',
-                      borderRadius: '8px',
-                      fontSize: '15px',
-                      fontWeight: '600',
-                      cursor: armingInProgress ? 'wait' : canTrade ? 'pointer' : 'not-allowed',
-                      boxShadow: '0 4px 6px rgba(0,0,0,0.1)',
-                      opacity: armingInProgress ? 0.7 : 1
-                    }}
-                  >
-                    {armingInProgress ? '⏳ Arming...' : autoTradingActive ? '🛑 Stop Auto-Trading' : '▶️ Start Auto-Trading'}
-                  </button>
-                  {!canTrade && (
-                    <div style={{ color: '#b91c1c', fontWeight: 500, marginLeft: 12 }}>{trendMsg}</div>
-                  )}
-                </>;
-              })()}
+              {/* Removed Start Auto Trade button from AI Recommendation table as requested */}
               {armError && (
                 <div style={{
                   padding: '12px 16px',
