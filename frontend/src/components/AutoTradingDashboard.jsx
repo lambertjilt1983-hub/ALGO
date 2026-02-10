@@ -1232,6 +1232,8 @@ const AutoTradingDashboard = () => {
       if (response.ok) {
         const data = await response.json();
         console.log(`✅ ${mode} TRADE EXECUTED: ${signal.symbol} - ${data.message || 'Success!'}`);
+        // Only after broker confirms, refresh active trades
+        await fetchData();
         // Don't show alert for auto-trades, just log
       } else {
         let errorMsg = 'Failed to execute trade.';
