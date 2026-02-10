@@ -139,6 +139,28 @@ const AutoTradingDashboard = () => {
   const [qualityTrades, setQualityTrades] = useState([]); // Market scanner results
   const [scannerLoading, setScannerLoading] = useState(false);
     // --- Market Open/Close Logic (must be above all usages) ---
+
+    // Handler for Start Auto Trade button (global)
+    const handleStartAutoTrade = async () => {
+      if (autoTradingActive) return;
+      setArmingInProgress(true);
+      setArmError(null);
+      try {
+        // Arm live trading (set to live mode)
+        // If you have a backend API to arm, call it here, else just set state
+        setAutoTradingActive(true);
+        setIsLiveMode(true);
+        // Optionally, trigger initial market analysis if needed
+        // analyzeMarket && analyzeMarket();
+        console.log('🚀 AUTO-TRADING ACTIVATED! (LIVE MODE)');
+      } catch (err) {
+        setArmError('Failed to start auto trading.');
+        setAutoTradingActive(false);
+        setIsLiveMode(false);
+      } finally {
+        setArmingInProgress(false);
+      }
+    };
     const getIstDateParts = () => {
       const formatter = new Intl.DateTimeFormat('en-US', {
         timeZone: 'Asia/Kolkata',
@@ -1955,48 +1977,89 @@ const AutoTradingDashboard = () => {
         borderBottom: '2px solid #e2e8f0'
       }}>
         <div>
-          <h3 style={{
-            margin: '0 0 8px 0',
-            color: '#2d3748',
-            fontSize: '24px',
-            fontWeight: 'bold',
-            display: 'flex',
-            alignItems: 'center',
-            gap: '12px'
-          }}>
-            🤖 Auto Trading Engine
-            <span style={{
-              fontSize: '14px',
-              padding: '4px 12px',
-              borderRadius: '20px',
-              background: autoTradingActive ? '#48bb78' : enabled ? '#ed8936' : '#cbd5e0',
-              color: 'white',
-              fontWeight: '600'
+          <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+            <h3 style={{
+              margin: '0 0 8px 0',
+              color: '#2d3748',
+              fontSize: '24px',
+              fontWeight: 'bold',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '12px'
             }}>
-              {autoTradingActive ? 'ACTIVE' : enabled ? '⏸️ STANDBY' : 'DISABLED'}
-            </span>
-            <span style={{
-              fontSize: '14px',
-              padding: '4px 12px',
-              borderRadius: '20px',
-              background: isLiveMode ? '#22c55e' : '#f59e0b',
-              color: 'white',
-              fontWeight: '600'
-            }}>
-              {isLiveMode ? '🔴 LIVE TRADES' : '⚪ DEMO MODE'}
-            </span>
-            <span style={{
-              fontSize: '14px',
-              padding: '4px 12px',
-              borderRadius: '20px',
-              background: wakeLockActive ? '#48bb78' : '#ed8936',
-              color: 'white',
-              fontWeight: '600',
-              animation: wakeLockActive ? 'pulse 2s infinite' : 'none'
-            }}>
-              {wakeLockActive ? '😴 AWAKE' : '⚠️ SLEEP MODE'}
-            </span>
-          </h3>
+              🤖 Auto Trading Engine
+              <span style={{
+                fontSize: '14px',
+                padding: '4px 12px',
+                borderRadius: '20px',
+                background: autoTradingActive ? '#48bb78' : enabled ? '#ed8936' : '#cbd5e0',
+                color: 'white',
+                fontWeight: '600'
+              }}>
+                {autoTradingActive ? 'ACTIVE' : enabled ? '⏸️ STANDBY' : 'DISABLED'}
+              </span>
+              <span style={{
+                fontSize: '14px',
+                padding: '4px 12px',
+                borderRadius: '20px',
+                background: isLiveMode ? '#22c55e' : '#f59e0b',
+                color: 'white',
+                fontWeight: '600'
+              }}>
+                {isLiveMode ? '🔴 LIVE TRADES' : '⚪ DEMO MODE'}
+              </span>
+              <span style={{
+                fontSize: '14px',
+                padding: '4px 12px',
+                borderRadius: '20px',
+                background: wakeLockActive ? '#48bb78' : '#ed8936',
+                color: 'white',
+                fontWeight: '600',
+                animation: wakeLockActive ? 'pulse 2s infinite' : 'none'
+              }}>
+                {wakeLockActive ? '😴 AWAKE' : '⚠️ SLEEP MODE'}
+              </span>
+            </h3>
+            {/* Global Quantity Input and Start Auto Trade Button */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <label style={{ fontSize: '14px', fontWeight: 500, color: '#2d3748' }}>
+                Quantity:
+                <input
+                  type="number"
+                  min={1}
+                  value={lotMultiplier}
+                  onChange={e => setLotMultiplier(Math.max(1, Number(e.target.value)))}
+                  style={{
+                    width: '60px',
+                    marginLeft: '6px',
+                    padding: '2px 6px',
+                    borderRadius: '6px',
+                    border: '1px solid #cbd5e0',
+                    fontSize: '14px',
+                    fontWeight: 500
+                  }}
+                />
+              </label>
+              <button
+                onClick={handleStartAutoTrade}
+                disabled={autoTradingActive || !enabled}
+                style={{
+                  background: autoTradingActive ? '#a0aec0' : '#3182ce',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '6px',
+                  padding: '6px 16px',
+                  fontSize: '14px',
+                  fontWeight: 600,
+                  cursor: autoTradingActive || !enabled ? 'not-allowed' : 'pointer',
+                  opacity: autoTradingActive || !enabled ? 0.6 : 1,
+                  transition: 'background 0.2s'
+                }}
+              >
+                {autoTradingActive ? 'Auto Trade Running' : 'Start Auto Trade'}
+              </button>
+            </div>
+          </div>
           <p style={{
             margin: 0,
             color: '#718096',
@@ -2013,87 +2076,7 @@ const AutoTradingDashboard = () => {
           </p>
         </div>
         <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
-          <div style={{
-            padding: '20px',
-            background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-            borderRadius: '12px',
-            color: 'white',
-            textAlign: 'center'
-          }}>
-            <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Daily Loss</div>
-            <div style={{
-              fontSize: '24px',
-              fontWeight: 'bold',
-              color: (stats?.daily_loss ?? 0) >= 0 ? '#c6f6d5' : '#fed7d7'
-            }}>
-              ₹{(stats?.daily_loss ?? 0).toLocaleString()}
-            </div>
-            <div style={{ fontSize: '11px', marginTop: '6px', opacity: 0.8 }}>
-              Limit: ₹{lossLimit}
-            </div>
-            <div style={{ marginTop: '8px', display: 'flex', gap: '6px', alignItems: 'center', justifyContent: 'center' }}>
-              <span style={{ fontSize: '10px', opacity: 0.9 }}>Set</span>
-              <input
-                type="number"
-                min="1"
-                step="100"
-                value={lossLimit}
-                onChange={(e) => {
-                  const next = Number(e.target.value);
-                  if (Number.isFinite(next) && next > 0) setLossLimit(next);
-                }}
-                style={{
-                  width: '90px',
-                  padding: '4px 6px',
-                  borderRadius: '6px',
-                  border: 'none',
-                  fontSize: '11px',
-                  textAlign: 'center'
-                }}
-              />
-            </div>
-          </div>
-          
-          <div style={{
-            padding: '20px',
-            background: 'linear-gradient(135deg, #48bb78 0%, #38a169 100%)',
-            borderRadius: '12px',
-            color: 'white',
-            textAlign: 'center'
-          }}>
-            <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Daily Profit</div>
-            <div style={{
-              fontSize: '24px',
-              fontWeight: 'bold',
-              color: '#c6f6d5'
-            }}>
-              ₹{(stats?.daily_profit ?? 0).toLocaleString()}
-            </div>
-            <div style={{ fontSize: '11px', marginTop: '6px', opacity: 0.8 }}>
-              Target: ₹{profitTarget}
-            </div>
-            <div style={{ marginTop: '8px', display: 'flex', gap: '6px', alignItems: 'center', justifyContent: 'center' }}>
-              <span style={{ fontSize: '10px', opacity: 0.9 }}>Set</span>
-              <input
-                type="number"
-                min="1"
-                step="100"
-                value={profitTarget}
-                onChange={(e) => {
-                  const next = Number(e.target.value);
-                  if (Number.isFinite(next) && next > 0) setProfitTarget(next);
-                }}
-                style={{
-                  width: '90px',
-                  padding: '4px 6px',
-                  borderRadius: '6px',
-                  border: 'none',
-                  fontSize: '11px',
-                  textAlign: 'center'
-                }}
-              />
-            </div>
-          </div>
+          {/* Daily Loss and Profit UI removed */}
           <div style={{
             padding: '20px',
             background: 'linear-gradient(135deg, #ed8936 0%, #dd6b20 100%)',
@@ -2119,7 +2102,6 @@ const AutoTradingDashboard = () => {
             <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Target / Trade</div>
             <div style={{ fontSize: '32px', fontWeight: 'bold' }}>{stats?.target_points_per_trade ?? 25}pts</div>
           </div>
-
           {stats?.portfolio_cap !== null && stats?.portfolio_cap !== undefined && (
             <div style={{
               padding: '20px',
@@ -2448,6 +2430,78 @@ const AutoTradingDashboard = () => {
               }}>
                 {selectedSignal ? `🎯 Selected Signal ${activeSignal.option_type === 'CE' ? '📈 (CALL)' : '📉 (PUT)'}` : '🎯 AI Recommendation (best signal)'}
               </h4>
+              {/* Professional Signal Section - Only show if quality >= 90% */}
+              {filteredOptionSignalsRaw.length > 0 && (
+                (() => {
+                  // Use the same quality threshold as the main table (90 or 96)
+                  const minProfessionalQuality = 90; // Change to 96 if you want stricter
+                  const professionalQuality = bestQualityTrade?.quality || professionalSignal?.quality;
+                  if (professionalQuality >= minProfessionalQuality) {
+                    return (
+                      <div style={{ margin: '32px 0' }}>
+                        <h3>🎯 Professional Intraday Signal
+                          <span style={{
+                            fontSize: '12px',
+                            padding: '4px 10px',
+                            borderRadius: '12px',
+                            background: 'rgba(255,255,255,0.2)',
+                            fontWeight: '600'
+                          }}>
+                            {bestQualityTrade ? '✨ SCANNED' : 'LIVE'}
+                          </span>
+                        </h3>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '16px' }}>
+                          <div>
+                            <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Symbol</div>
+                            <div style={{ fontSize: '18px', fontWeight: 'bold' }}>{bestQualityTrade?.symbol || professionalSignal?.symbol}</div>
+                          </div>
+                          <div>
+                            <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Action</div>
+                            <div style={{ fontSize: '20px', fontWeight: 'bold' }}>
+                              <span style={{
+                                padding: '6px 16px',
+                                borderRadius: '8px',
+                                background: (bestQualityTrade?.action || professionalSignal?.signal) === 'BUY' || (bestQualityTrade?.action || professionalSignal?.signal) === 'buy' ? '#48bb78' : (bestQualityTrade?.action || professionalSignal?.signal) === 'SELL' || (bestQualityTrade?.action || professionalSignal?.signal) === 'sell' ? '#f56565' : '#cbd5e0',
+                                color: 'white'
+                              }}>
+                                {(bestQualityTrade?.action || professionalSignal?.signal || 'HOLD').toUpperCase()}
+                              </span>
+                            </div>
+                          </div>
+                          <div>
+                            <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Entry Price</div>
+                            <div style={{ fontSize: '18px', fontWeight: 'bold' }}>
+                              ₹{(bestQualityTrade?.entry_price || professionalSignal?.entry_price)?.toFixed(2) || 'N/A'}
+                            </div>
+                          </div>
+                          <div>
+                            <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Target</div>
+                            <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#c6f6d5' }}>
+                              ₹{(bestQualityTrade?.target || professionalSignal?.target)?.toFixed(2) || 'N/A'}
+                            </div>
+                          </div>
+                          <div>
+                            <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Stop Loss</div>
+                            <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#fed7d7' }}>
+                              ₹{(bestQualityTrade?.stop_loss || professionalSignal?.stop_loss)?.toFixed(2) || 'N/A'}
+                            </div>
+                          </div>
+                          {bestQualityTrade && (
+                            <div>
+                              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '4px' }}>Quality Score</div>
+                              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#fbbf24' }}>
+                                {bestQualityTrade.quality}% ✨
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  } else {
+                    return null;
+                  }
+                })()
+              )}
                   <div style={{
                     display: 'flex',
                     gap: '16px',
