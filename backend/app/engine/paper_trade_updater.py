@@ -58,6 +58,22 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
 
     _price_update_cache["last_update"] = now
 
+    from datetime import time as dt_time, datetime
+    from app.core.market_hours import is_market_open
+    # NSE equity/derivatives: 9:15am to 3:30pm IST
+    market_start = dt_time(9, 15)
+    market_end = dt_time(15, 30)
+    ist_now = datetime.now()
+    if not is_market_open(market_start, market_end, ist_now):
+        # Market closed: do not start new trades
+        return {
+            "success": False,
+            "message": "Market is closed. No trades executed or updated.",
+            "updated_count": 0,
+            "closed_count": 0,
+            "total_open": 0,
+        }
+
     kite = _get_kite()
     if not kite:
         return {
@@ -75,6 +91,24 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
             "message": "No open trades to update",
             "updated_count": 0,
             "closed_count": 0,
+            "total_open": 0,
+        }
+
+    # Auto-close all open trades at 3:29 PM IST
+    close_time = dt_time(15, 29)
+    if ist_now.time() >= close_time:
+        closed_count = 0
+        for trade in open_trades:
+            trade.status = "AUTO_CLOSE_3_29PM"
+            trade.exit_price = trade.current_price
+            trade.exit_time = ist_now
+            closed_count += 1
+        db.commit()
+        return {
+            "success": True,
+            "message": f"Auto-closed {closed_count} trades at 3:29 PM IST.",
+            "updated_count": 0,
+            "closed_count": closed_count,
             "total_open": 0,
         }
 

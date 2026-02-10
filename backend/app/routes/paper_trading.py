@@ -62,6 +62,7 @@ def create_paper_trade(trade: PaperTradeCreate, db: Session = Depends(get_db)):
         }
 
     
+    from datetime import datetime
     paper_trade = PaperTrade(
         user_id=1,  # Default user
         symbol=trade.symbol,
@@ -75,7 +76,8 @@ def create_paper_trade(trade: PaperTradeCreate, db: Session = Depends(get_db)):
         target=trade.target,
         strategy=trade.strategy,
         signal_data=trade.signal_data,
-        status="OPEN"
+        status="OPEN",
+        entry_time=datetime.utcnow()
     )
     
     db.add(paper_trade)
@@ -213,7 +215,7 @@ def update_paper_trade(
     # Manual status update
     if update.status:
         trade.status = update.status
-        if update.status != "OPEN" and not trade.exit_time:
+        if update.status != "OPEN":
             trade.exit_price = trade.current_price
             trade.exit_time = datetime.utcnow()
     

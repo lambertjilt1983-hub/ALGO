@@ -88,6 +88,25 @@ const ALWAYS_FETCH_TRADES = true;
 // Screen Wake Lock - Prevent browser/system sleep
 
 const AutoTradingDashboard = () => {
+    // Fetch active trades from Zerodha (live) before starting a new trade
+    const checkZerodhaActiveTrades = async () => {
+      try {
+        const res = await config.authFetch(AUTO_TRADE_ACTIVE_API);
+        if (!res.ok) {
+          console.warn('Failed to fetch active trades from Zerodha');
+          return false;
+        }
+        const data = await res.json();
+        if (Array.isArray(data.trades) && data.trades.some(t => t.status === 'OPEN')) {
+          setStatusMessage('Open position detected in Zerodha. Waiting for all trades to close before starting a new one.');
+          return true; // There is an open trade
+        }
+        return false; // No open trades
+      } catch (e) {
+        console.error('Error checking Zerodha active trades:', e);
+        return false;
+      }
+    };
   const [enabled, setEnabled] = useState(false);
   const [isLiveMode, setIsLiveMode] = useState(false); // Starts in DEMO mode
   const [loading, setLoading] = useState(true);
@@ -314,12 +333,14 @@ const AutoTradingDashboard = () => {
       const tradesToday = tradeHistory.filter((t) => {
         const ts = t.exit_time || t.entry_time || t.timestamp;
         if (!ts) return false;
-        return new Date(ts).toISOString().slice(0, 10) === today;
+        const dateObj = new Date(ts);
+        return dateObj.getFullYear() + '-' + String(dateObj.getMonth()+1).padStart(2, '0') + '-' + String(dateObj.getDate()).padStart(2, '0') === today;
       });
       const activeToday = activeTrades.filter((t) => {
         const ts = t.entry_time || t.timestamp;
         if (!ts) return false;
-        return new Date(ts).toISOString().slice(0, 10) === today;
+        const dateObj = new Date(ts);
+        return dateObj.getFullYear() + '-' + String(dateObj.getMonth()+1).padStart(2, '0') + '-' + String(dateObj.getDate()).padStart(2, '0') === today;
       });
       const totalTradesToday = tradesToday.length + activeToday.length;
       
@@ -463,9 +484,16 @@ const AutoTradingDashboard = () => {
       return;
     }
 
-    // Prevent new trade if any open position exists when auto-trading is enabled
-    if (autoTradingActive && activeTrades && activeTrades.length > 0) {
-      console.log('⏸️ Open position detected - no new trade will be started until all positions are closed.');
+    // Prevent new trade if any open position exists in Zerodha (live broker)
+    if (autoTradingActive && isLiveMode) {
+      const hasOpen = await checkZerodhaActiveTrades();
+      if (hasOpen) {
+        console.log('⏸️ Open position detected in Zerodha - no new trade will be started until all positions are closed.');
+        return;
+      }
+    } else if (autoTradingActive && activeTrades && activeTrades.length > 0) {
+      // For demo mode, use local activeTrades
+      console.log('⏸️ Open position detected (demo) - no new trade will be started until all positions are closed.');
       setStatusMessage('Open position detected. Waiting for all trades to close before starting a new one.');
       return;
     }
@@ -1142,6 +1170,7 @@ const AutoTradingDashboard = () => {
       console.log('🚀 SIGNAL RECEIVED - Executing LIVE (user-approved)');
       await executeAutoTrade(candidate);
       await fetchData();
+      console.log('✅ Live trade executed!');
     })();
     // eslint-disable-next-line
   }, [activeSignal, isLiveMode, autoTradingActive, executing, activeTrades, optionSignals, stats?.max_trades]);
@@ -1623,15 +1652,12 @@ const AutoTradingDashboard = () => {
     }
   }, [autoTradingActive]);
 
+  // Always create a paper/demo trade for every new signal during market hours when not in live mode
   useEffect(() => {
-    if (!autoTradingActive && !isLiveMode && signalsLoaded && activeTrades.length === 0) {
-      // Create one paper trade when auto-trading is OFF (demo mode)
-      const signalForPaper = bestQualityTrade || activeSignal;
-      if (signalForPaper) {
-        createPaperTradeFromSignal(signalForPaper);
-      }
+    if (!isLiveMode && signalsLoaded && activeSignal && isMarketOpen) {
+      createPaperTradeFromSignal(activeSignal);
     }
-  }, [autoTradingActive, isLiveMode, signalsLoaded, activeTrades.length, bestQualityTrade, activeSignal, lotMultiplier, optionSignals]);
+  }, [isLiveMode, signalsLoaded, activeSignal, isMarketOpen, lotMultiplier]);
 
   if (loading) {
     return (
@@ -2948,7 +2974,7 @@ const AutoTradingDashboard = () => {
                         </span>
                       </td>
                       <td style={{ padding: '10px', fontSize: '11px', color: '#718096' }}>
-                        {trade.exit_time ? new Date(trade.exit_time).toLocaleString() : '-'}
+                        {trade.exit_time ? new Date(trade.exit_time).toLocaleString() : (trade.entry_time ? new Date(trade.entry_time).toLocaleString() : '-')}
                       </td>
                     </tr>
                   );
@@ -3086,10 +3112,37 @@ const AutoTradingDashboard = () => {
                         </td>
                         <td style={{ padding: '8px', textAlign: 'right' }}>₹{entry.toFixed(2)}</td>
                         <td style={{ padding: '8px', textAlign: 'right' }}>₹{exit !== null ? exit.toFixed(2) : '-'}</td>
-                        <td style={{ padding: '8px', textAlign: 'right', fontWeight: '700', color: pnl >= 0 ? '#48bb78' : '#f56565' }}>
+                        <td style={{
+                          padding: '8px',
+                          textAlign: 'right',
+                          fontWeight: '700',
+                          color: pnl >= 0 ? '#48bb78' : '#f56565'
+                        }}>
                           {pnl >= 0 ? '+' : ''}₹{pnl.toLocaleString()}
                         </td>
-                        <td style={{ padding: '8px', fontSize: '11px', color: '#718096' }}>{t.status || 'CLOSED'}</td>
+                        <td style={{
+                          padding: '8px',
+                          textAlign: 'right',
+                          fontWeight: '600',
+                          color: pnlPct >= 0 ? '#48bb78' : '#f56565'
+                        }}>
+                          {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%
+                        </td>
+                        <td style={{ padding: '8px' }}>
+                          <span style={{
+                            padding: '2px 6px',
+                            borderRadius: '3px',
+                            background: trade.status === 'CLOSED' ? '#bee3f8' : '#feebc8',
+                            color: trade.status === 'CLOSED' ? '#2c5282' : '#7c2d12',
+                            fontSize: '11px',
+                            fontWeight: 'bold'
+                          }}>
+                            {trade.status || 'CLOSED'}
+                          </span>
+                        </td>
+                        <td style={{ padding: '8px', fontSize: '11px', color: '#718096' }}>
+                          {trade.exit_time ? new Date(trade.exit_time).toLocaleString() : (trade.entry_time ? new Date(trade.entry_time).toLocaleString() : '-')}
+                        </td>
                       </tr>
                     );
                   })}

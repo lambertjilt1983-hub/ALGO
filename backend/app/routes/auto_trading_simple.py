@@ -1233,39 +1233,18 @@ async def analyze(
         can_trade = False
 
 
-    # Optionally auto-trigger trade execution for each recommendation
+    # Manual start required: do not auto-execute trade
     auto_trade_result = None
-    if can_trade:
-        try:
-            from fastapi import Request
-            if recommendation:
-                auto_trade_result = await execute(
-                    symbol=recommendation["symbol"],
-                    side=recommendation["action"],
-                    quantity=recommendation["quantity"],
-                    price=recommendation["entry_price"],
-                    authorization=authorization
-                )
-                if auto_trade_result is not None:
-                    auto_trade_result["executed"] = True
-        except Exception as e:
-            print(f"[AUTO TRADE ERROR] Could not auto-execute trade: {e}")
-            if auto_trade_result is None:
-                auto_trade_result = {}
-            auto_trade_result["executed"] = False
-            auto_trade_result["error"] = str(e)
-    else:
-        # Not enough money: show the trade as simulated, do not execute
+    if not can_trade:
         if recommendation:
             auto_trade_result = {
                 "executed": False,
                 "capital_required": recommendation["capital_required"],
                 "potential_profit": round((recommendation["target"] - recommendation["entry_price"]) * recommendation["quantity"], 2),
                 "potential_loss": round((recommendation["entry_price"] - recommendation["stop_loss"]) * recommendation["quantity"], 2),
-                "message": "Not enough capital to execute trade. Simulated only.",
+                "message": "Not enough capital or trade already running. Simulated only.",
                 "demo_mode": True
             }
-
 
     response = {
         "success": True,
@@ -1419,6 +1398,15 @@ async def execute(
         else:
             derived_target = round(trade.price * (1 - pct * (TARGET_PCT / STOP_PCT)), 2)
 
+    from datetime import time
+    from app.core.market_hours import is_market_open
+    market_start = time(9, 15)
+    market_end = time(15, 30)
+    from app.core.market_hours import ist_now
+    now_ist = ist_now()
+    if not is_market_open(market_start, market_end, now_ist):
+        raise HTTPException(status_code=403, detail="Market is closed. No trades can be started.")
+
     async with execute_lock:
         if len(active_trades) >= MAX_TRADES and not auto_demo:
             raise HTTPException(status_code=429, detail="Max active trades reached")
@@ -1441,7 +1429,7 @@ async def execute(
             "broker_id": trade.broker_id,
             "exchange": "NFO",
             "product": "MIS",
-            "timestamp": _now(),
+            "timestamp": now_ist.isoformat(),
             "stop_loss": derived_stop,
             "target": derived_target,
             "support": trade.support,
@@ -1450,8 +1438,7 @@ async def execute(
         }
 
         # --- REAL ZERODHA ORDER PLACEMENT ---
-        # Map your signal to the correct Zerodha symbol (tradingsymbol)
-        zerodha_symbol = trade.symbol  # You may need to convert to e.g. 'BANKNIFTY24FEB48000CE'
+        zerodha_symbol = trade.symbol
         print(f"[API /execute] ▶ Placing {mode} order to Zerodha...")
         print(f"[API /execute] ▶ Order Details: {zerodha_symbol}, {trade.quantity or 1} qty, {trade.side} at ₹{trade.price}")
         real_order = place_zerodha_order(
@@ -1460,7 +1447,7 @@ async def execute(
             side=trade.side,
             order_type="MARKET",
             product="MIS",
-            exchange="NFO"  # Use 'NFO' for options
+            exchange="NFO"
         )
         if real_order["success"]:
             print(f"[API /execute] ✓ Zerodha order ACCEPTED - Order ID: {real_order.get('order_id', 'N/A')}")
@@ -1471,7 +1458,7 @@ async def execute(
             return {
                 "success": False,
                 "message": real_order["error"],
-                "timestamp": _now(),
+                "timestamp": now_ist.isoformat(),
             }
 
         broker_logs.append({"trade": trade_obj, "response": broker_response})
@@ -1480,7 +1467,7 @@ async def execute(
             "success": True,
             "is_demo_mode": auto_demo,
             "message": f"{mode} trade accepted for {trade.symbol} at {trade.price}",
-            "timestamp": _now(),
+            "timestamp": now_ist.isoformat(),
             "broker_response": broker_response,
             "stop_loss": derived_stop,
             "target": derived_target,
