@@ -362,60 +362,54 @@ class AutoTradingEngine:
         """
         closed_trades = []
         
+        from datetime import datetime, time
+        ist_now = datetime.now()
+        close_time = time(15, 29)
         for trade in self.active_trades[:]:  # Iterate over copy
             if trade.status != 'OPEN':
                 continue
-            
             current_price = current_prices.get(trade.symbol, trade.entry_price)
-            
             should_close = False
             exit_reason = None
-            
-            if trade.action == 'BUY':
-                # Check target or stop-loss for BUY trade
-                if current_price >= trade.target_price:
-                    should_close = True
-                    exit_reason = 'TARGET_HIT'
-                elif current_price <= trade.stop_loss:
-                    should_close = True
-                    exit_reason = 'STOP_LOSS'
-            
-            else:  # SELL trade
-                # Check target or stop-loss for SELL trade
-                if current_price <= trade.target_price:
-                    should_close = True
-                    exit_reason = 'TARGET_HIT'
-                elif current_price >= trade.stop_loss:
-                    should_close = True
-                    exit_reason = 'STOP_LOSS'
-            
+            # Auto-close at 3:29 PM IST
+            if ist_now.time() >= close_time:
+                should_close = True
+                exit_reason = 'AUTO_CLOSE_3_29PM'
+            else:
+                if trade.action == 'BUY':
+                    if current_price >= trade.target_price:
+                        should_close = True
+                        exit_reason = 'TARGET_HIT'
+                    elif current_price <= trade.stop_loss:
+                        should_close = True
+                        exit_reason = 'STOP_LOSS'
+                else:  # SELL trade
+                    if current_price <= trade.target_price:
+                        should_close = True
+                        exit_reason = 'TARGET_HIT'
+                    elif current_price >= trade.stop_loss:
+                        should_close = True
+                        exit_reason = 'STOP_LOSS'
             if should_close:
                 trade.exit_price = current_price
-                trade.exit_time = datetime.now()
-                trade.status = 'CLOSED' if exit_reason == 'TARGET_HIT' else 'STOPPED'
-                
-                # Calculate P&L
+                trade.exit_time = ist_now
+                trade.status = 'CLOSED' if exit_reason in ['TARGET_HIT', 'AUTO_CLOSE_3_29PM'] else 'STOPPED'
                 if trade.action == 'BUY':
                     pnl = (current_price - trade.entry_price) * trade.quantity
                     pnl_pct = ((current_price - trade.entry_price) / trade.entry_price) * 100
                 else:
                     pnl = (trade.entry_price - current_price) * trade.quantity
                     pnl_pct = ((trade.entry_price - current_price) / trade.entry_price) * 100
-                
                 trade.profit_loss = pnl
                 trade.profit_percentage = pnl_pct
-                
-                # Update statistics
                 self.daily_pnl += pnl
                 if pnl > 0:
                     self.winning_trades += 1
                 else:
                     self.losing_trades += 1
-                
                 self.active_trades.remove(trade)
                 self.trade_history.append(trade)
                 closed_trades.append(trade)
-        
         return closed_trades
     
     def get_statistics(self) -> Dict[str, Any]:

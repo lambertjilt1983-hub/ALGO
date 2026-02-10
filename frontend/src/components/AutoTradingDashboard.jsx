@@ -88,6 +88,25 @@ const ALWAYS_FETCH_TRADES = true;
 // Screen Wake Lock - Prevent browser/system sleep
 
 const AutoTradingDashboard = () => {
+    // Fetch active trades from Zerodha (live) before starting a new trade
+    const checkZerodhaActiveTrades = async () => {
+      try {
+        const res = await config.authFetch(AUTO_TRADE_ACTIVE_API);
+        if (!res.ok) {
+          console.warn('Failed to fetch active trades from Zerodha');
+          return false;
+        }
+        const data = await res.json();
+        if (Array.isArray(data.trades) && data.trades.some(t => t.status === 'OPEN')) {
+          setStatusMessage('Open position detected in Zerodha. Waiting for all trades to close before starting a new one.');
+          return true; // There is an open trade
+        }
+        return false; // No open trades
+      } catch (e) {
+        console.error('Error checking Zerodha active trades:', e);
+        return false;
+      }
+    };
   const [enabled, setEnabled] = useState(false);
   const [isLiveMode, setIsLiveMode] = useState(false); // Starts in DEMO mode
   const [loading, setLoading] = useState(true);
@@ -119,6 +138,51 @@ const AutoTradingDashboard = () => {
   const [wakeLockActive, setWakeLockActive] = useState(false);
   const [qualityTrades, setQualityTrades] = useState([]); // Market scanner results
   const [scannerLoading, setScannerLoading] = useState(false);
+    // --- Market Open/Close Logic (must be above all usages) ---
+    const getIstDateParts = () => {
+      const formatter = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'Asia/Kolkata',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+        weekday: 'short'
+      });
+      const parts = formatter.formatToParts(new Date());
+      const map = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+      return {
+        year: map.year,
+        month: map.month,
+        day: map.day,
+        hour: Number(map.hour),
+        minute: Number(map.minute),
+        weekday: map.weekday,
+        iso: `${map.year}-${map.month}-${map.day}`
+      };
+    };
+
+    const { hour: istHour, minute: istMinute, weekday: istWeekday, iso: istIso } = getIstDateParts();
+    const isWeekend = istWeekday === 'Sat' || istWeekday === 'Sun';
+    const isHoliday = MARKET_HOLIDAYS.includes(istIso);
+    const isBeforeOpen = istHour < MARKET_OPEN_HOUR || (istHour === MARKET_OPEN_HOUR && istMinute < MARKET_OPEN_MINUTE);
+    const isAfterClose = istHour > MARKET_CLOSE_HOUR || (istHour === MARKET_CLOSE_HOUR && istMinute > MARKET_CLOSE_MINUTE);
+    const localMarketOpen = !isWeekend && !isHoliday && !isBeforeOpen && !isAfterClose;
+    const localMarketReason = isWeekend
+      ? 'Weekend'
+      : isHoliday
+        ? 'Holiday'
+        : isBeforeOpen
+          ? 'Before market open'
+          : isAfterClose
+            ? 'After market close'
+            : 'Open';
+
+    const backendMarketOpen = typeof stats?.market_open === 'boolean' ? stats.market_open : null;
+    const backendMarketReason = stats?.market_reason || null;
+    const isMarketOpen = backendMarketOpen !== null ? backendMarketOpen : localMarketOpen;
+    const marketClosedReason = isMarketOpen ? null : (backendMarketReason || localMarketReason);
   const [scannerTab, setScannerTab] = useState('indices');
   const [lossLimit, setLossLimit] = useState(() => {
     if (typeof window === 'undefined') return DEFAULT_DAILY_LOSS_LIMIT;
@@ -314,12 +378,14 @@ const AutoTradingDashboard = () => {
       const tradesToday = tradeHistory.filter((t) => {
         const ts = t.exit_time || t.entry_time || t.timestamp;
         if (!ts) return false;
-        return new Date(ts).toISOString().slice(0, 10) === today;
+        const dateObj = new Date(ts);
+        return dateObj.getFullYear() + '-' + String(dateObj.getMonth()+1).padStart(2, '0') + '-' + String(dateObj.getDate()).padStart(2, '0') === today;
       });
       const activeToday = activeTrades.filter((t) => {
         const ts = t.entry_time || t.timestamp;
         if (!ts) return false;
-        return new Date(ts).toISOString().slice(0, 10) === today;
+        const dateObj = new Date(ts);
+        return dateObj.getFullYear() + '-' + String(dateObj.getMonth()+1).padStart(2, '0') + '-' + String(dateObj.getDate()).padStart(2, '0') === today;
       });
       const totalTradesToday = tradesToday.length + activeToday.length;
       
@@ -463,9 +529,16 @@ const AutoTradingDashboard = () => {
       return;
     }
 
-    // Prevent new trade if any open position exists when auto-trading is enabled
-    if (autoTradingActive && activeTrades && activeTrades.length > 0) {
-      console.log('⏸️ Open position detected - no new trade will be started until all positions are closed.');
+    // Prevent new trade if any open position exists in Zerodha (live broker)
+    if (autoTradingActive && isLiveMode) {
+      const hasOpen = await checkZerodhaActiveTrades();
+      if (hasOpen) {
+        console.log('⏸️ Open position detected in Zerodha - no new trade will be started until all positions are closed.');
+        return;
+      }
+    } else if (autoTradingActive && activeTrades && activeTrades.length > 0) {
+      // For demo mode, use local activeTrades
+      console.log('⏸️ Open position detected (demo) - no new trade will be started until all positions are closed.');
       setStatusMessage('Open position detected. Waiting for all trades to close before starting a new one.');
       return;
     }
@@ -746,23 +819,65 @@ const AutoTradingDashboard = () => {
         return;
       }
 
-      // Pick highest scored signal with best momentum
-      const bestSignal = highQualitySignals.reduce((best, curr) => {
-        if (!best) return curr;
-        // Prioritize momentum score, then final score
-        const bestMomentum = best.indexMomentum?.score || 0;
-        const currMomentum = curr.indexMomentum?.score || 0;
-        if (currMomentum > bestMomentum) return curr;
-        if (currMomentum < bestMomentum) return best;
-        return curr.finalScore > best.finalScore ? curr : best;
-      });
+      // Advanced: Pick best CE if bullish, best PE if bearish, else best overall
+      let bestSignal = null;
+      let mainMomentum = null;
+      if (Object.keys(momentumAnalysis).length > 0) {
+        const mainIndex = momentumAnalysis['NIFTY'] ? 'NIFTY' : (momentumAnalysis['BANKNIFTY'] ? 'BANKNIFTY' : Object.keys(momentumAnalysis)[0]);
+        mainMomentum = momentumAnalysis[mainIndex] || {};
+        const ceSignals = highQualitySignals.filter(s => s.option_type === 'CE');
+        const peSignals = highQualitySignals.filter(s => s.option_type === 'PE');
+        console.log(`[AI DEBUG] High-quality signals: CE=${ceSignals.length}, PE=${peSignals.length}`);
+        if (mainMomentum.direction) {
+          console.log(`[AI DEBUG] Main momentum direction: ${mainMomentum.direction}`);
+        }
+        if (mainMomentum.direction && mainMomentum.direction.includes('BULLISH')) {
+          bestSignal = ceSignals.reduce((best, curr) => {
+            if (!best) return curr;
+            // Prioritize momentum score, then final score
+            const bestMomentum = best.indexMomentum?.score || 0;
+            const currMomentum = curr.indexMomentum?.score || 0;
+            if (currMomentum > bestMomentum) return curr;
+            if (currMomentum < bestMomentum) return best;
+            return curr.finalScore > best.finalScore ? curr : best;
+          }, null);
+        } else if (mainMomentum.direction && mainMomentum.direction.includes('BEARISH')) {
+          if (peSignals.length === 0) {
+            console.warn('[AI DEBUG] No high-quality PE signals available for bearish trend.');
+          }
+          bestSignal = peSignals.reduce((best, curr) => {
+            if (!best) return curr;
+            const bestMomentum = best.indexMomentum?.score || 0;
+            const currMomentum = curr.indexMomentum?.score || 0;
+            if (currMomentum > bestMomentum) return curr;
+            if (currMomentum < bestMomentum) return best;
+            return curr.finalScore > best.finalScore ? curr : best;
+          }, null);
+        }
+      }
+      // Fallback: best overall
+      if (!bestSignal) {
+        if (highQualitySignals.length === 0) {
+          console.warn('[AI DEBUG] No high-quality signals available for fallback.');
+        }
+        bestSignal = highQualitySignals.reduce((best, curr) => {
+          if (!best) return curr;
+          const bestMomentum = best.indexMomentum?.score || 0;
+          const currMomentum = curr.indexMomentum?.score || 0;
+          if (currMomentum > bestMomentum) return curr;
+          if (currMomentum < bestMomentum) return best;
+          return curr.finalScore > best.finalScore ? curr : best;
+        }, null);
+      }
 
-      console.log(`✅ MOMENTUM-ALIGNED SIGNAL SELECTED`);
-      console.log(`   ${bestSignal.index} ${bestSignal.option_type} ${bestSignal.symbol}`);
-      console.log(`   Final Score: ${bestSignal.finalScore.toFixed(1)} | Momentum: ${bestSignal.indexMomentum.direction} (${bestSignal.indexMomentum.score})`);
-      console.log(`   Market Move: ${bestSignal.indexMomentum.changePercent.toFixed(2)}% | Strength: ${bestSignal.indexMomentum.strength}`);
-      console.log(`   Factors: ${bestSignal.scoringFactors.join(', ')}`);
-      console.log(`   Entry: ₹${bestSignal.entry_price} | Target: ₹${bestSignal.target} | SL: ₹${bestSignal.stop_loss}`);
+      if (bestSignal && mainMomentum) {
+        console.log(`✅ ADVANCED TREND SIGNAL SELECTED`);
+        console.log(`   ${bestSignal.index} ${bestSignal.option_type} ${bestSignal.symbol}`);
+        console.log(`   Final Score: ${bestSignal.finalScore.toFixed(1)} | Momentum: ${bestSignal.indexMomentum.direction} (${bestSignal.indexMomentum.score})`);
+        console.log(`   Market Move: ${bestSignal.indexMomentum.changePercent?.toFixed(2)}% | Strength: ${bestSignal.indexMomentum.strength}`);
+        console.log(`   Factors: ${bestSignal.scoringFactors.join(', ')}`);
+        console.log(`   Entry: ₹${bestSignal.entry_price} | Target: ₹${bestSignal.target} | SL: ₹${bestSignal.stop_loss}`);
+      }
 
       // ═══════════════════════════════════════════════════════════════
       // ENHANCED PRE-EXECUTION VALIDATION WITH 10-POINT MAX STOP LOSS
@@ -905,17 +1020,32 @@ const AutoTradingDashboard = () => {
     return true;
   }
 
-  // Apply Golden Pullback filter to all signals (hard filter) and log filtered-out signals
-  const filteredOptionSignals = optionSignals.filter((signal) => {
-    const result = isGoldenPullback(signal);
-    if (!result) {
-      // Already logged in isGoldenPullback
-    }
-    return result;
+  // OTM filter: Only include CE where strike > spot, PE where strike < spot
+  function isOTMOption(signal) {
+    // Require both strike and spot/index price
+    const strike = Number(signal.strike);
+    const spot = Number(signal.spot_price ?? signal.index_price ?? signal.underlying_price);
+    if (!strike || !spot) return true; // If missing, do not filter out
+    if (signal.option_type === 'CE') return strike > spot;
+    if (signal.option_type === 'PE') return strike < spot;
+    return true;
+  }
+
+  // Apply Golden Pullback filter, OTM filter, and quality filters
+  // For trading: quality >= 96; For table display: quality > 90
+  const winRate = stats?.win_rate ? (stats.win_rate / 100) : 0.5;
+  const filteredOptionSignalsRaw = optionSignals.filter((signal) => {
+    const golden = isGoldenPullback(signal);
+    const otm = isOTMOption(signal);
+    const quality = calculateTradeQuality(signal, winRate).quality;
+    return golden && otm && quality > 90;
   });
 
-  // Group signals by index to show CE and PE side-by-side
-  const groupedSignals = filteredOptionSignals.reduce((acc, signal) => {
+  // Only allow signals with quality >= 96 for trading logic
+  const filteredOptionSignals = filteredOptionSignalsRaw.filter(signal => calculateTradeQuality(signal, winRate).quality >= 96);
+
+  // Group signals by index to show CE and PE side-by-side (for table: quality > 90)
+  const groupedSignals = filteredOptionSignalsRaw.reduce((acc, signal) => {
     // Filter out fake/invalid signals
     if (signal.error) return acc;
     if (!signal.symbol || !signal.index || !signal.strike) return acc;
@@ -943,21 +1073,50 @@ const AutoTradingDashboard = () => {
 
   // Get best quality trade from market scanner (if available)
   const bestQualityTrade = qualityTrades && qualityTrades.length > 0 ? qualityTrades[0] : null;
+
+  // If no quality trades, clear selected/active signals to prevent stale UI
+  const noQualityTrades = !qualityTrades || qualityTrades.length === 0;
+  const noFilteredSignals = !filteredOptionSignalsRaw || filteredOptionSignalsRaw.length === 0;
+
+  // If no signals, force null for all signal-driven UI
+  const effectiveBestQualityTrade = noQualityTrades ? null : bestQualityTrade;
+
+  // Advanced AI Recommendation: Use trend/momentum to pick CE or PE
+  let aiRecommendedSignal = null;
+  if (!noFilteredSignals) {
+    // Try to use momentumAnalysis if available (from last analyzeMarket run)
+    // Fallback: use best overall signal
+    if (typeof window !== 'undefined' && window.momentumAnalysis) {
+      const mainIndex = window.momentumAnalysis['NIFTY'] ? 'NIFTY' : (window.momentumAnalysis['BANKNIFTY'] ? 'BANKNIFTY' : Object.keys(window.momentumAnalysis)[0]);
+      const mainMomentum = window.momentumAnalysis[mainIndex] || {};
+      if (mainMomentum.direction && mainMomentum.direction.includes('BULLISH')) {
+        aiRecommendedSignal = filteredOptionSignalsRaw.filter(s => s.option_type === 'CE').reduce((best, curr) => {
+          if (!best) return curr;
+          return ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence)) ? curr : best;
+        }, null);
+      } else if (mainMomentum.direction && mainMomentum.direction.includes('BEARISH')) {
+        aiRecommendedSignal = filteredOptionSignalsRaw.filter(s => s.option_type === 'PE').reduce((best, curr) => {
+          if (!best) return curr;
+          return ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence)) ? curr : best;
+        }, null);
+      }
+    }
+    // Fallback if no momentum/trend data or no match
+    if (!aiRecommendedSignal) {
+      aiRecommendedSignal = filteredOptionSignalsRaw.reduce((best, curr) => {
+        if (curr.error || !curr.symbol || !curr.entry_price || curr.entry_price <= 0) return best;
+        if (!curr.confirmation_score && !curr.confidence) return best;
+        return (!best || ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence))) ? curr : best;
+      }, null);
+    }
+  }
+
+  // Use quality trade if available, otherwise use AI recommended signal (all from quality > 90%)
+  const activeSignal = noFilteredSignals ? null : (selectedSignal || effectiveBestQualityTrade || aiRecommendedSignal);
   const qualityTradesIndices = qualityTrades.filter((t) => getSignalGroup(t) === 'indices');
   const qualityTradesStocks = qualityTrades.filter((t) => getSignalGroup(t) === 'stocks');
   const scannerTrades = scannerTab === 'indices' ? qualityTradesIndices : qualityTradesStocks;
 
-  // Pick the best signal (highest confidence) from valid optionSignals only
-  const bestSignal = optionSignals.reduce((best, curr) => {
-    // Skip invalid signals
-    if (curr.error || !curr.symbol || !curr.entry_price || curr.entry_price <= 0) return best;
-    if (!curr.confirmation_score && !curr.confidence) return best;
-    
-    return (!best || ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence))) ? curr : best;
-  }, null);
-
-  // Use quality trade if available, otherwise use best signal
-  const activeSignal = selectedSignal || bestQualityTrade || bestSignal;
 
   const displayEntryPrice = activeSignal?.entry_price;
   const displayTarget = activeSignal?.target;
@@ -977,7 +1136,7 @@ const AutoTradingDashboard = () => {
       ? Number(displayEntryPrice) * Number(displayQuantity) * Number(lotMultiplier)
       : 0);
 
-  const liveDisplaySignal = bestQualityTrade
+  const liveDisplaySignal = effectiveBestQualityTrade
     || (professionalSignal && !professionalSignal.error ? professionalSignal : null)
     || activeSignal;
   const liveEntryPrice = liveDisplaySignal?.entry_price;
@@ -1142,6 +1301,7 @@ const AutoTradingDashboard = () => {
       console.log('🚀 SIGNAL RECEIVED - Executing LIVE (user-approved)');
       await executeAutoTrade(candidate);
       await fetchData();
+      console.log('✅ Live trade executed!');
     })();
     // eslint-disable-next-line
   }, [activeSignal, isLiveMode, autoTradingActive, executing, activeTrades, optionSignals, stats?.max_trades]);
@@ -1179,12 +1339,28 @@ const AutoTradingDashboard = () => {
     const risk = Math.abs(Number(signal.entry_price) - Number(signal.stop_loss));
     const reward = Math.abs(Number(signal.target) - Number(signal.entry_price));
     const rr = risk > 0 ? reward / risk : 0;
-    
+
     // Calculate AI optimal thresholds
     const winRate = stats?.win_rate ? (stats.win_rate / 100) : 0.5;
     const { rr: actualRR, optimalRR } = calculateOptimalRR(signal, winRate);
     const tradeQuality = calculateTradeQuality(signal, winRate);
-    
+
+    // === STRICT TREND CHECK AT ENTRY ===
+    let allowTrade = true;
+    if (typeof window !== 'undefined' && window.momentumAnalysis) {
+      const mainIndex = window.momentumAnalysis['NIFTY'] ? 'NIFTY' : (window.momentumAnalysis['BANKNIFTY'] ? 'BANKNIFTY' : Object.keys(window.momentumAnalysis)[0]);
+      const mainMomentum = window.momentumAnalysis[mainIndex] || {};
+      if (signal.option_type === 'CE' && !(mainMomentum.direction && mainMomentum.direction.includes('BULLISH'))) {
+        allowTrade = false;
+        console.warn('⛔ Blocked: CE signal but trend is not bullish at entry.');
+      }
+      if (signal.option_type === 'PE' && !(mainMomentum.direction && mainMomentum.direction.includes('BEARISH'))) {
+        allowTrade = false;
+        console.warn('⛔ Blocked: PE signal but trend is not bearish at entry.');
+      }
+    }
+    if (!allowTrade) return;
+
     console.log(`📊 Trade Quality Analysis: ${tradeQuality.quality}% | Confidence: ${confidence.toFixed(1)}% | RR: ${actualRR.toFixed(2)} vs Optimal: ${optimalRR.toFixed(2)}`);
 
     // AI-based approval logic
@@ -1623,15 +1799,12 @@ const AutoTradingDashboard = () => {
     }
   }, [autoTradingActive]);
 
+  // Always create a paper/demo trade for every new signal during market hours when not in live mode
   useEffect(() => {
-    if (!autoTradingActive && !isLiveMode && signalsLoaded && activeTrades.length === 0) {
-      // Create one paper trade when auto-trading is OFF (demo mode)
-      const signalForPaper = bestQualityTrade || activeSignal;
-      if (signalForPaper) {
-        createPaperTradeFromSignal(signalForPaper);
-      }
+    if (!isLiveMode && signalsLoaded && activeSignal && isMarketOpen) {
+      createPaperTradeFromSignal(activeSignal);
     }
-  }, [autoTradingActive, isLiveMode, signalsLoaded, activeTrades.length, bestQualityTrade, activeSignal, lotMultiplier, optionSignals]);
+  }, [isLiveMode, signalsLoaded, activeSignal, isMarketOpen, lotMultiplier]);
 
   if (loading) {
     return (
@@ -1726,51 +1899,6 @@ const AutoTradingDashboard = () => {
   const rangePnl = sumPnl(filteredHistory);
   const rangeWins = sumWins(filteredHistory);
   const todayTableRows = tradesToday;
-
-  const getIstDateParts = () => {
-    const formatter = new Intl.DateTimeFormat('en-US', {
-      timeZone: 'Asia/Kolkata',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-      weekday: 'short'
-    });
-    const parts = formatter.formatToParts(new Date());
-    const map = Object.fromEntries(parts.map((p) => [p.type, p.value]));
-    return {
-      year: map.year,
-      month: map.month,
-      day: map.day,
-      hour: Number(map.hour),
-      minute: Number(map.minute),
-      weekday: map.weekday,
-      iso: `${map.year}-${map.month}-${map.day}`
-    };
-  };
-
-  const { hour: istHour, minute: istMinute, weekday: istWeekday, iso: istIso } = getIstDateParts();
-  const isWeekend = istWeekday === 'Sat' || istWeekday === 'Sun';
-  const isHoliday = MARKET_HOLIDAYS.includes(istIso);
-  const isBeforeOpen = istHour < MARKET_OPEN_HOUR || (istHour === MARKET_OPEN_HOUR && istMinute < MARKET_OPEN_MINUTE);
-  const isAfterClose = istHour > MARKET_CLOSE_HOUR || (istHour === MARKET_CLOSE_HOUR && istMinute > MARKET_CLOSE_MINUTE);
-  const localMarketOpen = !isWeekend && !isHoliday && !isBeforeOpen && !isAfterClose;
-  const localMarketReason = isWeekend
-    ? 'Weekend'
-    : isHoliday
-      ? 'Holiday'
-      : isBeforeOpen
-        ? 'Before market open'
-        : isAfterClose
-          ? 'After market close'
-          : 'Open';
-
-  const backendMarketOpen = typeof stats?.market_open === 'boolean' ? stats.market_open : null;
-  const backendMarketReason = stats?.market_reason || null;
-  const isMarketOpen = backendMarketOpen !== null ? backendMarketOpen : localMarketOpen;
-  const marketClosedReason = isMarketOpen ? null : (backendMarketReason || localMarketReason);
 
   // --- Professional Signal Integration ---
   // ...existing code...
@@ -2296,8 +2424,8 @@ const AutoTradingDashboard = () => {
         </div>
       ) : null}
 
-      {/* Market Analysis */}
-      {activeSignal && (
+      {/* Market Analysis / AI Recommendation */}
+      {(activeSignal || filteredOptionSignalsRaw.length > 0) && (
         <div style={{
           padding: '24px',
           background: 'linear-gradient(135deg, #fef5e7 0%, #fdebd0 100%)',
@@ -2434,47 +2562,71 @@ const AutoTradingDashboard = () => {
               </div>
             </div>
             <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
-              <button
-                onClick={async () => {
-                  if (autoTradingActive) {
-                    // Stop auto-trading (both live and demo)
-                    setAutoTradingActive(false);
-                    setHasActiveTrade(false);
-                    setIsLiveMode(false);
-                    setArmError(null);
-                    return;
+              {/* Trend check for enabling/disabling auto-trade */}
+              {(() => {
+                let canTrade = true;
+                let trendMsg = '';
+                if (activeSignal) {
+                  if (typeof window !== 'undefined' && window.momentumAnalysis) {
+                    const mainIndex = window.momentumAnalysis['NIFTY'] ? 'NIFTY' : (window.momentumAnalysis['BANKNIFTY'] ? 'BANKNIFTY' : Object.keys(window.momentumAnalysis)[0]);
+                    const mainMomentum = window.momentumAnalysis[mainIndex] || {};
+                    if (activeSignal.option_type === 'CE' && !(mainMomentum.direction && mainMomentum.direction.includes('BULLISH'))) {
+                      canTrade = false;
+                      trendMsg = 'Trend is not bullish. Waiting for bullish momentum to start trade.';
+                    }
+                    if (activeSignal.option_type === 'PE' && !(mainMomentum.direction && mainMomentum.direction.includes('BEARISH'))) {
+                      canTrade = false;
+                      trendMsg = 'Trend is not bearish. Waiting for bearish momentum to start trade.';
+                    }
                   }
-                  // Try to arm live trading first
-                  const armed = await armLiveTrading(false);
-                  if (armed) {
-                    setAutoTradingActive(true);
-                    setIsLiveMode(true);
-                    setArmError(null);
-                    console.log('🚀 AUTO-TRADING ACTIVATED! (LIVE MODE)');
-                  } else {
-                    // If live arming fails, fallback to demo mode
-                    setAutoTradingActive(true);
-                    setIsLiveMode(false);
-                    setArmError('Live trading not armed, running in DEMO mode.');
-                    console.log('⚪ AUTO-TRADING ACTIVATED! (DEMO MODE)');
-                  }
-                }}
-                disabled={armingInProgress}
-                style={{
-                  padding: '12px 24px',
-                  background: armingInProgress ? '#cbd5e0' : autoTradingActive ? '#f56565' : '#48bb78',
-                  color: 'white',
-                  border: 'none',
-                  borderRadius: '8px',
-                  fontSize: '15px',
-                  fontWeight: '600',
-                  cursor: armingInProgress ? 'wait' : 'pointer',
-                  boxShadow: '0 4px 6px rgba(0,0,0,0.1)',
-                  opacity: armingInProgress ? 0.7 : 1
-                }}
-              >
-                {armingInProgress ? '⏳ Arming...' : autoTradingActive ? '🛑 Stop Auto-Trading' : '▶️ Start Auto-Trading'}
-              </button>
+                } else {
+                  canTrade = false;
+                  trendMsg = 'No valid signal for auto-trading.';
+                }
+                return <>
+                  <button
+                    onClick={async () => {
+                      if (autoTradingActive) {
+                        setAutoTradingActive(false);
+                        setHasActiveTrade(false);
+                        setIsLiveMode(false);
+                        setArmError(null);
+                        return;
+                      }
+                      const armed = await armLiveTrading(false);
+                      if (armed) {
+                        setAutoTradingActive(true);
+                        setIsLiveMode(true);
+                        setArmError(null);
+                        console.log('🚀 AUTO-TRADING ACTIVATED! (LIVE MODE)');
+                      } else {
+                        setAutoTradingActive(true);
+                        setIsLiveMode(false);
+                        setArmError('Live trading not armed, running in DEMO mode.');
+                        console.log('⚪ AUTO-TRADING ACTIVATED! (DEMO MODE)');
+                      }
+                    }}
+                    disabled={armingInProgress || !canTrade}
+                    style={{
+                      padding: '12px 24px',
+                      background: armingInProgress ? '#cbd5e0' : autoTradingActive ? '#f56565' : canTrade ? '#48bb78' : '#cbd5e0',
+                      color: 'white',
+                      border: 'none',
+                      borderRadius: '8px',
+                      fontSize: '15px',
+                      fontWeight: '600',
+                      cursor: armingInProgress ? 'wait' : canTrade ? 'pointer' : 'not-allowed',
+                      boxShadow: '0 4px 6px rgba(0,0,0,0.1)',
+                      opacity: armingInProgress ? 0.7 : 1
+                    }}
+                  >
+                    {armingInProgress ? '⏳ Arming...' : autoTradingActive ? '🛑 Stop Auto-Trading' : '▶️ Start Auto-Trading'}
+                  </button>
+                  {!canTrade && (
+                    <div style={{ color: '#b91c1c', fontWeight: 500, marginLeft: 12 }}>{trendMsg}</div>
+                  )}
+                </>;
+              })()}
               {armError && (
                 <div style={{
                   padding: '12px 16px',
@@ -2948,7 +3100,7 @@ const AutoTradingDashboard = () => {
                         </span>
                       </td>
                       <td style={{ padding: '10px', fontSize: '11px', color: '#718096' }}>
-                        {trade.exit_time ? new Date(trade.exit_time).toLocaleString() : '-'}
+                        {trade.exit_time ? new Date(trade.exit_time).toLocaleString() : (trade.entry_time ? new Date(trade.entry_time).toLocaleString() : '-')}
                       </td>
                     </tr>
                   );
@@ -3086,10 +3238,37 @@ const AutoTradingDashboard = () => {
                         </td>
                         <td style={{ padding: '8px', textAlign: 'right' }}>₹{entry.toFixed(2)}</td>
                         <td style={{ padding: '8px', textAlign: 'right' }}>₹{exit !== null ? exit.toFixed(2) : '-'}</td>
-                        <td style={{ padding: '8px', textAlign: 'right', fontWeight: '700', color: pnl >= 0 ? '#48bb78' : '#f56565' }}>
+                        <td style={{
+                          padding: '8px',
+                          textAlign: 'right',
+                          fontWeight: '700',
+                          color: pnl >= 0 ? '#48bb78' : '#f56565'
+                        }}>
                           {pnl >= 0 ? '+' : ''}₹{pnl.toLocaleString()}
                         </td>
-                        <td style={{ padding: '8px', fontSize: '11px', color: '#718096' }}>{t.status || 'CLOSED'}</td>
+                        <td style={{
+                          padding: '8px',
+                          textAlign: 'right',
+                          fontWeight: '600',
+                          color: pnlPct >= 0 ? '#48bb78' : '#f56565'
+                        }}>
+                          {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%
+                        </td>
+                        <td style={{ padding: '8px' }}>
+                          <span style={{
+                            padding: '2px 6px',
+                            borderRadius: '3px',
+                            background: trade.status === 'CLOSED' ? '#bee3f8' : '#feebc8',
+                            color: trade.status === 'CLOSED' ? '#2c5282' : '#7c2d12',
+                            fontSize: '11px',
+                            fontWeight: 'bold'
+                          }}>
+                            {trade.status || 'CLOSED'}
+                          </span>
+                        </td>
+                        <td style={{ padding: '8px', fontSize: '11px', color: '#718096' }}>
+                          {trade.exit_time ? new Date(trade.exit_time).toLocaleString() : (trade.entry_time ? new Date(trade.entry_time).toLocaleString() : '-')}
+                        </td>
                       </tr>
                     );
                   })}

@@ -95,7 +95,42 @@ def fetch_stock_option_chain(
     }
     ce_signal = _validate_signal_quality(ce_signal, kite, quote_data)
     pe_signal = _validate_signal_quality(pe_signal, kite, quote_data)
-    return [ce_signal, pe_signal]
+
+    # Enforce only one EXCELLENT/high quality signal (CE or PE) per strike
+    # Prefer the one with higher quality_score, or use technical recommendation if available
+    ce_score = ce_signal.get("quality_score", 0)
+    pe_score = pe_signal.get("quality_score", 0)
+    ce_reco = ce_signal.get("technical_indicators", {}).get("recommendation", "")
+    pe_reco = pe_signal.get("technical_indicators", {}).get("recommendation", "")
+
+    # Prefer technical recommendation if available and not HOLD
+    if ce_reco in ["STRONG BUY", "BUY"] and pe_reco not in ["STRONG BUY", "BUY"]:
+        # CE is the preferred signal
+        pe_signal["is_high_quality"] = False
+        pe_signal["quality_factors"] = pe_signal.get("quality_factors", []) + ["Filtered: CE trend stronger"]
+        return [ce_signal]
+    elif pe_reco in ["STRONG BUY", "BUY"] and ce_reco not in ["STRONG BUY", "BUY"]:
+        # PE is the preferred signal
+        ce_signal["is_high_quality"] = False
+        ce_signal["quality_factors"] = ce_signal.get("quality_factors", []) + ["Filtered: PE trend stronger"]
+        return [pe_signal]
+    else:
+        # Otherwise, use quality_score
+        if ce_score > pe_score:
+            pe_signal["is_high_quality"] = False
+            pe_signal["quality_factors"] = pe_signal.get("quality_factors", []) + ["Filtered: CE higher quality"]
+            return [ce_signal]
+        elif pe_score > ce_score:
+            ce_signal["is_high_quality"] = False
+            ce_signal["quality_factors"] = ce_signal.get("quality_factors", []) + ["Filtered: PE higher quality"]
+            return [pe_signal]
+        else:
+            # If both are equal, return both but mark as not high quality (or pick one arbitrarily)
+            ce_signal["is_high_quality"] = False
+            pe_signal["is_high_quality"] = False
+            ce_signal["quality_factors"] = ce_signal.get("quality_factors", []) + ["Filtered: No clear winner"]
+            pe_signal["quality_factors"] = pe_signal.get("quality_factors", []) + ["Filtered: No clear winner"]
+            return [ce_signal]
 import requests
 from typing import List, Dict
 import functools

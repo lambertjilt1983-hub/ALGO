@@ -57,15 +57,35 @@ def place_zerodha_order(symbol, quantity, side, order_type="MARKET", product="MI
     kite.set_access_token(access_token)
     
     try:
-        order_id = kite.place_order(
-            variety=kite.VARIETY_REGULAR,
-            exchange=exchange,
-            tradingsymbol=symbol,
-            transaction_type=kite.TRANSACTION_TYPE_BUY if side.upper() == "BUY" else kite.TRANSACTION_TYPE_SELL,
-            quantity=quantity,
-            order_type=order_type,
-            product=product
-        )
+        # Support for stop loss and target (squareoff)
+        import inspect
+        frame = inspect.currentframe().f_back
+        stoploss = getattr(frame, 'f_locals', lambda:{{}})().get('stoploss')
+        squareoff = getattr(frame, 'f_locals', lambda:{{}})().get('target')
+
+        if stoploss is not None or squareoff is not None:
+            # Use Bracket Order (BO)
+            order_id = kite.place_order(
+                variety=kite.VARIETY_BO,
+                exchange=exchange,
+                tradingsymbol=symbol,
+                transaction_type=kite.TRANSACTION_TYPE_BUY if side.upper() == "BUY" else kite.TRANSACTION_TYPE_SELL,
+                quantity=quantity,
+                order_type=order_type,
+                product=product,
+                stoploss=stoploss if stoploss is not None else 0,
+                squareoff=squareoff if squareoff is not None else 0
+            )
+        else:
+            order_id = kite.place_order(
+                variety=kite.VARIETY_REGULAR,
+                exchange=exchange,
+                tradingsymbol=symbol,
+                transaction_type=kite.TRANSACTION_TYPE_BUY if side.upper() == "BUY" else kite.TRANSACTION_TYPE_SELL,
+                quantity=quantity,
+                order_type=order_type,
+                product=product
+            )
         return {"success": True, "order_id": order_id}
     except Exception as e:
         return {"success": False, "error": str(e)}
