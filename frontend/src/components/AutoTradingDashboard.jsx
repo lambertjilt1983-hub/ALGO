@@ -456,13 +456,20 @@ const AutoTradingDashboard = () => {
       console.log('⏸️ Market analysis rate limited - wait 10s between calls');
       return;
     }
-    
+
     // Deduplication: prevent concurrent calls
     if (analyzeMarket.isRunning) {
       console.log('⏭️ Market analysis already running - skipping');
       return;
     }
-    
+
+    // Prevent new trade if any open position exists when auto-trading is enabled
+    if (autoTradingActive && activeTrades && activeTrades.length > 0) {
+      console.log('⏸️ Open position detected - no new trade will be started until all positions are closed.');
+      setStatusMessage('Open position detected. Waiting for all trades to close before starting a new one.');
+      return;
+    }
+
     analyzeMarket.isRunning = true;
     analyzeMarket.lastRun = now;
     
@@ -852,8 +859,63 @@ const AutoTradingDashboard = () => {
     return [];
   };
 
+  // Golden Pullback System filter (hard filter, all signals)
+  function isGoldenPullback(signal) {
+    // Example Golden Pullback criteria (customize as per PDF):
+    // 1. Signal must be a pullback (e.g., price above 20 EMA for CE, below for PE)
+    // 2. Recent candle must touch or cross 20 EMA and bounce in trend direction
+    // 3. Trend must be strong (e.g., 50 EMA > 200 EMA for CE, < for PE)
+    // 4. No entry if price is extended far from EMA (avoid late entries)
+    // 5. (Add more rules as per PDF)
+    //
+    // NOTE: This is a placeholder. Replace with actual logic as per Golden Pullback System rules and available signal fields.
+    if (!signal) {
+      console.log('[GoldenPullback] Filtered out: signal is null/undefined', signal);
+      return false;
+    }
+    // Example: Require signal to have golden_pullback_match === true (if backend provides)
+    if (signal.golden_pullback_match === false) {
+      console.log('[GoldenPullback] Filtered out:', signal.symbol, 'golden_pullback_match === false');
+      return false;
+    }
+    // If not provided, use basic EMA/trend logic as a proxy:
+    if (signal.ema_20 && signal.ema_50 && signal.ema_200 && signal.entry_price) {
+      if (signal.option_type === 'CE') {
+        // Price above 20 EMA, 50 EMA > 200 EMA
+        if (!(signal.entry_price > signal.ema_20 && signal.ema_50 > signal.ema_200)) {
+          console.log('[GoldenPullback] Filtered out:', signal.symbol, 'CE: price <= 20 EMA or 50 EMA <= 200 EMA', signal);
+          return false;
+        }
+      } else if (signal.option_type === 'PE') {
+        // Price below 20 EMA, 50 EMA < 200 EMA
+        if (!(signal.entry_price < signal.ema_20 && signal.ema_50 < signal.ema_200)) {
+          console.log('[GoldenPullback] Filtered out:', signal.symbol, 'PE: price >= 20 EMA or 50 EMA >= 200 EMA', signal);
+          return false;
+        }
+      } else {
+        console.log('[GoldenPullback] Filtered out:', signal.symbol, 'Unknown option_type', signal);
+        return false;
+      }
+    } else {
+      // If no EMA data, block (hard filter)
+      console.log('[GoldenPullback] Filtered out:', signal.symbol, 'Missing EMA data', signal);
+      return false;
+    }
+    // Add more checks as needed (e.g., candle touch, trend strength, not overextended, etc.)
+    return true;
+  }
+
+  // Apply Golden Pullback filter to all signals (hard filter) and log filtered-out signals
+  const filteredOptionSignals = optionSignals.filter((signal) => {
+    const result = isGoldenPullback(signal);
+    if (!result) {
+      // Already logged in isGoldenPullback
+    }
+    return result;
+  });
+
   // Group signals by index to show CE and PE side-by-side
-  const groupedSignals = optionSignals.reduce((acc, signal) => {
+  const groupedSignals = filteredOptionSignals.reduce((acc, signal) => {
     // Filter out fake/invalid signals
     if (signal.error) return acc;
     if (!signal.symbol || !signal.index || !signal.strike) return acc;
@@ -1146,16 +1208,23 @@ const AutoTradingDashboard = () => {
     
     try {
       const params = {
-        symbol: signal.symbol,
-        price: signal.entry_price,
-        target: signal.target,
-        stop_loss: signal.stop_loss,
-        quantity: adjustedQuantity,
-        side: signal.action,
-        expiry: signal.expiry_date,
+        symbol: signal.symbol || '',
+        price: Number(signal.entry_price) || 0,
+        target: signal.target !== undefined && signal.target !== null ? Number(signal.target) : 0,
+        stop_loss: signal.stop_loss !== undefined && signal.stop_loss !== null ? Number(signal.stop_loss) : 0,
+        quantity: Number.isFinite(parseInt(adjustedQuantity, 10)) ? parseInt(adjustedQuantity, 10) : 1,
+        side: signal.action || 'BUY', // 'BUY' or 'SELL'
+        support: signal.support !== undefined && signal.support !== null ? Number(signal.support) : 0,
+        resistance: signal.resistance !== undefined && signal.resistance !== null ? Number(signal.resistance) : 0,
         broker_id: 1,
-        balance: isLiveMode ? 50000 : 0  // 0 = demo mode, positive = live mode
+        balance: isLiveMode ? 50000 : 0 // 0 = demo mode, positive = live mode
       };
+      console.log('[DEBUG] Executing trade with params:', {
+        isLiveMode,
+        autoTradingActive,
+        balance: params.balance,
+        params
+      });
       const response = await config.authFetch(config.endpoints.autoTrade.execute, {
         method: 'POST',
         body: JSON.stringify(params)
@@ -1437,12 +1506,32 @@ const AutoTradingDashboard = () => {
     };
   }, [enabled, autoTradingActive, activeTrades.length]);
 
-  // Default: auto-trading OFF on load (paper trades only until user clicks Start)
+  // Restore auto-trading state from backend on mount
   useEffect(() => {
     if (didAutoStart.current) return;
     didAutoStart.current = true;
-    setAutoTradingActive(false);
-    setIsLiveMode(false);
+    // Fetch auto-trading status from backend
+    const restoreAutoTradingState = async () => {
+      try {
+        const res = await config.authFetch(AUTO_TRADE_STATUS_API);
+        if (res.ok) {
+          const data = await res.json();
+          // The backend should return a status object with live_armed or similar
+          // Adjust field names as per backend response
+          const armed = data.live_armed ?? data.armed ?? data.enabled ?? false;
+          const live = data.is_live_mode ?? data.live ?? armed; // fallback: if armed, assume live
+          setAutoTradingActive(!!armed);
+          setIsLiveMode(!!live);
+        } else {
+          setAutoTradingActive(false);
+          setIsLiveMode(false);
+        }
+      } catch {
+        setAutoTradingActive(false);
+        setIsLiveMode(false);
+      }
+    };
+    restoreAutoTradingState();
   }, []);
 
   useEffect(() => {
@@ -1485,11 +1574,50 @@ const AutoTradingDashboard = () => {
     }
   }, [stats?.daily_pnl, autoTradingActive]);
 
-  // Trigger initial trade when auto-trading is activated
+  // Debounced, strictly controlled auto-trade trigger
+  const autoTradeStoppedRef = React.useRef(false);
+  const autoTradeTriggerTimeout = React.useRef(null);
+
+  // Track if user has manually stopped auto-trading
   useEffect(() => {
-    if (autoTradingActive && activeTrades.length === 0) {
-      console.log('Auto-trading activated - starting initial trade analysis...');
-      setTimeout(() => analyzeMarket(), 2000);
+    if (!autoTradingActive) {
+      autoTradeStoppedRef.current = true;
+      if (autoTradeTriggerTimeout.current) {
+        clearTimeout(autoTradeTriggerTimeout.current);
+        autoTradeTriggerTimeout.current = null;
+      }
+    }
+  }, [autoTradingActive]);
+
+  useEffect(() => {
+    // Only start a new trade if:
+    // - auto-trading is active
+    // - there are no active trades
+    // - user has not manually stopped auto-trading since last activation
+    // - no pending trigger
+    if (
+      autoTradingActive &&
+      activeTrades.length === 0 &&
+      !autoTradeStoppedRef.current &&
+      !autoTradeTriggerTimeout.current
+    ) {
+      console.log('Auto-trading activated - starting initial trade analysis (debounced)...');
+      autoTradeTriggerTimeout.current = setTimeout(() => {
+        analyzeMarket();
+        autoTradeTriggerTimeout.current = null;
+      }, 2000);
+    }
+    // If a trade becomes active, clear any pending trigger
+    if (activeTrades.length > 0 && autoTradeTriggerTimeout.current) {
+      clearTimeout(autoTradeTriggerTimeout.current);
+      autoTradeTriggerTimeout.current = null;
+    }
+  }, [autoTradingActive, activeTrades.length]);
+
+  // Reset the stopped flag if user arms auto-trading again
+  useEffect(() => {
+    if (autoTradingActive) {
+      autoTradeStoppedRef.current = false;
     }
   }, [autoTradingActive]);
 
@@ -2307,18 +2435,26 @@ const AutoTradingDashboard = () => {
               <button
                 onClick={async () => {
                   if (autoTradingActive) {
+                    // Stop auto-trading (both live and demo)
                     setAutoTradingActive(false);
                     setHasActiveTrade(false);
                     setIsLiveMode(false);
                     setArmError(null);
                     return;
                   }
+                  // Try to arm live trading first
                   const armed = await armLiveTrading(false);
                   if (armed) {
                     setAutoTradingActive(true);
-                    console.log('🚀 AUTO-TRADING ACTIVATED!');
+                    setIsLiveMode(true);
+                    setArmError(null);
+                    console.log('🚀 AUTO-TRADING ACTIVATED! (LIVE MODE)');
                   } else {
-                    console.log('❌ AUTO-TRADING ACTIVATION FAILED');
+                    // If live arming fails, fallback to demo mode
+                    setAutoTradingActive(true);
+                    setIsLiveMode(false);
+                    setArmError('Live trading not armed, running in DEMO mode.');
+                    console.log('⚪ AUTO-TRADING ACTIVATED! (DEMO MODE)');
                   }
                 }}
                 disabled={armingInProgress}
@@ -2604,7 +2740,12 @@ const AutoTradingDashboard = () => {
                       </td>
                       <td style={{ padding: '10px', textAlign: 'right' }}>{trade.quantity}</td>
                       <td style={{ padding: '10px', fontSize: '11px', color: '#718096' }}>
-                        {trade.entry_time ? new Date(trade.entry_time).toLocaleString() : '-'}
+                        {trade.entry_time ? (() => {
+                          const utc = new Date(trade.entry_time);
+                          // Convert to IST (UTC+5:30)
+                          const ist = new Date(utc.getTime() + (5.5 * 60 * 60 * 1000));
+                          return ist.toLocaleString('en-IN', { hour12: true });
+                        })() : '-'}
                       </td>
                       <td style={{ padding: '10px', textAlign: 'center' }}>
                         <button

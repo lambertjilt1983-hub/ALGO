@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.requests import Request
-from app.routes import auth, broker, orders, strategies, market_intelligence, auto_trading_simple, test_market, token_refresh, admin, option_signals, zerodha_postback, paper_trading
+from app.routes import auth, broker, orders, strategies, market_intelligence, auto_trading_simple, test_market, token_refresh, admin, option_signals, zerodha_postback, paper_trading, export_excel
 from app.core.database import Base, engine, SessionLocal
 from app.core.config import get_settings
 from app.core.background_tasks import start_background_tasks, stop_background_tasks
@@ -95,20 +95,6 @@ app = FastAPI(
 
 # ...existing code...
 
-# Explicit CORS preflight handler for OPTIONS requests
-from fastapi.responses import JSONResponse
-from fastapi.requests import Request
-@app.options("/{path:path}")
-async def preflight_handler(request: Request, path: str):
-    origin = request.headers.get("origin")
-    allowed = origin if origin in allowed_origins else allowed_origins[0]
-    headers = {
-        "Access-Control-Allow-Origin": allowed,
-        "Access-Control-Allow-Methods": request.headers.get("access-control-request-method", "*"),
-        "Access-Control-Allow-Headers": request.headers.get("access-control-request-headers", "*"),
-        "Access-Control-Allow-Credentials": "true",
-    }
-    return JSONResponse(status_code=200, content={}, headers=headers)
 
 import os
 from fastapi import FastAPI
@@ -209,21 +195,13 @@ app = FastAPI(
 )
 
 # CORS middleware
-settings = get_settings()
-allowed_origins = [origin.strip() for origin in settings.ALLOWED_ORIGINS.split(",") if origin.strip()]
-placeholder_hosts = {"https://yourdomain.com", "https://www.yourdomain.com"}
-if not allowed_origins or placeholder_hosts.intersection(allowed_origins):
-    allowed_origins = [
-        settings.FRONTEND_URL,
-        settings.FRONTEND_ALT_URL,
-    ]
-# Always allow localhost:3000 and localhost:3001 for development
-for dev_origin in ["http://localhost:3000", "http://localhost:3001"]:
-    if dev_origin not in allowed_origins:
-        allowed_origins.append(dev_origin)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=[
+        "*",  # Allow all origins for development; change to specific domains for production
+        "http://localhost:3000",
+        "http://localhost:3001"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -327,25 +305,13 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS middleware (must be first)
-settings = get_settings()
-allowed_origins = [origin.strip() for origin in settings.ALLOWED_ORIGINS.split(",") if origin.strip()]
-placeholder_hosts = {"https://yourdomain.com", "https://www.yourdomain.com"}
-if not allowed_origins or placeholder_hosts.intersection(allowed_origins):
-    allowed_origins = [
-        settings.FRONTEND_URL,
-        settings.FRONTEND_ALT_URL,
-    ]
-# Always allow localhost:3000 and localhost:3001 for development
-for dev_origin in ["http://localhost:3000", "http://localhost:3001"]:
-    if dev_origin not in allowed_origins:
-        allowed_origins.append(dev_origin)
+# --- FORCE CORS FOR LOCAL DEVELOPMENT ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=["*"],  # Allow all origins for local development
     allow_credentials=True,
-    allow_methods=["*"] ,
-    allow_headers=["*"] ,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Include routers
@@ -356,6 +322,7 @@ app.include_router(strategies.router)
 app.include_router(test_market.router)  # Test endpoint with real data
 app.include_router(market_intelligence.router)
 app.include_router(option_signals.router)
+app.include_router(export_excel.router)
 app.include_router(auto_trading_simple.router)  # Using simplified version
 app.include_router(token_refresh.router)  # Token refresh and validation endpoints
 app.include_router(admin.router)  # Admin-only utilities

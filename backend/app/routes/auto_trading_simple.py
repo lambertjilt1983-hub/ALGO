@@ -1,5 +1,8 @@
+
+# Ensure os is imported first for all usages
+import os
 import asyncio
-from fastapi import APIRouter, Body, Header, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Header, HTTPException, BackgroundTasks, Body
 from pydantic import BaseModel
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
 
@@ -36,6 +39,7 @@ import numpy as np
 from datetime import datetime, timedelta, time as dt_time
 from typing import Any, Dict, List, Optional, Tuple
 
+import os
 
 
 from fastapi import APIRouter, Body, Header, HTTPException
@@ -76,6 +80,9 @@ MAX_TRADES = 10000  # allow more intraday trades when signals align
 SINGLE_ACTIVE_TRADE = True  # hard lock: only one live trade at a time
 TARGET_PCT = 0.6  # target move in percent (slightly above stop for RR >= 1)
 STOP_PCT = 0.4    # stop move in percent (tighter risk)
+STOP_PCT_OPTIONS = 0.4  # stop move in percent for options (same as STOP_PCT by default)
+MAX_STOP_POINTS = 40  # maximum stop loss allowed in points (matches frontend logic)
+TARGET_POINTS = 40  # default target move in points for options trades
 CONFIRM_MOMENTUM_PCT = 0.1  # very loose confirmation so signals appear on small moves
 MIN_WIN_RATE = 0.6          # suppress signals if recent hit-rate is below this
 MIN_WIN_SAMPLE = 8          # minimum closed trades before applying win-rate gate
@@ -619,6 +626,58 @@ def _close_trade(trade: Dict[str, any], exit_price: float) -> None:
         except Exception:
             pass
 
+
+def place_zerodha_order(symbol: str, quantity: int, side: str, order_type: str = "MARKET", product: str = "MIS", exchange: str = "NFO") -> dict:
+    """Place a real order to Zerodha using ZerodhaBroker, fetching credentials from DB if available."""
+    from app.models.auth import BrokerCredential
+    from app.core.token_manager import TokenManager
+    db = SessionLocal()
+    credentials = None
+    try:
+        # Try to fetch the first active Zerodha credential (customize as needed)
+        cred = db.query(BrokerCredential).filter(
+            BrokerCredential.broker_name == "zerodha",
+            BrokerCredential.is_active == True
+        ).first()
+        if cred and TokenManager.validate_zerodha_token(cred):
+            api_key = TokenManager._maybe_decrypt(cred.api_key)
+            access_token = TokenManager._maybe_decrypt(cred.access_token)
+            credentials = {"api_key": api_key, "access_token": access_token}
+        else:
+            # Fallback to environment variables
+            credentials = {
+                "api_key": os.environ.get("ZERODHA_API_KEY"),
+                "access_token": os.environ.get("ZERODHA_ACCESS_TOKEN"),
+            }
+    except Exception as e:
+        # Fallback to environment variables on error
+        credentials = {
+            "api_key": os.environ.get("ZERODHA_API_KEY"),
+            "access_token": os.environ.get("ZERODHA_ACCESS_TOKEN"),
+        }
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+    broker = ZerodhaBroker()
+    if not broker.connect(credentials):
+        return {"success": False, "error": "Failed to connect to Zerodha. Check credentials."}
+    order_details = {
+        "exchange": exchange,
+        "tradingsymbol": symbol,
+        "transaction_type": side.upper(),
+        "quantity": quantity,
+        "order_type": order_type,
+        "product": product,
+        # Add more params as needed
+    }
+    try:
+        result = broker.place_order(order_details)
+        return result
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 def close_all_active_trades(reason: str = "Market close") -> int:
     """Force-close all open active trades with a market exit order."""
@@ -1256,20 +1315,37 @@ class CloseTradeRequest(BaseModel):
     trade_id: Optional[int] = None
     symbol: Optional[str] = None
 
+
 @router.post("/execute")
 async def execute(
-    symbol: str,
-    price: float = 0.0,
-    balance: float = 100.0,
-    quantity: Optional[int] = None,
-    side: str = "BUY",
-    stop_loss: Optional[float] = None,
-    target: Optional[float] = None,
-    support: Optional[float] = None,
-    resistance: Optional[float] = None,
-    broker_id: int = 1,
+    trade: TradeRequest = Body(...),
     authorization: Optional[str] = Header(None),
 ):
+    global TARGET_POINTS
+    symbol = trade.symbol
+    price = trade.price
+    balance = trade.balance
+    quantity = trade.quantity
+    side = trade.side
+    stop_loss = trade.stop_loss
+    target = trade.target
+    support = trade.support
+    resistance = trade.resistance
+    broker_id = trade.broker_id
+    # Debug: Log received parameters and mode
+    print("[DEBUG] /autotrade/execute called with:", {
+        "symbol": symbol,
+        "price": price,
+        "balance": balance,
+        "quantity": quantity,
+        "side": side,
+        "stop_loss": stop_loss,
+        "target": target,
+        "broker_id": broker_id,
+        "is_demo_mode": state.get("is_demo_mode"),
+        "authorization": authorization
+    }, flush=True)
+
     # Ignore balance, demo mode, trading window, and max trades. Always execute trade if market is live.
     mode = "LIVE"
 
