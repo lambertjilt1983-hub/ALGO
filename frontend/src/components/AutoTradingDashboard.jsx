@@ -1024,8 +1024,13 @@ const AutoTradingDashboard = () => {
 
   // Restore quality and EMA (Golden Pullback) filters for AI recommendation and table display
   const winRate = stats?.win_rate ? (stats.win_rate / 100) : 0.5;
+  // Only include intraday signals
+  const intradayOptionSignals = optionSignals.filter(signal => {
+    const signalType = String(signal?.signal_type || signal?.type || signal?.strategy || '').toLowerCase();
+    return signalType.includes('intraday');
+  });
   // Only apply Golden Pullback (EMA) filter for table and AI recommendation
-  const filteredOptionSignalsRaw = optionSignals.filter((signal) => isGoldenPullback(signal));
+  const filteredOptionSignalsRaw = intradayOptionSignals.filter((signal) => isGoldenPullback(signal));
   const filteredOptionSignals = filteredOptionSignalsRaw;
   // Group signals by index to show CE and PE side-by-side (with filters)
   const groupedSignals = filteredOptionSignalsRaw.reduce((acc, signal) => {
@@ -2131,7 +2136,7 @@ const AutoTradingDashboard = () => {
             fontSize: '18px',
             fontWeight: 'bold'
           }}>
-            🎯 All Quality Signals (NIFTY • BANKNIFTY • SENSEX • FINNIFTY - 85%+ Quality, All Options)
+            🎯 All Intraday Option Signals – 85%+ Quality (All Indices & Stocks)
           </h4>
           <button
             onClick={() => scanMarketForQualityTrades(true)}
