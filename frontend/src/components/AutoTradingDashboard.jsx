@@ -138,6 +138,8 @@ const AutoTradingDashboard = () => {
   const [wakeLockActive, setWakeLockActive] = useState(false);
   const [qualityTrades, setQualityTrades] = useState([]); // Market scanner results
   const [scannerLoading, setScannerLoading] = useState(false);
+  const [lastScanTime, setLastScanTime] = useState(null); // Timestamp of last scan
+  const [lastScanResults, setLastScanResults] = useState([]); // Cached scan results
     // --- Market Open/Close Logic (must be above all usages) ---
 
     // Handler for Start Auto Trade button (global)
@@ -328,24 +330,31 @@ const AutoTradingDashboard = () => {
 
 
   // Market Quality Scanner - finds all 75%+ quality trades
-  const scanMarketForQualityTrades = async () => {
+  const scanMarketForQualityTrades = async (force = false) => {
+    // Only scan if never scanned, or >1 hour since last scan, or force is true
+    const now = Date.now();
+    if (!force && lastScanTime && (now - lastScanTime < 60 * 60 * 1000)) {
+      // Use cached results
+      setQualityTrades(lastScanResults);
+      setScannerLoading(false);
+      return;
+    }
     setScannerLoading(true);
     console.log('🔍 Scanning entire market for quality trades (75%+)...');
-    
     try {
       // Fetch all signals from the market
       const res = await config.authFetch(`${OPTION_SIGNALS_API}?include_nifty50=true`);
       if (!res.ok) throw new Error('Failed to fetch market signals');
-      
       const data = await res.json();
       const allSignals = data.signals || [];
+      console.log(`[DEBUG] Backend returned ${allSignals.length} signals`);
       const intradayOnly = allSignals.filter((signal) => {
         const signalType = String(signal?.signal_type || signal?.type || signal?.strategy || '').toLowerCase();
         const hasOptionType = signal?.option_type === 'CE' || signal?.option_type === 'PE';
         return signalType.includes('intraday') || hasOptionType;
       });
+      console.log(`[DEBUG] After intraday/options filter: ${intradayOnly.length} signals`);
       const winRate = stats?.win_rate ? (stats.win_rate / 100) : 0.5;
-      
       // Calculate quality for each signal
       const qualityScores = intradayOnly.map(signal => {
         const quality = calculateTradeQuality(signal, winRate);
@@ -360,40 +369,24 @@ const AutoTradingDashboard = () => {
           recommendation: quality.quality >= 85 ? '⭐ EXCELLENT' : quality.quality >= 75 ? '✅ GOOD' : '❌ POOR'
         };
       });
-      
+      console.log(`[DEBUG] After quality scoring: ${qualityScores.length} signals`);
       // Filter only 50%+ quality trades and sort by quality descending (weighted scoring)
-      // PATCH: Lowered threshold to 0 for testing (show all)
       const qualityOnly = qualityScores
         .filter(s => s.quality >= 0)
         .sort((a, b) => b.quality - a.quality);
-
-      // Count today's executed trades (active + closed)
-      const today = new Date().toISOString().slice(0, 10);
-      const tradesToday = tradeHistory.filter((t) => {
-        const ts = t.exit_time || t.entry_time || t.timestamp;
-        if (!ts) return false;
-        const dateObj = new Date(ts);
-        return dateObj.getFullYear() + '-' + String(dateObj.getMonth()+1).padStart(2, '0') + '-' + String(dateObj.getDate()).padStart(2, '0') === today;
-      });
-      const activeToday = activeTrades.filter((t) => {
-        const ts = t.entry_time || t.timestamp;
-        if (!ts) return false;
-        const dateObj = new Date(ts);
-        return dateObj.getFullYear() + '-' + String(dateObj.getMonth()+1).padStart(2, '0') + '-' + String(dateObj.getDate()).padStart(2, '0') === today;
-      });
-      const totalTradesToday = tradesToday.length + activeToday.length;
-      
-      console.log(`✅ Market Scan Complete: ${qualityOnly.length} quality trades found (${allSignals.length} total signals)`);
-      console.log(`📊 All Signal Scores:`, qualityScores.map(s => ({ symbol: s.symbol, quality: s.quality, confidence: s.factors?.confidenceScore })));
-      
+      console.log(`[DEBUG] After quality >= 0 filter: ${qualityOnly.length} signals`);
       // Log top 5 trades for debugging
       qualityOnly.slice(0, 5).forEach((t, i) => {
         console.log(`  #${i+1}: ${t.symbol} - Quality: ${t.quality}% (Confidence: ${t.factors?.confidenceScore?.toFixed(1)}, RR: ${t.factors?.rrScore?.toFixed(1)}, Win Rate: ${t.factors?.winRateScore?.toFixed(1)})`);
       });
       setQualityTrades(qualityOnly);
+      setLastScanResults(qualityOnly);
+      setLastScanTime(now);
     } catch (err) {
       console.error('❌ Market scan failed:', err);
       setQualityTrades([]);
+      setLastScanResults([]);
+      setLastScanTime(now);
     } finally {
       setScannerLoading(false);
     }
@@ -817,7 +810,9 @@ const AutoTradingDashboard = () => {
       let bestSignal = null;
       let mainMomentum = null;
       if (Object.keys(momentumAnalysis).length > 0) {
-        const mainIndex = momentumAnalysis['NIFTY'] ? 'NIFTY' : (momentumAnalysis['BANKNIFTY'] ? 'BANKNIFTY' : Object.keys(momentumAnalysis)[0]);
+        // Dynamically select the main index: pick the one with the highest momentum score
+        const mainIndex = Object.entries(momentumAnalysis)
+          .sort(([, a], [, b]) => (b.score || 0) - (a.score || 0))[0]?.[0] || Object.keys(momentumAnalysis)[0];
         mainMomentum = momentumAnalysis[mainIndex] || {};
         const ceSignals = highQualitySignals.filter(s => s.option_type === 'CE');
         const peSignals = highQualitySignals.filter(s => s.option_type === 'PE');
@@ -988,30 +983,31 @@ const AutoTradingDashboard = () => {
       return false;
     }
     // If not provided, use basic EMA/trend logic as a proxy:
+    // Hybrid: Allow if strict EMA rule passes, OR if confidence/quality is very high
     if (signal.ema_20 && signal.ema_50 && signal.ema_200 && signal.entry_price) {
       if (signal.option_type === 'CE') {
-        // Price above 20 EMA, 50 EMA > 200 EMA
-        if (!(signal.entry_price > signal.ema_20 && signal.ema_50 > signal.ema_200)) {
-          console.log('[GoldenPullback] Filtered out:', signal.symbol, 'CE: price <= 20 EMA or 50 EMA <= 200 EMA', signal);
-          return false;
+        if (signal.entry_price > signal.ema_20 && signal.ema_50 > signal.ema_200) {
+          return true;
         }
       } else if (signal.option_type === 'PE') {
-        // Price below 20 EMA, 50 EMA < 200 EMA
-        if (!(signal.entry_price < signal.ema_20 && signal.ema_50 < signal.ema_200)) {
-          console.log('[GoldenPullback] Filtered out:', signal.symbol, 'PE: price >= 20 EMA or 50 EMA >= 200 EMA', signal);
-          return false;
+        if (signal.entry_price < signal.ema_20 && signal.ema_50 < signal.ema_200) {
+          return true;
         }
       } else {
         console.log('[GoldenPullback] Filtered out:', signal.symbol, 'Unknown option_type', signal);
         return false;
       }
-    } else {
-      // If no EMA data, block (hard filter)
-      console.log('[GoldenPullback] Filtered out:', signal.symbol, 'Missing EMA data', signal);
-      return false;
     }
-    // Add more checks as needed (e.g., candle touch, trend strength, not overextended, etc.)
-    return true;
+    // If strict EMA rule fails, allow if confidence or quality is very high
+    const confidence = Number(signal.confirmation_score ?? signal.confidence ?? 0);
+    const quality = Number(signal.quality_score ?? signal.quality ?? 0);
+    if (confidence >= 85 || quality >= 85) {
+      console.log('[GoldenPullback] Allowed by high confidence/quality:', signal.symbol, {confidence, quality});
+      return true;
+    }
+    // Otherwise, block
+    console.log('[GoldenPullback] Filtered out:', signal.symbol, 'Did not meet EMA or high confidence/quality', signal);
+    return false;
   }
 
   // OTM filter: Only include CE where strike > spot, PE where strike < spot
@@ -1060,36 +1056,16 @@ const AutoTradingDashboard = () => {
   // If no signals, force null for all signal-driven UI
   const effectiveBestQualityTrade = noQualityTrades ? null : bestQualityTrade;
 
-  // Advanced AI Recommendation: Use trend/momentum to pick CE or PE
+  // Reduced AI Recommendation: pick the signal with the highest confidence/quality
   let aiRecommendedSignal = null;
   if (!noFilteredSignals) {
-    // Try to use momentumAnalysis if available (from last analyzeMarket run)
-    // Fallback: use best overall signal
-    if (typeof window !== 'undefined' && window.momentumAnalysis) {
-      const mainIndex = window.momentumAnalysis['NIFTY'] ? 'NIFTY' : (window.momentumAnalysis['BANKNIFTY'] ? 'BANKNIFTY' : Object.keys(window.momentumAnalysis)[0]);
-      const mainMomentum = window.momentumAnalysis[mainIndex] || {};
-      if (mainMomentum.direction && mainMomentum.direction.includes('BULLISH')) {
-        aiRecommendedSignal = filteredOptionSignalsRaw.filter(s => s.option_type === 'CE').reduce((best, curr) => {
-          if (!best) return curr;
-          return ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence)) ? curr : best;
-        }, null);
-      } else if (mainMomentum.direction && mainMomentum.direction.includes('BEARISH')) {
-        aiRecommendedSignal = filteredOptionSignalsRaw.filter(s => s.option_type === 'PE').reduce((best, curr) => {
-          if (!best) return curr;
-          return ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence)) ? curr : best;
-        }, null);
-      }
-    }
-    // Fallback if no momentum/trend data or no match
-    if (!aiRecommendedSignal) {
-      aiRecommendedSignal = filteredOptionSignalsRaw.reduce((best, curr) => {
-        if (curr.error || !curr.symbol || !curr.entry_price || curr.entry_price <= 0) return best;
-        if (!curr.confirmation_score && !curr.confidence) return best;
-        return (!best || ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence))) ? curr : best;
-      }, null);
-    }
+    aiRecommendedSignal = filteredOptionSignalsRaw.reduce((best, curr) => {
+      if (curr.error || !curr.symbol || !curr.entry_price || curr.entry_price <= 0) return best;
+      if (!curr.confirmation_score && !curr.confidence) return best;
+      return (!best || ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence))) ? curr : best;
+    }, null);
     // Debug log for AI recommended signal
-    console.log('[DEBUG] AI Recommended Signal:', aiRecommendedSignal);
+    console.log('[DEBUG] AI Recommended Signal (reduced logic):', aiRecommendedSignal);
   }
 
   // Use quality trade if available, otherwise use AI recommended signal (all from quality > 90%)
@@ -1119,22 +1095,21 @@ const AutoTradingDashboard = () => {
       ? Number(displayEntryPrice) * Number(displayQuantity) * Number(lotMultiplier)
       : 0);
 
-  const liveDisplaySignal = effectiveBestQualityTrade
-    // ...removed professionalSignal fallback...
-    || activeSignal;
-  const liveEntryPrice = liveDisplaySignal?.entry_price;
-  const liveTarget = liveDisplaySignal?.target;
-  const liveStopLoss = liveDisplaySignal?.stop_loss;
+  const liveDisplaySignal = effectiveBestQualityTrade || activeSignal;
+  const hasLiveSignal = !!liveDisplaySignal;
+  const liveEntryPrice = hasLiveSignal ? liveDisplaySignal.entry_price : null;
+  const liveTarget = hasLiveSignal ? liveDisplaySignal.target : null;
+  const liveStopLoss = hasLiveSignal ? liveDisplaySignal.stop_loss : null;
   const liveTargetPoints =
-    liveTarget != null && liveEntryPrice != null
+    hasLiveSignal && liveTarget != null && liveEntryPrice != null
       ? Math.abs(Number(liveTarget) - Number(liveEntryPrice))
       : null;
   const liveSlPoints =
-    liveStopLoss != null && liveEntryPrice != null
+    hasLiveSignal && liveStopLoss != null && liveEntryPrice != null
       ? Math.abs(Number(liveEntryPrice) - Number(liveStopLoss))
       : null;
-  const liveQuantity = liveDisplaySignal?.quantity ?? activeSignal?.quantity ?? 0;
-  const liveExpiryDate = liveDisplaySignal?.expiry_date || liveDisplaySignal?.expiry;
+  const liveQuantity = hasLiveSignal ? (liveDisplaySignal.quantity ?? activeSignal?.quantity ?? 0) : null;
+  const liveExpiryDate = hasLiveSignal ? (liveDisplaySignal.expiry_date || liveDisplaySignal.expiry) : null;
 
   // Render option signals table - Side by side CE and PE
   const renderOptionSignalsTable = () => (
@@ -1581,46 +1556,33 @@ const AutoTradingDashboard = () => {
   };
 
   useEffect(() => {
-    // Set loading to false immediately to show UI
-    // Data will load in background
     setLoading(false);
-    
-    // Auto-scan market for quality trades on load
+    // On mount, auto-scan market for quality trades (with caching)
     setTimeout(() => {
       scanMarketForQualityTrades();
-      console.log('📊 Auto-scanning market for quality trades...');
+      console.log('📊 Auto-scanning market for quality trades (with caching)...');
     }, 2000);
-    
     // Start wake lock + heartbeat immediately
     const activateWakeLock = async () => {
       const status = await initializeWakeLock();
       setWakeLockActive(!!status?.wakeLockActive || !!status?.hasModernAPI || !!status?.heartbeatActive);
       startKeepAliveHeartbeat();
     };
-    
     activateWakeLock();
-
     const handleVisibilityRefresh = () => {
       if (!document.hidden) {
         fetchData();
         scanMarketForQualityTrades();
       }
     };
-
     document.addEventListener('visibilitychange', handleVisibilityRefresh);
-
     const wakeLockStatusInterval = setInterval(() => {
       const status = getWakeLockStatus();
       setWakeLockActive(!!status?.isActive || !!status?.heartbeatRunning);
     }, 30000);
-
-    // Fetch data in background (non-blocking)
     const initialDataTimeout = setTimeout(() => {
       fetchData();
-      // analyzeMarket() only called when auto-trading starts or trade exits
-    }, 100); // Small delay to ensure UI renders first
-
-    // Keep-alive heartbeat: Ping backend health every 30 seconds
+    }, 100);
     const healthCheckInterval = setInterval(async () => {
       try {
         await config.authFetch(`${config.API_BASE_URL}/health`);
@@ -1629,35 +1591,16 @@ const AutoTradingDashboard = () => {
       } catch (e) {
         console.warn('⚠️ Health check failed:', e.message);
       }
-    }, 30000); // Every 30 seconds
-
-    // Auto-refresh data every 5 seconds for real-time updates
+    }, 30000);
     const dataRefreshInterval = setInterval(async () => {
       const prevCount = prevActiveTradesCount.current;
-      
-      // Always fetch trade data so it stays updated anytime
       if (document.hidden && !ALWAYS_FETCH_TRADES) {
         console.log('⏸️ Tab hidden - skipping data fetch');
         return;
       }
-      
       await fetchData();
-      
-      // CRITICAL: Detect trade exit (count went from 1+ to 0)
-      if (autoTradingActive && prevCount > 0 && activeTrades.length === 0) {
-        console.log(`🔄 Trade EXIT detected! (${prevCount} → 0) - Triggering new analysis in 3s...`);
-        setTimeout(() => {
-          console.log('🎯 Analyzing market for next trade...');
-          analyzeMarket();
-        }, 3000);
-      }
-      
-      // No continuous market analysis - only on trade exits or auto-trading start
-      
-      // Update ref for next iteration
       prevActiveTradesCount.current = activeTrades.length;
-    }, 2000); // 2 seconds for data refresh
-
+    }, 2000);
     return () => {
       clearTimeout(initialDataTimeout);
       clearInterval(dataRefreshInterval);
@@ -2191,7 +2134,7 @@ const AutoTradingDashboard = () => {
             🎯 All Quality Signals (NIFTY • BANKNIFTY • SENSEX • FINNIFTY - 85%+ Quality, All Options)
           </h4>
           <button
-            onClick={scanMarketForQualityTrades}
+            onClick={() => scanMarketForQualityTrades(true)}
             disabled={scannerLoading}
             style={{
               padding: '10px 20px',
@@ -2205,9 +2148,14 @@ const AutoTradingDashboard = () => {
             }}>
             {scannerLoading ? '🔄 Scanning...' : '🔄 Refresh'}
           </button>
+          {lastScanTime && (
+            <span style={{ marginLeft: 16, fontSize: 13, color: '#92400e' }}>
+              Last scan: {new Date(lastScanTime).toLocaleTimeString()} (auto every 1h)
+            </span>
+          )}
         </div>
 
-        {qualityTrades.filter(t => t.quality >= 0).length > 0 ? (
+        {qualityTrades.length > 0 ? (
           <div style={{ overflowX: 'auto' }}>
             <table style={{
               width: '100%',
@@ -2228,7 +2176,7 @@ const AutoTradingDashboard = () => {
                 </tr>
               </thead>
               <tbody>
-                {qualityTrades.filter(trade => trade.quality >= 85).map((trade, idx) => {
+                {qualityTrades.map((trade, idx) => {
                   // Highlight Nifty 50 company options
                   const NIFTY_50_SYMBOLS = [
                     "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
@@ -2285,7 +2233,9 @@ const AutoTradingDashboard = () => {
                     </td>
                     <td style={{ padding: '10px', textAlign: 'center' }}>₹{trade.entry_price?.toFixed(2) || '-'}</td>
                     <td style={{ padding: '10px', textAlign: 'center' }}>₹{trade.target?.toFixed(2) || '-'}</td>
-                    <td style={{ padding: '10px', textAlign: 'center' }}>{trade.recommendation}</td>
+                    <td style={{ padding: '10px', textAlign: 'center' }}>
+                      {trade.recommendation === '⭐ EXCELLENT' ? trade.recommendation : ''}
+                    </td>
                     <td style={{ padding: '10px', textAlign: 'center', fontSize: '12px' }}>
                       {Array.isArray(trade.all_option_signals) && trade.all_option_signals.length > 0 ? (
                         <ul style={{ margin: 0, padding: 0, listStyle: 'none' }}>
@@ -2318,148 +2268,151 @@ const AutoTradingDashboard = () => {
 
 
       {/* Market Analysis / AI Recommendation */}
-      {(activeSignal || filteredOptionSignalsRaw.length > 0) && (
+      <div style={{
+        padding: '24px',
+        background: 'linear-gradient(135deg, #fef5e7 0%, #fdebd0 100%)',
+        borderRadius: '12px',
+        border: '2px solid #f59e0b',
+        marginBottom: '24px'
+      }}>
         <div style={{
-          padding: '24px',
-          background: 'linear-gradient(135deg, #fef5e7 0%, #fdebd0 100%)',
-          borderRadius: '12px',
-          border: '2px solid #f59e0b',
-          marginBottom: '24px'
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'start',
+          marginBottom: '16px'
         }}>
-          <div style={{
-            display: 'flex',
-            justifyContent: 'space-between',
-            alignItems: 'start',
-            marginBottom: '16px'
-          }}>
-            <div>
-              <h4 style={{
-                margin: '0 0 8px 0',
-                color: '#78350f',
-                fontSize: '18px',
-                fontWeight: 'bold'
-              }}>
-                {selectedSignal ? `🎯 Selected Signal ${activeSignal.option_type === 'CE' ? '📈 (CALL)' : '📉 (PUT)'}` : '🎯 AI Recommendation (best signal)'}
-              </h4>
+          <div>
+            <h4 style={{
+              margin: '0 0 8px 0',
+              color: '#78350f',
+              fontSize: '18px',
+              fontWeight: 'bold'
+            }}>
+              {selectedSignal ? `🎯 Selected Signal ${activeSignal?.option_type === 'CE' ? '📈 (CALL)' : activeSignal?.option_type === 'PE' ? '📉 (PUT)' : ''}` : '🎯 AI Recommendation (best signal)'}
+            </h4>
 
-              <div style={{
-                padding: '12px',
-                background: 'linear-gradient(135deg, #edf2f7 0%, #e2e8f0 100%)',
-                borderRadius: '6px',
-                color: 'white',
-                textAlign: 'center'
-              }}>
-                <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '6px' }}>AI Recommendation</div>
-                <div style={{ fontSize: '28px', fontWeight: 'bold' }}>
-                  {selectedSignal ? `₹${activeSignal.entry_price}` : '—'}
-                </div>
-                <div style={{ fontSize: '11px', marginTop: '6px', opacity: 0.8 }}>
-                  {selectedSignal ? `Target: ₹${activeSignal.target}` : '—'}
-                </div>
-                <div style={{ fontSize: '11px', opacity: 0.8 }}>
-                  {selectedSignal ? `SL: ₹${activeSignal.stop_loss}` : '—'}
-                </div>
-                <div style={{ fontSize: '11px', opacity: 0.8 }}>
-                  {selectedSignal ? `Quantity: ${activeSignal.quantity}` : '—'}
-                </div>
-                <div style={{ fontSize: '11px', opacity: 0.8 }}>
-                  {selectedSignal ? `Expiry: ${activeSignal.expiry_date || activeSignal.expiry}` : '—'}
-                </div>
+            <div style={{
+              padding: '12px',
+              background: 'linear-gradient(135deg, #edf2f7 0%, #e2e8f0 100%)',
+              borderRadius: '6px',
+              color: 'white',
+              textAlign: 'center'
+            }}>
+              <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '6px' }}>AI Recommendation</div>
+              <div style={{ fontSize: '28px', fontWeight: 'bold' }}>
+                {selectedSignal ? `₹${activeSignal?.entry_price}` : (activeSignal ? `₹${activeSignal.entry_price}` : '—')}
               </div>
-            </div>
-            <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
-              {/* Trend check for enabling/disabling auto-trade */}
-              {/* Removed Start Auto Trade button from AI Recommendation table as requested */}
-              {armError && (
-                <div style={{
-                  padding: '12px 16px',
-                  background: '#fed7d7',
-                  color: '#742a2a',
-                  borderRadius: '6px',
-                  fontSize: '13px',
-                  fontWeight: '600',
-                  maxWidth: '300px'
-                }}>
-                  ❌ {armError}
-                </div>
-              )}
-              {autoTradingActive && (
-                <div style={{
-                  padding: '8px 16px',
-                  background: isLiveMode ? '#c6f6d5' : '#feebc8',
-                  color: isLiveMode ? '#22543d' : '#78350f',
-                  borderRadius: '6px',
-                  fontSize: '13px',
-                  fontWeight: '600'
-                }}>
-                  {isLiveMode ? '🔴 REAL TRADES' : '⚪ DEMO MODE'} {activeTrades.length > 0 ? '(Trade Active)' : '(Ready)'}
+              <div style={{ fontSize: '11px', marginTop: '6px', opacity: 0.8 }}>
+                {selectedSignal ? `Target: ₹${activeSignal?.target}` : (activeSignal ? `Target: ₹${activeSignal.target}` : '—')}
+              </div>
+              <div style={{ fontSize: '11px', opacity: 0.8 }}>
+                {selectedSignal ? `SL: ₹${activeSignal?.stop_loss}` : (activeSignal ? `SL: ₹${activeSignal.stop_loss}` : '—')}
+              </div>
+              <div style={{ fontSize: '11px', opacity: 0.8 }}>
+                {selectedSignal ? `Quantity: ${activeSignal?.quantity}` : (activeSignal ? `Quantity: ${activeSignal.quantity}` : '—')}
+              </div>
+              <div style={{ fontSize: '11px', opacity: 0.8 }}>
+                {selectedSignal ? `Expiry: ${activeSignal?.expiry_date || activeSignal?.expiry}` : (activeSignal ? `Expiry: ${activeSignal.expiry_date || activeSignal.expiry}` : '—')}
+              </div>
+              {!activeSignal && (
+                <div style={{ fontSize: '13px', color: '#92400e', marginTop: '10px' }}>
+                  No AI recommendation available at this time.
                 </div>
               )}
             </div>
           </div>
-          <div style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
-            gap: '12px',
-            padding: '16px',
-            background: 'rgba(255, 255, 255, 0.5)',
-            borderRadius: '8px'
-          }}>
-            <div>
-              <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>
-                🔴 Live Entry Price
+          <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+            {/* Trend check for enabling/disabling auto-trade */}
+            {/* Removed Start Auto Trade button from AI Recommendation table as requested */}
+            {armError && (
+              <div style={{
+                padding: '12px 16px',
+                background: '#fed7d7',
+                color: '#742a2a',
+                borderRadius: '6px',
+                fontSize: '13px',
+                fontWeight: '600',
+                maxWidth: '300px'
+              }}>
+                ❌ {armError}
               </div>
-              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#1a202c' }}>
-                ₹{liveEntryPrice != null ? Number(liveEntryPrice).toFixed(2) : '--'}
+            )}
+            {autoTradingActive && (
+              <div style={{
+                padding: '8px 16px',
+                background: isLiveMode ? '#c6f6d5' : '#feebc8',
+                color: isLiveMode ? '#22543d' : '#78350f',
+                borderRadius: '6px',
+                fontSize: '13px',
+                fontWeight: '600'
+              }}>
+                {isLiveMode ? '🔴 REAL TRADES' : '⚪ DEMO MODE'} {activeTrades.length > 0 ? '(Trade Active)' : '(Ready)'}
               </div>
+            )}
+          </div>
+        </div>
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
+          gap: '12px',
+          padding: '16px',
+          background: 'rgba(255, 255, 255, 0.5)',
+          borderRadius: '8px'
+        }}>
+          <div>
+            <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>
+              🔴 Live Entry Price
             </div>
-            <div>
-              <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>
-                Target (+{liveTargetPoints != null ? liveTargetPoints.toFixed(2) : '--'}pts)
-              </div>
-              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#48bb78' }}>
-                ₹{liveTarget != null ? Number(liveTarget).toFixed(2) : '--'}
-              </div>
+            <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#1a202c' }}>
+              {liveEntryPrice != null ? `₹${Number(liveEntryPrice).toFixed(2)}` : '--'}
             </div>
-            <div>
-              <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>
-                Stop Loss (-{liveSlPoints != null ? liveSlPoints.toFixed(2) : '--'}pts)
-              </div>
-              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#f56565' }}>
-                ₹{liveStopLoss != null ? Number(liveStopLoss).toFixed(2) : '--'}
-              </div>
+          </div>
+          <div>
+            <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>
+              Target (+{liveTargetPoints != null ? liveTargetPoints.toFixed(2) : '--'}pts)
             </div>
-            <div>
-              <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Potential Profit</div>
-              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#38a169' }}>
-                ₹{liveTarget != null && liveEntryPrice != null
-                  ? ((Number(liveTarget) - Number(liveEntryPrice)) * liveQuantity * lotMultiplier).toLocaleString()
-                  : '--'}
-              </div>
+            <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#48bb78' }}>
+              {liveTarget != null ? `₹${Number(liveTarget).toFixed(2)}` : '--'}
             </div>
-            <div>
-              <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Max Risk</div>
-              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#e53e3e' }}>
-                ₹{liveStopLoss != null && liveEntryPrice != null
-                  ? ((Number(liveEntryPrice) - Number(liveStopLoss)) * liveQuantity * lotMultiplier).toLocaleString()
-                  : '--'}
-              </div>
+          </div>
+          <div>
+            <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>
+              Stop Loss (-{liveSlPoints != null ? liveSlPoints.toFixed(2) : '--'}pts)
             </div>
-            <div>
-              <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Quantity</div>
-              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#5a67d8' }}>
-                {liveQuantity * lotMultiplier}
-              </div>
+            <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#f56565' }}>
+              {liveStopLoss != null ? `₹${Number(liveStopLoss).toFixed(2)}` : '--'}
             </div>
-            <div>
-              <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Expiry Date</div>
-              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#2d3748' }}>
-                {liveExpiryDate || 'N/A'}
-              </div>
+          </div>
+          <div>
+            <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Potential Profit</div>
+            <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#38a169' }}>
+              {liveTarget != null && liveEntryPrice != null
+                ? `₹${((Number(liveTarget) - Number(liveEntryPrice)) * liveQuantity * lotMultiplier).toLocaleString()}`
+                : '--'}
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Max Risk</div>
+            <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#e53e3e' }}>
+              {liveStopLoss != null && liveEntryPrice != null
+                ? `₹${((Number(liveEntryPrice) - Number(liveStopLoss)) * liveQuantity * lotMultiplier).toLocaleString()}`
+                : '--'}
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Quantity</div>
+            <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#5a67d8' }}>
+              {liveQuantity * lotMultiplier}
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Expiry Date</div>
+            <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#2d3748' }}>
+              {liveExpiryDate || 'N/A'}
             </div>
           </div>
         </div>
-      )}
+      </div>
 
       {/* All Signals Table */}
       {/* Debug: Raw signals output */}
