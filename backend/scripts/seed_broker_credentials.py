@@ -58,7 +58,9 @@ def upsert_credentials(user_id: int, broker_name: str, api_key: str, api_secret:
 
         session.commit()
         session.refresh(credential)
-        print(f"✅ {action.capitalize()} credentials for broker '{broker_name}' (id={credential.id}) for user {user_id}.")
+            import logging
+            logging.basicConfig(level=logging.INFO)
+            logging.info(f"✓ {action.capitalize()} credentials for broker '{broker_name}' (id={credential.id}) for user {user_id}.")
     finally:
         session.close()
 

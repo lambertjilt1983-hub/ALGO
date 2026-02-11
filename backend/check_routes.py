@@ -1,5 +1,7 @@
 from app.main import app
 
-print("Registered Routes:")
+import logging
+logging.basicConfig(level=logging.INFO)
+logging.info("Registered Routes:")
 for route in app.routes:
-    print(f"  {route.path} - {route.methods if hasattr(route, 'methods') else 'N/A'}")
+    logging.info(f"  {route.path} - {route.methods if hasattr(route, 'methods') else 'N/A'}")

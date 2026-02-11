@@ -7,6 +7,8 @@
 
 # Import required modules before app instance
 import os
+import sys
+from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -18,10 +20,13 @@ from app.core.background_tasks import start_background_tasks, stop_background_ta
 from app import brokers  # Import brokers to trigger registration
 from app.auth.service import AuthService
 
+# Redirect all console output to trading.log
+
 
 # --- FastAPI lifespan event handler (replaces deprecated on_event) ---
 from contextlib import asynccontextmanager
 import logging
+from logging.handlers import RotatingFileHandler
 import importlib.util
 from pathlib import Path
 
@@ -113,18 +118,34 @@ from contextlib import asynccontextmanager
 try:
     Base.metadata.create_all(bind=engine)
 except Exception as e:
-    print(f"Warning: Could not create tables: {e}")
+    logging.error(f"Warning: Could not create tables: {e}")
 
 # --- FastAPI lifespan event handler (replaces deprecated on_event) ---
 # ...existing code...
 
 # ...existing code...
 
-# --- FastAPI lifespan event handler (replaces deprecated on_event) ---
 from contextlib import asynccontextmanager
-import logging
 import importlib.util
 from pathlib import Path
+
+# --- GLOBAL LOGGER SETUP ---
+log_dir = Path(__file__).resolve().parent.parent / "logs"
+log_dir.mkdir(parents=True, exist_ok=True)
+log_file = log_dir / "trading.log"
+file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5, encoding="utf-8")
+file_handler.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+if not any(isinstance(h, RotatingFileHandler) for h in root_logger.handlers):
+    root_logger.addHandler(file_handler)
+for logger_name in ["uvicorn", "uvicorn.error", "uvicorn.access", "fastapi"]:
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.INFO)
+    if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+        logger.addHandler(file_handler)
 
 def _check_required_dependencies(logger: logging.Logger) -> None:
     requirements_path = Path(__file__).resolve().parent.parent / "requirements.txt"
@@ -161,7 +182,6 @@ def _check_required_dependencies(logger: logging.Logger) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("startup")
     logger.info("[STARTUP] FastAPI startup event triggered.")
     _check_required_dependencies(logger)
@@ -224,7 +244,7 @@ from app.auth.service import AuthService
 try:
     Base.metadata.create_all(bind=engine)
 except Exception as e:
-    print(f"Warning: Could not create tables: {e}")
+    logging.error(f"Warning: Could not create tables: {e}")
 
 
 # --- FastAPI lifespan event handler (replaces deprecated on_event) ---
@@ -332,6 +352,7 @@ app.include_router(paper_trading.router)  # Paper trading performance tracking
 @app.get("/")
 async def root():
     """Root endpoint"""
+    logging.getLogger("root").info("[API GET /] Root endpoint accessed")
     return {
         "message": "Welcome to AlgoTrade Pro",
         "version": "1.0.0",

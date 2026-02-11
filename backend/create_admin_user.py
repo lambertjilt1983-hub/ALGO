@@ -13,9 +13,13 @@ if not env_file:
         env_file = os.path.join(os.path.dirname(__file__), ".env")
 if os.path.exists(env_file):
     load_dotenv(env_file)
-    print(f"[ENV] Loaded environment from {env_file}")
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    logging.info(f"[ENV] Loaded environment from {env_file}")
 else:
-    print(f"[ENV] WARNING: Env file {env_file} not found!")
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    logging.warning(f"[ENV] WARNING: Env file {env_file} not found!")
 
 from app.core.database import SessionLocal
 from app.models.auth import User
@@ -53,7 +57,7 @@ if not user:
     )
     db.add(user)
     db.commit()
-    print("User created.")
+        logging.info("User created.")
 else:
-    print("User already exists.")
+        logging.info("User already exists.")
 db.close()

@@ -1,8 +1,13 @@
+
+
+
+from __future__ import annotations
+import logging
+logger = logging.getLogger("trading_bot")
 """
 Shared paper trade price updater.
 Runs batched price updates and enforces SL/target logic.
 """
-from __future__ import annotations
 
 import time
 from datetime import datetime
@@ -159,9 +164,7 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
                         half_target = trade.target is not None and new_price >= (trade.entry_price + (trade.target - trade.entry_price) * 0.5)
                         if half_target and trade.stop_loss < trade.entry_price:
                             trade.stop_loss = round(trade.entry_price, 2)
-                            print(
-                                f"✅ BREAKEVEN set at {trade.stop_loss} after 50% target reached (Profit: +{profit_points:.1f}pts)"
-                            )
+                            logger.info(f"✅ BREAKEVEN set at {trade.stop_loss} after 50% target reached (Profit: +{profit_points:.1f}pts)")
                         if target_reached:
                             trade.status = "TARGET_HIT"
                             trade.exit_price = trade.target
@@ -169,9 +172,7 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
                             trade.pnl = (trade.target - trade.entry_price) * trade.quantity
                             trade.pnl_percentage = (trade.pnl / (trade.entry_price * trade.quantity)) * 100
                             closed_count += 1
-                            print(
-                                f"✅ TARGET HIT: Trade {trade.id} closed at target {trade.target} (Profit: ₹{trade.pnl:.2f})"
-                            )
+                            logger.info(f"✅ TARGET HIT: Trade {trade.id} closed at target {trade.target} (Profit: ₹{trade.pnl:.2f})")
                             trade.current_price = trade.target
                             updated_count += 1
                             continue
@@ -179,9 +180,7 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
                             new_trailing_sl = round(new_price - 5, 2)
                             if new_trailing_sl > trade.stop_loss:
                                 trade.stop_loss = new_trailing_sl
-                                print(
-                                    f"💎 TARGET EXCEEDED! Trailing SL: {trade.stop_loss} (Profit: +{profit_points:.1f}pts)"
-                                )
+                                logger.info(f"💎 TARGET EXCEEDED! Trailing SL: {trade.stop_loss} (Profit: +{profit_points:.1f}pts)")
                 else:  # SELL
                     if trade.stop_loss is not None:
                         profit_points = trade.entry_price - new_price
@@ -189,9 +188,7 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
                         half_target = trade.target is not None and new_price <= (trade.entry_price - (trade.entry_price - trade.target) * 0.5)
                         if half_target and trade.stop_loss > trade.entry_price:
                             trade.stop_loss = round(trade.entry_price, 2)
-                            print(
-                                f"✅ BREAKEVEN set at {trade.stop_loss} after 50% target reached (Profit: +{profit_points:.1f}pts)"
-                            )
+                            logger.info(f"✅ BREAKEVEN set at {trade.stop_loss} after 50% target reached (Profit: +{profit_points:.1f}pts)")
                         if target_reached:
                             trade.status = "TARGET_HIT"
                             trade.exit_price = trade.target
@@ -199,9 +196,7 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
                             trade.pnl = (trade.entry_price - trade.target) * trade.quantity
                             trade.pnl_percentage = (trade.pnl / (trade.entry_price * trade.quantity)) * 100
                             closed_count += 1
-                            print(
-                                f"✅ TARGET HIT: Trade {trade.id} closed at target {trade.target} (Profit: ₹{trade.pnl:.2f})"
-                            )
+                            logger.info(f"✅ TARGET HIT: Trade {trade.id} closed at target {trade.target} (Profit: ₹{trade.pnl:.2f})")
                             trade.current_price = trade.target
                             updated_count += 1
                             continue
@@ -209,9 +204,7 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
                             new_trailing_sl = round(new_price + 5, 2)
                             if new_trailing_sl < trade.stop_loss:
                                 trade.stop_loss = new_trailing_sl
-                                print(
-                                    f"💎 TARGET EXCEEDED! Trailing SL: {trade.stop_loss} (Profit: +{profit_points:.1f}pts)"
-                                )
+                                logger.info(f"💎 TARGET EXCEEDED! Trailing SL: {trade.stop_loss} (Profit: +{profit_points:.1f}pts)")
 
                 # Check SL using live price (target handled above)
                 if trade.side == "BUY":
@@ -223,7 +216,7 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
                         trade.pnl = (trade.stop_loss - trade.entry_price) * trade.quantity
                         trade.pnl_percentage = (trade.pnl / (trade.entry_price * trade.quantity)) * 100
                         closed_count += 1
-                        print(f"❌ Trade {trade.id} closed at SL: {trade.stop_loss} (Profit: ₹{trade.pnl:.2f})")
+                        logger.info(f"❌ Trade {trade.id} closed at SL: {trade.stop_loss} (Profit: ₹{trade.pnl:.2f})")
                 else:  # SELL
                     if trade.stop_loss is not None and new_price >= trade.stop_loss:
                         new_price = trade.stop_loss
@@ -233,7 +226,7 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
                         trade.pnl = (trade.entry_price - trade.stop_loss) * trade.quantity
                         trade.pnl_percentage = (trade.pnl / (trade.entry_price * trade.quantity)) * 100
                         closed_count += 1
-                        print(f"❌ Trade {trade.id} closed at SL: {trade.stop_loss} (Profit: ₹{trade.pnl:.2f})")
+                        logger.info(f"❌ Trade {trade.id} closed at SL: {trade.stop_loss} (Profit: ₹{trade.pnl:.2f})")
 
                 trade.current_price = new_price
 

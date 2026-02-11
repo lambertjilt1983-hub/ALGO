@@ -17,13 +17,17 @@ if __name__ == "__main__":
         BrokerCredential.is_active == True
     ).order_by(BrokerCredential.id.desc()).first()
     if not cred:
-        print("No Zerodha credential found.")
+           import logging
+           logging.basicConfig(level=logging.INFO)
+           logging.warning("No Zerodha credential found.")
     else:
-        print(f"API Key: {cred.api_key}")
-        print(f"Access Token: {cred.access_token}")
-        print(f"Token Expiry: {cred.token_expiry}")
-        print(f"Active: {cred.is_active}")
+           import logging
+           logging.basicConfig(level=logging.INFO)
+           logging.info(f"API Key: {cred.api_key}")
+           logging.info(f"Access Token: {cred.access_token}")
+           logging.info(f"Token Expiry: {cred.token_expiry}")
+           logging.info(f"Active: {cred.is_active}")
         # Validate token
         valid = TokenManager.validate_zerodha_token(cred)
-        print(f"Token Valid: {valid}")
+           logging.info(f"Token Valid: {valid}")
     db.close()

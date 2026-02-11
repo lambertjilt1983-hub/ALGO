@@ -23,7 +23,15 @@ class AutoTradingEngine:
             result = broker.place_order(order_details)
             if result.get('success'):
                 self.active_trades.append(result)
+            else:
+                import logging
+                logger = logging.getLogger("trading_bot")
+                logger.error(f"[AutoTradingEngine] ERROR: Failed to place order with broker '{broker_name}'. Details: {result}")
             return result
+        else:
+            import logging
+            logger = logging.getLogger("trading_bot")
+            logger.error(f"[AutoTradingEngine] ERROR: Broker '{broker_name}' not found or not connected.")
         return None
 
     def get_balance(self, broker_name: str) -> Optional[Dict[str, Any]]:

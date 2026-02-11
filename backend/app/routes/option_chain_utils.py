@@ -41,7 +41,7 @@ async def get_option_chain(symbol: str, expiry: str, authorization: str = None):
 
     # Check expiry and refresh if needed (pseudo-code, implement refresh logic as needed)
     if token_expiry and datetime.utcnow() >= token_expiry:
-        print(f"[OPTION_CHAIN_UTILS] Access token expired, refreshing...")
+        logging.info(f"[OPTION_CHAIN_UTILS] Access token expired, refreshing...")
         # TODO: Implement refresh logic here, update DB, and set new access_token
         # access_token = refresh_access_token(api_key, api_secret, refresh_token)
         # Save new access_token and expiry to DB
@@ -50,7 +50,7 @@ async def get_option_chain(symbol: str, expiry: str, authorization: str = None):
     kite = await ZerodhaKite.from_user_context(authorization)
     instruments = await kite.get_instruments()
     if not instruments or not isinstance(instruments, list):
-        print(f"[OPTION_CHAIN_UTILS] No instruments returned for {symbol} {expiry}", file=sys.stderr)
+        logging.error(f"[OPTION_CHAIN_UTILS] No instruments returned for {symbol} {expiry}")
         return {'CE': [], 'PE': [], 'error': 'No instruments returned'}
 
     ce_options = []
@@ -58,17 +58,17 @@ async def get_option_chain(symbol: str, expiry: str, authorization: str = None):
     for inst in instruments:
         # Defensive: log and skip if any key is missing or None
         if inst is None:
-            print(f"[OPTION_CHAIN_UTILS] Skipping None instrument for {symbol} {expiry}", file=sys.stderr)
+            logging.error(f"[OPTION_CHAIN_UTILS] Skipping None instrument for {symbol} {expiry}")
             continue
         name = inst.get('name')
         inst_expiry = inst.get('expiry')
         inst_type = inst.get('instrument_type')
         if name is None or inst_expiry is None or inst_type is None:
-            print(f"[OPTION_CHAIN_UTILS] Skipping instrument with missing fields: {inst}", file=sys.stderr)
+            logging.error(f"[OPTION_CHAIN_UTILS] Skipping instrument with missing fields: {inst}")
             continue
         if name == symbol and inst_expiry == expiry and inst_type == 'CE':
             ce_options.append(inst)
         if name == symbol and inst_expiry == expiry and inst_type == 'PE':
             pe_options.append(inst)
-    print(f"[OPTION_CHAIN_UTILS] {symbol} {expiry} CE count: {len(ce_options)}, PE count: {len(pe_options)}")
+    logging.info(f"[OPTION_CHAIN_UTILS] {symbol} {expiry} CE count: {len(ce_options)}, PE count: {len(pe_options)}")
     return {'CE': ce_options, 'PE': pe_options}

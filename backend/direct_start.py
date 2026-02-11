@@ -7,20 +7,23 @@ if __name__ == '__main__':
     sys.path.insert(0, r'F:\ALGO\backend')
 
     # Import and check
-    print("=" * 60)
-    print("VERIFYING SOURCE CODE VALUES...")
-    print("=" * 60)
+        import logging
+        logging.basicConfig(level=logging.INFO)
+        logging.info("=" * 60)
+        logging.info("VERIFYING SOURCE CODE VALUES...")
+        logging.info("=" * 60)
 
     # Read source file
     with open(r'F:\ALGO\backend\app\routes\auto_trading_simple.py', 'r', encoding='utf-8') as f:
         content = f.read()
         if '25157.50' in content:
-            print("✓ Source file contains CORRECT value: 25157.50")
+              logging.info("✓ Source file contains CORRECT value: 25157.50")
         else:
-            print("✗ Source file MISSING correct value!")
+              logging.warning("✗ Source file MISSING correct value!")
 
     print("\nStarting server...")
-    print("=" * 60)
+        logging.info("\nStarting server...")
+        logging.info("=" * 60)
 
     # Now start uvicorn
     import uvicorn

@@ -149,6 +149,7 @@ if __name__ == "__main__":
     # Load your 5-min OHLCV data as a DataFrame with columns: ['open','high','low','close','volume']
     df = pd.read_csv('nifty_5min.csv')
     df = generate_signals(df)
-    print(df[['close','Signal','Debug']].tail(20))
+    import logging
+    logging.info(df[['close','Signal','Debug']].tail(20))
     results = backtest(df)
-    print('Backtest Results:', results)
+    logging.info(f'Backtest Results: {results}')

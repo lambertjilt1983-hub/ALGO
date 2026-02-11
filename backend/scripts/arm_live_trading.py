@@ -7,8 +7,10 @@ def arm_live_trading(api_url, token):
         "Content-Type": "application/json"
     }
     response = requests.post(url, json=True, headers=headers)
-    print("Status:", response.status_code)
-    print("Response:", response.json())
+        import logging
+        logging.basicConfig(level=logging.INFO)
+        logging.info("Status: %s", response.status_code)
+        logging.info("Response: %s", response.json())
 
 if __name__ == "__main__":
     # Update these values as needed

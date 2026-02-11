@@ -30,7 +30,7 @@ async def zerodha_postback(request: Request):
                     history.append(trade)
                     active_trades.remove(trade)
                 break
-        print("Updated trades on postback:", active_trades, history)
+        logging.info(f"Updated trades on postback: {active_trades}, {history}")
         return JSONResponse({"status": "ok"}, status_code=status.HTTP_200_OK)
     except Exception as e:
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=status.HTTP_400_BAD_REQUEST)

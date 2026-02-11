@@ -381,14 +381,14 @@ async def zerodha_oauth_callback(
     token: str = Depends(AuthService.verify_bearer_token)
 ):
     """Handle Zerodha OAuth callback and exchange request token for access token"""
-    print(f"\n{'='*60}")
-    print(f"ZERODHA CALLBACK RECEIVED")
-    print(f"Request Token: {request_token}")
-    print(f"Status: {status}")
-    print(f"{'='*60}\n")
+    logging.info(f"{'='*60}")
+    logging.info(f"ZERODHA CALLBACK RECEIVED")
+    logging.info(f"Request Token: {request_token}")
+    logging.info(f"Status: {status}")
+    logging.info(f"{'='*60}")
     
     if status != "success":
-        print("Status not success, sending JSON failure")
+        logging.info("Status not success, sending JSON failure")
         return {"status": "failed", "message": "Zerodha auth did not return success"}
     
     try:
@@ -398,7 +398,7 @@ async def zerodha_oauth_callback(
         # Get authenticated user from token
         payload = AuthService.verify_token(token)
         user_id = int(payload.get("sub"))
-        print(f"Authenticated user ID: {user_id}")
+        logging.info(f"Authenticated user ID: {user_id}")
         
         # Get the most recent Zerodha credential for THIS user
         credential = db.query(BrokerCredential).filter(
@@ -407,35 +407,35 @@ async def zerodha_oauth_callback(
         ).order_by(BrokerCredential.created_at.desc()).first()
         
         if not credential:
-            print(f"ERROR: No Zerodha broker found for user {user_id}!")
+            logging.error(f"ERROR: No Zerodha broker found for user {user_id}!")
             return {"status": "error", "message": "No Zerodha broker found for user"}
         
-        print(f"Found broker: ID={credential.id}, Name={credential.broker_name}, User={user_id}")
+        logging.info(f"Found broker: ID={credential.id}, Name={credential.broker_name}, User={user_id}")
         
         if not credential.api_key or not credential.api_secret:
-            print("ERROR: Missing API credentials!")
+            logging.error("ERROR: Missing API credentials!")
             return {"status": "error", "message": "Missing API credentials"}
         
         # Decrypt credentials
         decrypted_api_key = encryption_manager.decrypt_credentials(credential.api_key)
         decrypted_api_secret = encryption_manager.decrypt_credentials(credential.api_secret)
-        print(f"Decrypted API key: {decrypted_api_key[:10]}...")
+        logging.info(f"Decrypted API key: {decrypted_api_key[:10]}...")
         
         # Initialize KiteConnect with decrypted credentials
         kite = KiteConnect(api_key=decrypted_api_key)
         
         # Exchange request token for access token
-        print("Generating session with Zerodha...")
+        logging.info("Generating session with Zerodha...")
         try:
             data = kite.generate_session(request_token, api_secret=decrypted_api_secret)
             access_token = data["access_token"]
-            print(f"Access token received: {access_token[:20]}...")
+            logging.info(f"Access token received: {access_token[:20]}...")
         except Exception as kite_error:
-            print(f"Kite session generation failed: {str(kite_error)}")
+            logging.error(f"Kite session generation failed: {str(kite_error)}")
             raise
         
         # Update credential with access token - CRITICAL: Save to DB immediately
-        print(f"Saving access token to broker ID: {credential.id}")
+        logging.info(f"Saving access token to broker ID: {credential.id}")
         safe_access_token = access_token.strip() if isinstance(access_token, str) else access_token
         credential.access_token = encryption_manager.encrypt_credentials(safe_access_token)
         db.add(credential)  # Explicitly add to session
@@ -444,18 +444,18 @@ async def zerodha_oauth_callback(
         # Verify it was saved
         db.refresh(credential)
         saved_token = credential.access_token
-        print(f"Token saved! Verify: {saved_token[:20] if saved_token else 'NONE'}...")
+        logging.info(f"Token saved! Verify: {saved_token[:20] if saved_token else 'NONE'}...")
         
         if not saved_token:
-            print("ERROR: Token was not persisted to database!")
+            logging.error("ERROR: Token was not persisted to database!")
             return {"status": "error", "message": "Token failed to save to database"}
         
         # Return JSON for frontend fetch handler
-        print("✅ Returning JSON success to frontend")
+        logging.info("✅ Returning JSON success to frontend")
         return {"status": "success", "broker_id": credential.id}
         
     except Exception as e:
-        print(f"ERROR in callback: {str(e)}")
+        logging.error(f"ERROR in callback: {str(e)}")
         import traceback
         traceback.print_exc()
         error_msg = str(e)

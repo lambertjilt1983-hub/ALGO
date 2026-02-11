@@ -224,7 +224,7 @@ const AutoTradingDashboard = () => {
                       Math.abs(Number(signal.entry_price ?? 0) - Number(signal.stop_loss ?? 0));
     
     // AI adjustment factors - more realistic for retail trading
-    const confidenceBoost = confidence > 90 ? 0.1 : confidence > 85 ? 0.05 : 0;
+    const confidenceBoost = confidence > 80 ? 0.1 : confidence > 80 ? 0.05 : 0;
     const winRateAdjust = Math.max(0, (winRate - 0.5) * 0.1); // Less aggressive adjustment
     
     // Dynamic threshold based on conditions (1.5 base for realistic options)
@@ -1033,17 +1033,17 @@ const AutoTradingDashboard = () => {
   }
 
   // Apply Golden Pullback filter, OTM filter, and quality filters
-  // For trading: quality >= 96; For table display: quality > 90
+  // For trading: quality >= 85; For table display: quality > 85
   const winRate = stats?.win_rate ? (stats.win_rate / 100) : 0.5;
   const filteredOptionSignalsRaw = optionSignals.filter((signal) => {
     const golden = isGoldenPullback(signal);
     const otm = isOTMOption(signal);
     const quality = calculateTradeQuality(signal, winRate).quality;
-    return golden && otm && quality > 90;
+    return golden && otm && quality > 85;
   });
 
-  // Only allow signals with quality >= 96 for trading logic
-  const filteredOptionSignals = filteredOptionSignalsRaw.filter(signal => calculateTradeQuality(signal, winRate).quality >= 96);
+  // Only allow signals with quality >= 85 for trading logic
+  const filteredOptionSignals = filteredOptionSignalsRaw.filter(signal => calculateTradeQuality(signal, winRate).quality >= 85);
 
   // Group signals by index to show CE and PE side-by-side (for table: quality > 90)
   const groupedSignals = filteredOptionSignalsRaw.reduce((acc, signal) => {

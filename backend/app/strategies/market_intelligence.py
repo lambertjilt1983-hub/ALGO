@@ -88,7 +88,7 @@ class NewsAnalyzer:
                 })
         except Exception as exc:
             # Keep log lightweight; fall back handled by caller
-            print(f"[MarketIntelligence] RSS fetch failed for {source_name}: {exc}")
+            logging.error(f"[MarketIntelligence] RSS fetch failed for {source_name}: {exc}")
 
         return items
 
@@ -338,7 +338,7 @@ class MarketTrendAnalyzer:
             if access and not self.kite_access_token:
                 self.kite_access_token = access
         except Exception as exc:
-            print(f"[MarketIntelligence] Failed to load Zerodha tokens from DB: {exc}")
+            logging.error(f"[MarketIntelligence] Failed to load Zerodha tokens from DB: {exc}")
         finally:
             try:
                 db.close()
@@ -372,7 +372,7 @@ class MarketTrendAnalyzer:
             resp.raise_for_status()
             data = resp.json().get('data') or []
         except Exception as exc:
-            print(f"[MarketIntelligence] NSE index fetch failed: {exc}")
+            logging.error(f"[MarketIntelligence] NSE index fetch failed: {exc}")
             return {}
 
         market_data: Dict[str, Dict[str, Any]] = {}
@@ -421,7 +421,7 @@ class MarketTrendAnalyzer:
             results = response.json().get('quoteResponse', {}).get('result', [])
         except Exception as exc:
             err = str(exc)
-            print(f"[MarketIntelligence] Live quote fetch failed (batch): {err}")
+            logging.error(f"[MarketIntelligence] Live quote fetch failed (batch): {err}")
             # Yahoo often returns 401 for server IPs; bail early to avoid noisy retries.
             return market_data
 
@@ -490,7 +490,7 @@ class MarketTrendAnalyzer:
                     'macd': 'Bullish' if change_percent > 0 else 'Bearish' if change_percent < 0 else 'Flat'
                 }
             except Exception as exc:
-                print(f"[MarketIntelligence] Moneycontrol fetch failed for {idx}: {exc}")
+                logging.error(f"[MarketIntelligence] Moneycontrol fetch failed for {idx}: {exc}")
 
         return market_data
 
@@ -613,7 +613,7 @@ class MarketTrendAnalyzer:
                 'macd': 'Bullish' if change_percent > 0 else 'Bearish' if change_percent < 0 else 'Flat'
             }
         except Exception as exc:
-            print(f"[MarketIntelligence] Chart fetch failed for {symbol}: {exc}")
+            logging.error(f"[MarketIntelligence] Chart fetch failed for {symbol}: {exc}")
             return None
     
     def get_sector_rotation(self) -> List[Dict[str, Any]]:
