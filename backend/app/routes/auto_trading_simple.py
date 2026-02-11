@@ -1,5 +1,47 @@
 import logging
 from pathlib import Path
+from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Header
+from typing import Optional
+log_dir = Path("backend/logs")
+log_dir.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+    handlers=[
+        logging.FileHandler(log_dir / "auto_trading.log", encoding="utf-8"),
+        logging.FileHandler(log_dir / "trading.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("trading_bot")
+router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
+
+# --- New endpoint for frontend signal fetch ---
+@router.get("/option-signals/intraday-advanced")
+async def option_signals_intraday_advanced(
+    symbol: str = "NIFTY",
+    balance: float = 50000,
+    symbols: Optional[str] = None,
+    instrument_type: str = "weekly_option",
+    quantity: Optional[int] = None,
+    authorization: Optional[str] = Header(None),
+):
+    # Reuse analyze logic to generate signals
+    selected_symbols = [s.strip().upper() for s in (symbols.split(",") if symbols else [symbol, "BANKNIFTY", "FINNIFTY"]) if s]
+    instrument_type = instrument_type.lower()
+    signals, data_source = await _live_signals(selected_symbols, instrument_type, quantity, balance)
+    # Optionally filter for intraday/option signals
+    option_signals = [s for s in signals if s.get("option_type") in ("CE", "PE")]
+    return JSONResponse({
+        "signals": option_signals,
+        "all_signals": signals,
+        "data_source": data_source,
+        "success": True,
+        "timestamp": _now(),
+    })
+import logging
+from pathlib import Path
 log_dir = Path("backend/logs")
 log_dir.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
@@ -653,6 +695,7 @@ def _close_trade(trade: Dict[str, any], exit_price: float) -> None:
         logging.warning(f"Warning: failed to persist trade report: {e}")
     finally:
         try:
+            # ...existing code...
             db.close()
         except Exception:
             pass
@@ -1577,61 +1620,52 @@ async def execute(
         zerodha_symbol = trade.symbol
         logging.info(f"[API /execute] ▶ Placing {mode} order to Zerodha...")
         logging.info(f"[API /execute] ▶ Order Details: {zerodha_symbol}, {trade.quantity or 1} qty, {trade.side} at ₹{trade.price}")
-        real_order = place_zerodha_order(
-            symbol=zerodha_symbol,
-            quantity=trade.quantity or 1,
-            side=trade.side,
-            order_type="MARKET",
-            product="MIS",
-            exchange="NFO"
-        )
-
-            try:
-                logging.info(f"[API /execute] ENTRY: trade execution requested. Payload: {trade_obj}")
-                # --- REAL ZERODHA ORDER PLACEMENT ---
-                zerodha_symbol = trade.symbol
-                logging.info(f"[API /execute] ▶ Placing {mode} order to Zerodha...")
-                logging.info(f"[API /execute] ▶ Order Details: {zerodha_symbol}, {trade.quantity or 1} qty, {trade.side} at ₹{trade.price}")
-                real_order = place_zerodha_order(
-                    symbol=zerodha_symbol,
-                    quantity=trade.quantity or 1,
-                    side=trade.side,
-                    order_type="MARKET",
-                    product="MIS",
-                    exchange="NFO"
-                )
-                logging.info(f"[API /execute] Zerodha response: {real_order}")
-                if real_order["success"]:
-                    logging.info(f"[API /execute] ✓ Zerodha order ACCEPTED - Order ID: {real_order.get('order_id', 'N/A')}")
-                    broker_response = real_order
-                    active_trades.append(trade_obj)
-                else:
-                    logging.error(f"[API /execute] ✗ Zerodha order REJECTED - Error: {real_order.get('error', 'Unknown')}")
-                    logging.error(f"[API /execute] EXIT: trade execution failed. Response: {real_order}")
-                    return {
-                        "success": False,
-                        "message": real_order["error"],
-                        "timestamp": now_ist.isoformat(),
-                    }
-
-                broker_logs.append({"trade": trade_obj, "response": broker_response})
-                logging.info(f"[API /execute] EXIT: trade execution successful. Response: {broker_response}")
-                return {
-                    "success": True,
-                    "is_demo_mode": auto_demo,
-                    "message": f"{mode} trade accepted for {trade.symbol} at {trade.price}",
-                    "timestamp": now_ist.isoformat(),
-                    "broker_response": broker_response,
-                    "stop_loss": derived_stop,
-                    "target": derived_target,
-                }
-            except Exception as e:
-                logging.exception(f"[API /execute] EXCEPTION: {str(e)}")
+        try:
+            logging.info(f"[API /execute] ENTRY: trade execution requested. Payload: {trade_obj}")
+            # --- REAL ZERODHA ORDER PLACEMENT ---
+            zerodha_symbol = trade.symbol
+            logging.info(f"[API /execute] ▶ Placing {mode} order to Zerodha...")
+            logging.info(f"[API /execute] ▶ Order Details: {zerodha_symbol}, {trade.quantity or 1} qty, {trade.side} at ₹{trade.price}")
+            real_order = place_zerodha_order(
+                symbol=zerodha_symbol,
+                quantity=trade.quantity or 1,
+                side=trade.side,
+                order_type="MARKET",
+                product="MIS",
+                exchange="NFO"
+            )
+            logging.info(f"[API /execute] Zerodha response: {real_order}")
+            if real_order["success"]:
+                logging.info(f"[API /execute] ✓ Zerodha order ACCEPTED - Order ID: {real_order.get('order_id', 'N/A')}")
+                broker_response = real_order
+                active_trades.append(trade_obj)
+            else:
+                logging.error(f"[API /execute] ✗ Zerodha order REJECTED - Error: {real_order.get('error', 'Unknown')}")
+                logging.error(f"[API /execute] EXIT: trade execution failed. Response: {real_order}")
                 return {
                     "success": False,
-                    "message": f"Exception occurred: {str(e)}",
+                    "message": real_order["error"],
                     "timestamp": now_ist.isoformat(),
                 }
+
+            broker_logs.append({"trade": trade_obj, "response": broker_response})
+            logging.info(f"[API /execute] EXIT: trade execution successful. Response: {broker_response}")
+            return {
+                "success": True,
+                "is_demo_mode": auto_demo,
+                "message": f"{mode} trade accepted for {trade.symbol} at {trade.price}",
+                "timestamp": now_ist.isoformat(),
+                "broker_response": broker_response,
+                "stop_loss": derived_stop,
+                "target": derived_target,
+            }
+        except Exception as e:
+            logging.exception(f"[API /execute] EXCEPTION: {str(e)}")
+            return {
+                "success": False,
+                "message": f"Exception occurred: {str(e)}",
+                "timestamp": now_ist.isoformat(),
+            }
 
 
 @router.get("/trades/active")
