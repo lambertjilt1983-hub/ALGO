@@ -2177,28 +2177,17 @@ const AutoTradingDashboard = () => {
               </thead>
               <tbody>
                 {qualityTrades.map((trade, idx) => {
-                  // Highlight Nifty 50 company options
-                  const NIFTY_50_SYMBOLS = [
-                    "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
-                    "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BEL", "BPCL",
-                    "BHARTIARTL", "BRITANNIA", "CIPLA", "COALINDIA", "DRREDDY",
-                    "EICHERMOT", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE",
-                    "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDUSINDBK",
-                    "INFY", "ITC", "JSWSTEEL", "KOTAKBANK", "LT",
-                    "M&M", "MARUTI", "NESTLEIND", "NTPC", "ONGC",
-                    "POWERGRID", "RELIANCE", "SBIN", "SBILIFE", "SHRIRAMFIN",
-                    "SUNPHARMA", "TATAMOTORS", "TATASTEEL", "TCS", "TECHM",
-                    "TITAN", "ULTRACEMCO", "WIPRO"
-                  ];
-                  const isNifty50 = NIFTY_50_SYMBOLS.some(sym => trade.symbol && trade.symbol.toUpperCase().includes(sym));
+                  // Highlight index options (NIFTY, BANKNIFTY, SENSEX, FINNIFTY)
+                  const INDEX_SYMBOLS = ["NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY"];
+                  const isIndexOption = INDEX_SYMBOLS.some(idxSym => trade.symbol && trade.symbol.toUpperCase().includes(idxSym));
                   return (
                     <tr key={idx} style={{
-                      background: isNifty50 ? '#e0f2fe' : (idx % 2 === 0 ? '#fffbeb' : '#fef3c7'),
+                      background: isIndexOption ? '#e0f2fe' : (idx % 2 === 0 ? '#fffbeb' : '#fef3c7'),
                       borderBottom: '1px solid #fcd34d'
                     }}>
-                      <td style={{ padding: '10px', fontWeight: '600', color: isNifty50 ? '#2563eb' : '#1f2937', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <td style={{ padding: '10px', fontWeight: '600', color: isIndexOption ? '#2563eb' : '#1f2937', display: 'flex', alignItems: 'center', gap: '6px' }}>
                         {trade.symbol}
-                        {isNifty50 && (
+                        {isIndexOption && (
                           <span style={{
                             background: '#2563eb',
                             color: 'white',
@@ -2209,7 +2198,7 @@ const AutoTradingDashboard = () => {
                             marginLeft: '4px',
                             letterSpacing: '1px'
                           }}>
-                            NIFTY 50
+                            INDEX
                           </span>
                         )}
                       </td>
@@ -2293,28 +2282,31 @@ const AutoTradingDashboard = () => {
 
             <div style={{
               padding: '12px',
-              background: 'linear-gradient(135deg, #edf2f7 0%, #e2e8f0 100%)',
+              background: 'linear-gradient(135deg, #fbc2eb 0%, #fcb69f 100%)',
               borderRadius: '6px',
-              color: 'white',
+              color: '#78350f',
               textAlign: 'center'
             }}>
               <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '6px' }}>AI Recommendation</div>
-              <div style={{ fontSize: '28px', fontWeight: 'bold' }}>
-                {selectedSignal ? `₹${activeSignal?.entry_price}` : (activeSignal ? `₹${activeSignal.entry_price}` : '—')}
-              </div>
-              <div style={{ fontSize: '11px', marginTop: '6px', opacity: 0.8 }}>
-                {selectedSignal ? `Target: ₹${activeSignal?.target}` : (activeSignal ? `Target: ₹${activeSignal.target}` : '—')}
-              </div>
-              <div style={{ fontSize: '11px', opacity: 0.8 }}>
-                {selectedSignal ? `SL: ₹${activeSignal?.stop_loss}` : (activeSignal ? `SL: ₹${activeSignal.stop_loss}` : '—')}
-              </div>
-              <div style={{ fontSize: '11px', opacity: 0.8 }}>
-                {selectedSignal ? `Quantity: ${activeSignal?.quantity}` : (activeSignal ? `Quantity: ${activeSignal.quantity}` : '—')}
-              </div>
-              <div style={{ fontSize: '11px', opacity: 0.8 }}>
-                {selectedSignal ? `Expiry: ${activeSignal?.expiry_date || activeSignal?.expiry}` : (activeSignal ? `Expiry: ${activeSignal.expiry_date || activeSignal.expiry}` : '—')}
-              </div>
-              {!activeSignal && (
+              {activeSignal ? (
+                <>
+                  <div style={{ fontSize: '28px', fontWeight: 'bold' }}>
+                    ₹{activeSignal.entry_price}
+                  </div>
+                  <div style={{ fontSize: '11px', marginTop: '6px', opacity: 0.8 }}>
+                    Target: ₹{activeSignal.target}
+                  </div>
+                  <div style={{ fontSize: '11px', opacity: 0.8 }}>
+                    SL: ₹{activeSignal.stop_loss}
+                  </div>
+                  <div style={{ fontSize: '11px', opacity: 0.8 }}>
+                    Quantity: {activeSignal.quantity}
+                  </div>
+                  <div style={{ fontSize: '11px', opacity: 0.8 }}>
+                    Expiry: {activeSignal.expiry_date || activeSignal.expiry}
+                  </div>
+                </>
+              ) : (
                 <div style={{ fontSize: '13px', color: '#92400e', marginTop: '10px' }}>
                   No AI recommendation available at this time.
                 </div>
@@ -2351,67 +2343,69 @@ const AutoTradingDashboard = () => {
             )}
           </div>
         </div>
-        <div style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
-          gap: '12px',
-          padding: '16px',
-          background: 'rgba(255, 255, 255, 0.5)',
-          borderRadius: '8px'
-        }}>
-          <div>
-            <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>
-              🔴 Live Entry Price
+        {activeSignal && (
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
+            gap: '12px',
+            padding: '16px',
+            background: 'rgba(255, 255, 255, 0.5)',
+            borderRadius: '8px'
+          }}>
+            <div>
+              <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>
+                🔴 Live Entry Price
+              </div>
+              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#1a202c' }}>
+                {liveEntryPrice != null ? `₹${Number(liveEntryPrice).toFixed(2)}` : '--'}
+              </div>
             </div>
-            <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#1a202c' }}>
-              {liveEntryPrice != null ? `₹${Number(liveEntryPrice).toFixed(2)}` : '--'}
+            <div>
+              <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>
+                Target (+{liveTargetPoints != null ? liveTargetPoints.toFixed(2) : '--'}pts)
+              </div>
+              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#48bb78' }}>
+                {liveTarget != null ? `₹${Number(liveTarget).toFixed(2)}` : '--'}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>
+                Stop Loss (-{liveSlPoints != null ? liveSlPoints.toFixed(2) : '--'}pts)
+              </div>
+              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#f56565' }}>
+                {liveStopLoss != null ? `₹${Number(liveStopLoss).toFixed(2)}` : '--'}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Potential Profit</div>
+              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#38a169' }}>
+                {liveTarget != null && liveEntryPrice != null
+                  ? `₹${((Number(liveTarget) - Number(liveEntryPrice)) * liveQuantity * lotMultiplier).toLocaleString()}`
+                  : '--'}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Max Risk</div>
+              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#e53e3e' }}>
+                {liveStopLoss != null && liveEntryPrice != null
+                  ? `₹${((Number(liveEntryPrice) - Number(liveStopLoss)) * liveQuantity * lotMultiplier).toLocaleString()}`
+                  : '--'}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Quantity</div>
+              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#5a67d8' }}>
+                {liveQuantity * lotMultiplier}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Expiry Date</div>
+              <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#2d3748' }}>
+                {liveExpiryDate || 'N/A'}
+              </div>
             </div>
           </div>
-          <div>
-            <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>
-              Target (+{liveTargetPoints != null ? liveTargetPoints.toFixed(2) : '--'}pts)
-            </div>
-            <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#48bb78' }}>
-              {liveTarget != null ? `₹${Number(liveTarget).toFixed(2)}` : '--'}
-            </div>
-          </div>
-          <div>
-            <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>
-              Stop Loss (-{liveSlPoints != null ? liveSlPoints.toFixed(2) : '--'}pts)
-            </div>
-            <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#f56565' }}>
-              {liveStopLoss != null ? `₹${Number(liveStopLoss).toFixed(2)}` : '--'}
-            </div>
-          </div>
-          <div>
-            <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Potential Profit</div>
-            <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#38a169' }}>
-              {liveTarget != null && liveEntryPrice != null
-                ? `₹${((Number(liveTarget) - Number(liveEntryPrice)) * liveQuantity * lotMultiplier).toLocaleString()}`
-                : '--'}
-            </div>
-          </div>
-          <div>
-            <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Max Risk</div>
-            <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#e53e3e' }}>
-              {liveStopLoss != null && liveEntryPrice != null
-                ? `₹${((Number(liveEntryPrice) - Number(liveStopLoss)) * liveQuantity * lotMultiplier).toLocaleString()}`
-                : '--'}
-            </div>
-          </div>
-          <div>
-            <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Quantity</div>
-            <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#5a67d8' }}>
-              {liveQuantity * lotMultiplier}
-            </div>
-          </div>
-          <div>
-            <div style={{ fontSize: '12px', color: '#78350f', marginBottom: '4px' }}>Expiry Date</div>
-            <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#2d3748' }}>
-              {liveExpiryDate || 'N/A'}
-            </div>
-          </div>
-        </div>
+        )}
       </div>
 
       {/* All Signals Table */}
