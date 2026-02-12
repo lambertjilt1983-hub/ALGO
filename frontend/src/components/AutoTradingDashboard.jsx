@@ -1061,22 +1061,44 @@ const AutoTradingDashboard = () => {
   // If no signals, force null for all signal-driven UI
   const effectiveBestQualityTrade = noQualityTrades ? null : bestQualityTrade;
 
-  // Reduced AI Recommendation: pick the signal with the highest confidence/quality
+  // Enhanced AI Recommendation: Prefer Golden Pullback, else 80%+, else first valid signal
   let aiRecommendedSignal = null;
   if (!noFilteredSignals) {
-    aiRecommendedSignal = filteredOptionSignalsRaw.reduce((best, curr) => {
-      if (curr.error || !curr.symbol || !curr.entry_price || curr.entry_price <= 0) return best;
-      if (!curr.confirmation_score && !curr.confidence) return best;
-      return (!best || ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence))) ? curr : best;
-    }, null);
-    // Debug log for AI recommended signal
-    console.log('[DEBUG] AI Recommended Signal (reduced logic):', aiRecommendedSignal);
+    // If Golden Pullback signals exist, pick the best among them
+    if (filteredOptionSignalsRaw.length > 0) {
+      aiRecommendedSignal = filteredOptionSignalsRaw.reduce((best, curr) => {
+        if (curr.error || !curr.symbol || !curr.entry_price || curr.entry_price <= 0) return best;
+        if (!curr.confirmation_score && !curr.confidence) return best;
+        return (!best || ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence))) ? curr : best;
+      }, null);
+      console.log('[DEBUG] AI Recommended Signal (Golden Pullback):', aiRecommendedSignal);
+    } else {
+      // If no Golden Pullback, pick best signal with confidence/quality >= 80%
+      const eligibleSignals = optionSignals.filter(s => {
+        const conf = Number(s.confirmation_score ?? s.confidence ?? 0);
+        const qual = Number(s.quality_score ?? s.quality ?? 0);
+        return !s.error && s.symbol && s.entry_price > 0 && (conf >= 80 || qual >= 80);
+      });
+      if (eligibleSignals.length > 0) {
+        aiRecommendedSignal = eligibleSignals.reduce((best, curr) => {
+          const currScore = Number(curr.confirmation_score ?? curr.confidence ?? 0);
+          const bestScore = best ? Number(best.confirmation_score ?? best.confidence ?? 0) : -1;
+          return currScore > bestScore ? curr : best;
+        }, null);
+        console.log('[DEBUG] AI Recommended Signal (Fallback 80%+):', aiRecommendedSignal);
+      } else {
+        // If still nothing, pick the first valid signal from optionSignals
+        const firstValid = optionSignals.find(s => !s.error && s.symbol && s.entry_price > 0);
+        aiRecommendedSignal = firstValid || null;
+        console.log('[DEBUG] AI Recommended Signal (First available):', aiRecommendedSignal);
+      }
+    }
   }
 
-  // Use quality trade if available, otherwise use AI recommended signal (all from quality > 90%)
-  const activeSignal = noFilteredSignals ? null : (selectedSignal || effectiveBestQualityTrade || aiRecommendedSignal);
-    // Debug log for active signal
-    console.log('[DEBUG] Active Signal:', activeSignal);
+  // Use quality trade if available, otherwise use AI recommended signal
+  const activeSignal = aiRecommendedSignal ? (selectedSignal || effectiveBestQualityTrade || aiRecommendedSignal) : null;
+  // Debug log for active signal
+  console.log('[DEBUG] Active Signal:', activeSignal);
   const qualityTradesIndices = qualityTrades.filter((t) => getSignalGroup(t) === 'indices');
   const qualityTradesStocks = qualityTrades.filter((t) => getSignalGroup(t) === 'stocks');
   const scannerTrades = scannerTab === 'indices' ? qualityTradesIndices : qualityTradesStocks;
