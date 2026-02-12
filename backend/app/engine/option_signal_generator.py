@@ -579,7 +579,7 @@ def fetch_index_option_chain(
         change_pct = ((spot_price - quote.get(quote_symbol, {}).get('open_price', spot_price)) / quote.get(quote_symbol, {}).get('open_price', spot_price) * 100) if quote.get(quote_symbol, {}).get('open_price') else 0
         trend_bullish = change_pct >= 0
         
-        # Return BOTH CE and PE signals
+        # Build CE and PE signals
         ce_signal = {
             "index": index_name,
             "strike": atm_strike,
@@ -601,7 +601,6 @@ def fetch_index_option_chain(
             "risk": 20 * lot_size,
             "option_type": "CE"
         }
-        
         pe_signal = {
             "index": index_name,
             "strike": atm_strike,
@@ -623,13 +622,14 @@ def fetch_index_option_chain(
             "risk": 20 * lot_size,
             "option_type": "PE"
         }
-        
         # Validate signal quality for both CE and PE
         ce_signal = _validate_signal_quality(ce_signal, kite, quote_data)
         pe_signal = _validate_signal_quality(pe_signal, kite, quote_data)
-        
-        # Return the most bullish signal first, PE second
-        return [ce_signal, pe_signal] if trend_bullish else [pe_signal, ce_signal]
+        # Only return the signal matching the trend
+        if trend_bullish:
+            return [ce_signal]
+        else:
+            return [pe_signal]
     except Exception as e:
         return {"index": index_name, "error": str(e)}
 
@@ -739,6 +739,12 @@ def generate_signals(
                 signals.extend(result)
             else:
                 signals.append(result)
+        # DEBUG: Log number and quality of generated signals
+        import logging
+        logger = logging.getLogger("option_signal_debug")
+        logger.info(f"[DEBUG] Generated {len(signals)} signals.")
+        for sig in signals:
+            logger.info(f"[DEBUG] Signal index={sig.get('index')} quality_score={sig.get('quality_score')} error={sig.get('error')}")
         _signals_cache = signals
         _signals_cache_time = now
         return signals
@@ -887,6 +893,12 @@ async def generate_signals_advanced(
         idx = s.get("index")
         trend_row = trend_data.get(idx) if idx else None
         enhanced.append(_apply_confirmation(s, sentiment, trend_row, mode=mode))
+    # DEBUG: Log number and quality of generated signals
+    import logging
+    logger = logging.getLogger("option_signal_debug")
+    logger.info(f"[DEBUG] [ADVANCED] Generated {len(enhanced)} signals.")
+    for sig in enhanced:
+        logger.info(f"[DEBUG] [ADVANCED] Signal index={sig.get('index')} quality_score={sig.get('quality_score')} error={sig.get('error')}")
     return enhanced
 
 if __name__ == "__main__":

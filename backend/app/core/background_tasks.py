@@ -1,3 +1,20 @@
+def scan_job():
+    """Run the advanced AI signal scan job and return results."""
+    try:
+        import asyncio
+        from app.engine.option_signal_generator import generate_signals_advanced
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        signals = loop.run_until_complete(generate_signals_advanced(include_nifty50=True))
+        loop.close()
+        best_signal = None
+        if signals:
+            best_signal = max(signals, key=lambda s: s.get('quality', 0))
+        logger.log_info("AI Scan job executed", {"best_signal": best_signal, "all_signals": signals})
+        return {"best_signal": best_signal, "all_signals": signals}
+    except Exception as e:
+        logger.log_error("AI Scan job failed", {"error": str(e)})
+        return {"error": str(e)}
 """
 Background tasks for token validation and refresh
 Runs periodically to check token validity and trigger refresh if needed

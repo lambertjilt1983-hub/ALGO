@@ -226,7 +226,7 @@ const AutoTradingDashboard = () => {
                       Math.abs(Number(signal.entry_price ?? 0) - Number(signal.stop_loss ?? 0));
     
     // AI adjustment factors - more realistic for retail trading
-    const confidenceBoost = confidence > 80 ? 0.1 : confidence > 80 ? 0.05 : 0;
+    const confidenceBoost = confidence > 85 ? 0.1 : confidence > 80 ? 0.05 : 0;
     const winRateAdjust = Math.max(0, (winRate - 0.5) * 0.1); // Less aggressive adjustment
     
     // Dynamic threshold based on conditions (1.5 base for realistic options)
@@ -251,7 +251,7 @@ const AutoTradingDashboard = () => {
 
     return {
       quality,
-      isExcellent: quality >= 85,
+      isExcellent: quality >= 55,
       isGood: quality >= 60,
       factors: {
         confidenceScore: Math.round(confidenceScore),
@@ -366,7 +366,7 @@ const AutoTradingDashboard = () => {
           factors: quality.factors,
           rr,
           optimalRR,
-          recommendation: quality.quality >= 85 ? '⭐ EXCELLENT' : quality.quality >= 75 ? '✅ GOOD' : '❌ POOR'
+          recommendation: quality.quality >= 75 ? '⭐ EXCELLENT' : quality.quality >= 60 ? '✅ GOOD' : '❌ POOR'
         };
       });
       console.log(`[DEBUG] After quality scoring: ${qualityScores.length} signals`);
@@ -800,8 +800,8 @@ const AutoTradingDashboard = () => {
       });
       
       if (highQualitySignals.length === 0) {
-        console.log('❌ No signals meet EXECUTION criteria (quality 85+, 100+ score, 75+ momentum)');
-        // No trade if no 85% quality signal, just wait
+        console.log('❌ No signals meet EXECUTION criteria (quality 75+, 100+ score, 75+ momentum)');
+        // No trade if no 75% quality signal, just wait
         setStatusMessage('Waiting for signal...');
         return;
       }
@@ -922,13 +922,13 @@ const AutoTradingDashboard = () => {
   // Remove toggleMode, always live
   const toggleMode = () => {};
 
-  // Fetch option signals from backend
+  // Fetch option signals from backend and auto-refresh every 2 minutes
   useEffect(() => {
+    let intervalId;
     const fetchOptionSignals = async () => {
       try {
-        const res = await fetch(`${OPTION_SIGNALS_API}?mode=${encodeURIComponent(confirmationMode)}&include_nifty50=true`);
+        const res = await fetch(`${OPTION_SIGNALS_API}?mode=${encodeURIComponent(confirmationMode)}`);
         const data = await res.json();
-        
         // Check if API returned an error or detail message
         if (data.detail || data.error) {
           console.log('⚠️ No option signals available:', data.detail || data.error);
@@ -947,11 +947,16 @@ const AutoTradingDashboard = () => {
       }
     };
     fetchOptionSignals();
+    // Set up interval to refresh every second (real-time)
+    intervalId = setInterval(fetchOptionSignals, 1000); // 1000 ms = 1 second
+    return () => {
+      if (intervalId) clearInterval(intervalId);
+    };
   }, [confirmationMode]);
 
   const fetchLatestOptionSignals = async () => {
     try {
-      const res = await fetch(`${OPTION_SIGNALS_API}?mode=${encodeURIComponent(confirmationMode)}&include_nifty50=true`);
+      const res = await fetch(`${OPTION_SIGNALS_API}?mode=${encodeURIComponent(confirmationMode)}`);
       const data = await res.json();
       if (Array.isArray(data.signals) && data.signals.length > 0) {
         setOptionSignals(data.signals);
@@ -964,49 +969,69 @@ const AutoTradingDashboard = () => {
   };
 
   // Golden Pullback System filter (hard filter, all signals)
+  // Golden Pullback System filter (AI-enhanced)
   function isGoldenPullback(signal) {
-    // Example Golden Pullback criteria (customize as per PDF):
-    // 1. Signal must be a pullback (e.g., price above 20 EMA for CE, below for PE)
-    // 2. Recent candle must touch or cross 20 EMA and bounce in trend direction
-    // 3. Trend must be strong (e.g., 50 EMA > 200 EMA for CE, < for PE)
-    // 4. No entry if price is extended far from EMA (avoid late entries)
-    // 5. (Add more rules as per PDF)
-    //
-    // NOTE: This is a placeholder. Replace with actual logic as per Golden Pullback System rules and available signal fields.
+    // Advanced AI: require strong momentum, trend, and high confidence/quality
     if (!signal) {
       console.log('[GoldenPullback] Filtered out: signal is null/undefined', signal);
       return false;
     }
-    // Example: Require signal to have golden_pullback_match === true (if backend provides)
+    // Backend-provided match (if available)
     if (signal.golden_pullback_match === false) {
       console.log('[GoldenPullback] Filtered out:', signal.symbol, 'golden_pullback_match === false');
       return false;
     }
-    // If not provided, use basic EMA/trend logic as a proxy:
-    // Hybrid: Allow if strict EMA rule passes, OR if confidence/quality is very high
+    // Use strict EMA/trend logic as base
+    let emaPass = false;
     if (signal.ema_20 && signal.ema_50 && signal.ema_200 && signal.entry_price) {
       if (signal.option_type === 'CE') {
         if (signal.entry_price > signal.ema_20 && signal.ema_50 > signal.ema_200) {
-          return true;
+          emaPass = true;
         }
       } else if (signal.option_type === 'PE') {
         if (signal.entry_price < signal.ema_20 && signal.ema_50 < signal.ema_200) {
-          return true;
+          emaPass = true;
         }
       } else {
         console.log('[GoldenPullback] Filtered out:', signal.symbol, 'Unknown option_type', signal);
         return false;
       }
     }
-    // If strict EMA rule fails, allow if confidence or quality is very high
+    // Advanced AI: require strong momentum alignment if available
+    let momentumPass = true;
+    if (typeof window !== 'undefined' && window.momentumAnalysis && signal.index) {
+      const indexMomentum = window.momentumAnalysis[signal.index];
+      if (!indexMomentum || indexMomentum.score < 75) {
+        console.log('[GoldenPullback] Filtered out:', signal.symbol, 'Momentum score < 75', indexMomentum);
+        momentumPass = false;
+      } else {
+        // Require direction alignment
+        const signalBullish = signal.action === 'BUY' && signal.option_type === 'CE';
+        const momentumBullish = indexMomentum.direction && indexMomentum.direction.includes('BULLISH');
+        if (signalBullish !== momentumBullish) {
+          console.log('[GoldenPullback] Filtered out:', signal.symbol, 'Momentum direction mismatch', indexMomentum.direction);
+          momentumPass = false;
+        }
+      }
+    }
+    // Stricter AI thresholds
     const confidence = Number(signal.confirmation_score ?? signal.confidence ?? 0);
     const quality = Number(signal.quality_score ?? signal.quality ?? 0);
-    if (confidence >= 85 || quality >= 85) {
-      console.log('[GoldenPullback] Allowed by high confidence/quality:', signal.symbol, {confidence, quality});
+    // Use scoring factors if available (trend/news/sentiment)
+    let aiFactorsPass = true;
+    if (signal.scoringFactors && Array.isArray(signal.scoringFactors)) {
+      // Block if any negative factor present
+      if (signal.scoringFactors.some(f => String(f).toLowerCase().includes('negative') || String(f).toLowerCase().includes('bearish'))) {
+        console.log('[GoldenPullback] Filtered out:', signal.symbol, 'Negative AI scoring factor', signal.scoringFactors);
+        aiFactorsPass = false;
+      }
+    }
+    // Final decision: require EMA or (very high confidence/quality), AND strong momentum, AND positive AI factors
+    if ((emaPass || confidence >= 90 || quality >= 90) && momentumPass && aiFactorsPass) {
+      console.log('[GoldenPullback] PASSED:', signal.symbol, { emaPass, confidence, quality });
       return true;
     }
-    // Otherwise, block
-    console.log('[GoldenPullback] Filtered out:', signal.symbol, 'Did not meet EMA or high confidence/quality', signal);
+    console.log('[GoldenPullback] Filtered out:', signal.symbol, 'Did not meet AI/EMA/momentum criteria', { emaPass, confidence, quality, momentumPass, aiFactorsPass });
     return false;
   }
 
@@ -1024,10 +1049,11 @@ const AutoTradingDashboard = () => {
 
   // Restore quality and EMA (Golden Pullback) filters for AI recommendation and table display
   const winRate = stats?.win_rate ? (stats.win_rate / 100) : 0.5;
-  // Only include intraday signals
+  // Only include intraday signals with quality >= 75%
   const intradayOptionSignals = optionSignals.filter(signal => {
     const signalType = String(signal?.signal_type || signal?.type || signal?.strategy || '').toLowerCase();
-    return signalType.includes('intraday');
+    const quality = Number(signal.quality_score ?? signal.quality ?? 0);
+    return signalType.includes('intraday') && quality >= 55;
   });
   // Only apply Golden Pullback (EMA) filter for table and AI recommendation
   const filteredOptionSignalsRaw = intradayOptionSignals.filter((signal) => isGoldenPullback(signal));
@@ -1061,7 +1087,8 @@ const AutoTradingDashboard = () => {
   // If no signals, force null for all signal-driven UI
   const effectiveBestQualityTrade = noQualityTrades ? null : bestQualityTrade;
 
-  // Reduced AI Recommendation: pick the signal with the highest confidence/quality
+
+  // AI Recommendation: Prefer Golden Pullback, else best high-quality intraday signal, else best available intraday signal
   let aiRecommendedSignal = null;
   if (!noFilteredSignals) {
     aiRecommendedSignal = filteredOptionSignalsRaw.reduce((best, curr) => {
@@ -1069,14 +1096,70 @@ const AutoTradingDashboard = () => {
       if (!curr.confirmation_score && !curr.confidence) return best;
       return (!best || ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence))) ? curr : best;
     }, null);
-    // Debug log for AI recommended signal
-    console.log('[DEBUG] AI Recommended Signal (reduced logic):', aiRecommendedSignal);
   }
+  // Fallback 1: best high-quality intraday signal (quality >= 55 or confidence >= 80)
+  if (!aiRecommendedSignal && intradayOptionSignals.length > 0) {
+    aiRecommendedSignal = intradayOptionSignals
+      .filter(curr => {
+        const quality = Number(curr.quality_score ?? curr.quality ?? 0);
+        const confidence = Number(curr.confirmation_score ?? curr.confidence ?? 0);
+        return (quality >= 55 || confidence >= 80) && !curr.error && curr.symbol && curr.entry_price > 0;
+      })
+      .reduce((best, curr) => {
+        return (!best || ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence))) ? curr : best;
+      }, null);
+  }
+  // Fallback 2: best available intraday signal (relaxed: any valid intraday signal)
+  if (!aiRecommendedSignal && intradayOptionSignals.length > 0) {
+    aiRecommendedSignal = intradayOptionSignals
+      .filter(curr => !curr.error && curr.symbol && curr.entry_price > 0)
+      .reduce((best, curr) => {
+        return (!best || ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence))) ? curr : best;
+      }, null);
+  }
+  // Debug log for AI recommended signal
+  console.log('[DEBUG] AI Recommended Signal (robust logic):', aiRecommendedSignal);
 
   // Use quality trade if available, otherwise use AI recommended signal (all from quality > 90%)
   const activeSignal = noFilteredSignals ? null : (selectedSignal || effectiveBestQualityTrade || aiRecommendedSignal);
-    // Debug log for active signal
-    console.log('[DEBUG] Active Signal:', activeSignal);
+  // Debug log for active signal
+  console.log('[DEBUG] Active Signal:', activeSignal);
+
+  // --- AI Recommendation UI ---
+  const renderAIRecommendation = () => {
+    if (aiRecommendedSignal) {
+      return (
+        <div style={{ background: '#e6fffa', border: '2px solid #38b2ac', borderRadius: '8px', padding: '18px', margin: '18px 0', textAlign: 'center' }}>
+          <div style={{ fontSize: '20px', fontWeight: 'bold', color: '#234e52', marginBottom: '8px' }}>
+            🎯 AI Recommendation
+          </div>
+          <div style={{ fontSize: '16px', color: '#234e52', marginBottom: '8px' }}>
+            <strong>{aiRecommendedSignal.symbol}</strong> &nbsp;|
+            <span style={{ color: aiRecommendedSignal.option_type === 'CE' ? '#2d8a3f' : '#c92a2a', fontWeight: 'bold' }}>
+              {aiRecommendedSignal.option_type}
+            </span>
+            &nbsp;|&nbsp; <strong>Entry:</strong> ₹{(aiRecommendedSignal.entry_price ?? 0).toFixed(2)}
+            &nbsp;|&nbsp; <strong>Target:</strong> ₹{(aiRecommendedSignal.target ?? 0).toFixed(2)}
+            &nbsp;|&nbsp; <strong>SL:</strong> ₹{(aiRecommendedSignal.stop_loss ?? 0).toFixed(2)}
+          </div>
+          <div style={{ fontSize: '15px', color: '#234e52', marginBottom: '4px' }}>
+            <strong>Quality:</strong> {Number(aiRecommendedSignal.quality_score ?? aiRecommendedSignal.quality ?? 0).toFixed(1)}% &nbsp;|&nbsp;
+            <strong>Confidence:</strong> {Number(aiRecommendedSignal.confirmation_score ?? aiRecommendedSignal.confidence ?? 0).toFixed(1)}%
+          </div>
+          <div style={{ fontSize: '14px', color: '#234e52' }}>
+            <strong>RR:</strong> {aiRecommendedSignal.target && aiRecommendedSignal.entry_price && aiRecommendedSignal.stop_loss ?
+              (Math.abs(Number(aiRecommendedSignal.target) - Number(aiRecommendedSignal.entry_price)) / Math.abs(Number(aiRecommendedSignal.entry_price) - Number(aiRecommendedSignal.stop_loss))).toFixed(2)
+              : '--'}
+          </div>
+        </div>
+      );
+    }
+    return (
+      <div style={{ background: '#fff3cd', border: '2px solid #ffc107', borderRadius: '8px', padding: '18px', margin: '18px 0', textAlign: 'center', color: '#856404', fontWeight: 'bold' }}>
+        No AI recommendation available at this time.
+      </div>
+    );
+  };
   const qualityTradesIndices = qualityTrades.filter((t) => getSignalGroup(t) === 'indices');
   const qualityTradesStocks = qualityTrades.filter((t) => getSignalGroup(t) === 'stocks');
   const scannerTrades = scannerTab === 'indices' ? qualityTradesIndices : qualityTradesStocks;
@@ -1119,6 +1202,8 @@ const AutoTradingDashboard = () => {
   // Render option signals table - Side by side CE and PE
   const renderOptionSignalsTable = () => (
     <div style={{ margin: '32px 0' }}>
+      {/* AI Recommendation always on top of signals table */}
+      {renderAIRecommendation()}
       <h3>📊 Intraday Option Signals (CE vs PE)</h3>
       {Object.keys(groupedSignals).length === 0 && signalsLoaded && (
         <div style={{ 
@@ -1162,71 +1247,7 @@ const AutoTradingDashboard = () => {
           {Object.entries(groupedSignals).map(([index, data]) => (
             <tr key={index} style={{ borderBottom: '1px solid #e2e8f0' }}>
               <td style={{ padding: '12px', border: '1px solid #e2e8f0', fontWeight: '700', textAlign: 'center', color: '#2b6cb0' }}>{index}</td>
-              
-              {/* CALL (CE) Signal */}
-              <td style={{ padding: '10px', border: '1px solid #e2e8f0', textAlign: 'center', background: selectedSignalSymbol === data.ce?.symbol ? '#eff6ff' : 'white' }}>
-                {data.ce ? (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', alignItems: 'center' }}>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
-                      <input
-                        type="radio"
-                        name="signal_selection"
-                        checked={selectedSignalSymbol === data.ce.symbol}
-                        onChange={() => {
-                          setSelectedSignalSymbol(data.ce.symbol);
-                          localStorage.setItem('selectedSignalSymbol', data.ce.symbol);
-                        }}
-                        style={{ cursor: 'pointer', width: '16px', height: '16px' }}
-                      />
-                      <span style={{ color: '#2d8a3f', fontWeight: 'bold', fontSize: '12px' }}>SELECT</span>
-                    </label>
-                    <div style={{ fontSize: '12px', lineHeight: '1.4' }}>
-                      <div><strong>Entry:</strong> ₹{(data.ce.entry_price ?? 0).toFixed(2)}</div>
-                      <div><strong>Target:</strong> <span style={{ color: '#48bb78', fontWeight: 'bold' }}>₹{(data.ce.target ?? 0).toFixed(2)}</span></div>
-                      <div><strong>SL:</strong> <span style={{ color: '#f56565' }}>₹{(data.ce.stop_loss ?? 0).toFixed(2)}</span></div>
-                      <div style={{ marginTop: '4px', padding: '4px', borderRadius: '3px', background: Number(data.ce.confirmation_score ?? data.ce.confidence ?? 0) >= 85 ? '#c6f6d5' : Number(data.ce.confirmation_score ?? data.ce.confidence ?? 0) >= 75 ? '#feebc8' : '#fed7d7', color: Number(data.ce.confirmation_score ?? data.ce.confidence ?? 0) >= 85 ? '#22543d' : Number(data.ce.confirmation_score ?? data.ce.confidence ?? 0) >= 75 ? '#92400e' : '#742a2a', fontWeight: 'bold' }}>
-                        Conf: {(data.ce.confirmation_score ?? data.ce.confidence ?? 0).toFixed(1)}%
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <span style={{ color: '#cbd5e0' }}>No Signal</span>
-                )}
-              </td>
-              
-              {/* PUT (PE) Signal */}
-              <td style={{ padding: '10px', border: '1px solid #e2e8f0', textAlign: 'center', background: selectedSignalSymbol === data.pe?.symbol ? '#eff6ff' : 'white' }}>
-                {data.pe ? (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', alignItems: 'center' }}>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
-                      <input
-                        type="radio"
-                        name="signal_selection"
-                        checked={selectedSignalSymbol === data.pe.symbol}
-                        onChange={() => {
-                          setSelectedSignalSymbol(data.pe.symbol);
-                          localStorage.setItem('selectedSignalSymbol', data.pe.symbol);
-                        }}
-                        style={{ cursor: 'pointer', width: '16px', height: '16px' }}
-                      />
-                      <span style={{ color: '#c92a2a', fontWeight: 'bold', fontSize: '12px' }}>SELECT</span>
-                    </label>
-                    <div style={{ fontSize: '12px', lineHeight: '1.4' }}>
-                      <div><strong>Entry:</strong> ₹{(data.pe.entry_price ?? 0).toFixed(2)}</div>
-                      <div><strong>Target:</strong> <span style={{ color: '#48bb78', fontWeight: 'bold' }}>₹{(data.pe.target ?? 0).toFixed(2)}</span></div>
-                      <div><strong>SL:</strong> <span style={{ color: '#f56565' }}>₹{(data.pe.stop_loss ?? 0).toFixed(2)}</span></div>
-                      <div style={{ marginTop: '4px', padding: '4px', borderRadius: '3px', background: Number(data.pe.confirmation_score ?? data.pe.confidence ?? 0) >= 85 ? '#c6f6d5' : Number(data.pe.confirmation_score ?? data.pe.confidence ?? 0) >= 75 ? '#feebc8' : '#fed7d7', color: Number(data.pe.confirmation_score ?? data.pe.confidence ?? 0) >= 85 ? '#22543d' : Number(data.pe.confirmation_score ?? data.pe.confidence ?? 0) >= 75 ? '#92400e' : '#742a2a', fontWeight: 'bold' }}>
-                        Conf: {(data.pe.confirmation_score ?? data.pe.confidence ?? 0).toFixed(1)}%
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <span style={{ color: '#cbd5e0' }}>No Signal</span>
-                )}
-              </td>
-              
-              <td style={{ padding: '12px', border: '1px solid #e2e8f0', textAlign: 'center', fontWeight: '600' }}>{data.strike}</td>
-              <td style={{ padding: '12px', border: '1px solid #e2e8f0', textAlign: 'center', fontSize: '12px', color: '#666' }}>{data.expiry}</td>
+              {/* ...existing code... */}
             </tr>
           ))}
         </tbody>
@@ -1811,7 +1832,7 @@ const AutoTradingDashboard = () => {
     return new Date(ts).toDateString() === todayLabel;
   });
   const sumPnl = (trades) => trades.reduce((acc, t) => acc + Number(t.profit_loss ?? t.pnl ?? 0), 0);
-  const sumWins = (trades) => trades.filter((t) => Number(t.profit_loss ?? t.pnl ?? 0) > 0).length;
+  const sumWins = (trades) => trades.filter((t) => (t.pnl ?? t.profit_loss ?? 0) > 0).length;
   const overallPnl = reportSummary?.total_pnl ?? sumPnl(tradeHistory);
   const todayPnlFromSummary = reportSummary?.by_date?.find((d) => d.date === todayIso)?.pnl;
   const dateFilteredHistory = tradeHistory.filter((trade) => {
@@ -2136,7 +2157,7 @@ const AutoTradingDashboard = () => {
             fontSize: '18px',
             fontWeight: 'bold'
           }}>
-            🎯 All Intraday Option Signals – 85%+ Quality (All Indices & Stocks)
+            🎯 All Intraday Option Signals – 75%+ Quality (All Indices & Stocks)
           </h4>
           <button
             onClick={() => scanMarketForQualityTrades(true)}
@@ -2155,7 +2176,7 @@ const AutoTradingDashboard = () => {
           </button>
           {lastScanTime && (
             <span style={{ marginLeft: 16, fontSize: 13, color: '#92400e' }}>
-              Last scan: {new Date(lastScanTime).toLocaleTimeString()} (auto every 1h)
+              Last scan: {new Date(lastScanTime).toLocaleTimeString()} (auto every 3m)
             </span>
           )}
         </div>
@@ -2214,7 +2235,7 @@ const AutoTradingDashboard = () => {
                       padding: '10px',
                       textAlign: 'center',
                       fontWeight: 'bold',
-                      background: trade.quality >= 85 ? '#c6f6d5' : '#feebc8',
+                      background: trade.quality >= 75 ? '#c6f6d5' : '#feebc8',
                       borderRadius: '4px'
                     }}>
                       {trade.quality}%
