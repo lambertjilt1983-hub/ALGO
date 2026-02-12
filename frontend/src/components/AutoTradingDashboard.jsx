@@ -1047,19 +1047,17 @@ const AutoTradingDashboard = () => {
   }
 
 
-  // Restore quality and EMA (Golden Pullback) filters for AI recommendation and table display
+  // AI Recommendation and table: show all valid signals (no intraday/type/quality/EMA filter)
   const winRate = stats?.win_rate ? (stats.win_rate / 100) : 0.5;
-  // Only include intraday signals with quality >= 75%
-  const intradayOptionSignals = optionSignals.filter(signal => {
-    const signalType = String(signal?.signal_type || signal?.type || signal?.strategy || '').toLowerCase();
+  // Only include signals with quality > 80 and confidence > 90
+  const validOptionSignals = optionSignals.filter(signal => {
+    if (signal.error || !signal.symbol || signal.entry_price <= 0) return false;
     const quality = Number(signal.quality_score ?? signal.quality ?? 0);
-    return signalType.includes('intraday') && quality >= 55;
+    const confidence = Number(signal.confirmation_score ?? signal.confidence ?? 0);
+    return quality > 80 && confidence > 90;
   });
-  // Only apply Golden Pullback (EMA) filter for table and AI recommendation
-  const filteredOptionSignalsRaw = intradayOptionSignals.filter((signal) => isGoldenPullback(signal));
-  const filteredOptionSignals = filteredOptionSignalsRaw;
-  // Group signals by index to show CE and PE side-by-side (with filters)
-  const groupedSignals = filteredOptionSignalsRaw.reduce((acc, signal) => {
+  // For table, group by index, show CE/PE side by side
+  const groupedSignals = validOptionSignals.reduce((acc, signal) => {
     const key = signal.index;
     if (!acc[key]) {
       acc[key] = { ce: null, pe: null, strike: signal.strike, expiry: signal.expiry_date || signal.expiry_zone };
@@ -1082,46 +1080,26 @@ const AutoTradingDashboard = () => {
 
   // If no quality trades, clear selected/active signals to prevent stale UI
   const noQualityTrades = !qualityTrades || qualityTrades.length === 0;
-  const noFilteredSignals = !filteredOptionSignalsRaw || filteredOptionSignalsRaw.length === 0;
+  const noValidSignals = !validOptionSignals || validOptionSignals.length === 0;
 
   // If no signals, force null for all signal-driven UI
   const effectiveBestQualityTrade = noQualityTrades ? null : bestQualityTrade;
 
 
-  // AI Recommendation: Prefer Golden Pullback, else best high-quality intraday signal, else best available intraday signal
+  // AI Recommendation: pick the best valid signal by confidence/quality
   let aiRecommendedSignal = null;
-  if (!noFilteredSignals) {
-    aiRecommendedSignal = filteredOptionSignalsRaw.reduce((best, curr) => {
-      if (curr.error || !curr.symbol || !curr.entry_price || curr.entry_price <= 0) return best;
-      if (!curr.confirmation_score && !curr.confidence) return best;
-      return (!best || ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence))) ? curr : best;
+  if (validOptionSignals.length > 0) {
+    aiRecommendedSignal = validOptionSignals.reduce((best, curr) => {
+      const currScore = Number(curr.confirmation_score ?? curr.confidence ?? 0);
+      const bestScore = best ? Number(best.confirmation_score ?? best.confidence ?? 0) : -1;
+      return currScore > bestScore ? curr : best;
     }, null);
   }
-  // Fallback 1: best high-quality intraday signal (quality >= 55 or confidence >= 80)
-  if (!aiRecommendedSignal && intradayOptionSignals.length > 0) {
-    aiRecommendedSignal = intradayOptionSignals
-      .filter(curr => {
-        const quality = Number(curr.quality_score ?? curr.quality ?? 0);
-        const confidence = Number(curr.confirmation_score ?? curr.confidence ?? 0);
-        return (quality >= 55 || confidence >= 80) && !curr.error && curr.symbol && curr.entry_price > 0;
-      })
-      .reduce((best, curr) => {
-        return (!best || ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence))) ? curr : best;
-      }, null);
-  }
-  // Fallback 2: best available intraday signal (relaxed: any valid intraday signal)
-  if (!aiRecommendedSignal && intradayOptionSignals.length > 0) {
-    aiRecommendedSignal = intradayOptionSignals
-      .filter(curr => !curr.error && curr.symbol && curr.entry_price > 0)
-      .reduce((best, curr) => {
-        return (!best || ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence))) ? curr : best;
-      }, null);
-  }
   // Debug log for AI recommended signal
-  console.log('[DEBUG] AI Recommended Signal (robust logic):', aiRecommendedSignal);
+  console.log('[DEBUG] AI Recommended Signal (no filter):', aiRecommendedSignal);
 
-  // Use quality trade if available, otherwise use AI recommended signal (all from quality > 90%)
-  const activeSignal = noFilteredSignals ? null : (selectedSignal || effectiveBestQualityTrade || aiRecommendedSignal);
+  // Use quality trade if available, otherwise use AI recommended signal
+  const activeSignal = selectedSignal || effectiveBestQualityTrade || aiRecommendedSignal;
   // Debug log for active signal
   console.log('[DEBUG] Active Signal:', activeSignal);
 
