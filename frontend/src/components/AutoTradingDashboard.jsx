@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
 
+
+
 /**
  * 🚀 PERFORMANCE OPTIMIZATIONS APPLIED:
  * 
@@ -412,7 +414,16 @@ const AutoTradingDashboard = () => {
       const activeEndpoint = useLive ? AUTO_TRADE_ACTIVE_API : PAPER_TRADES_ACTIVE_API;
       const updateEndpoint = useLive ? AUTO_TRADE_UPDATE_API : PAPER_TRADES_UPDATE_API;
 
-      await timeoutPromise(config.authFetch(updateEndpoint, { method: 'POST' }), 15000).catch(() => null);
+      // --- DEBUG: Log before price update fetch ---
+      console.log('[DEBUG] Fetching price update from:', updateEndpoint);
+      const updateRes = await timeoutPromise(config.authFetch(updateEndpoint, { method: 'POST' }), 15000).catch(() => null);
+      if (updateRes && updateRes.ok) {
+        const updateJson = await updateRes.json().catch(() => null);
+        console.log('[DEBUG] Price update response:', updateJson);
+      } else {
+        console.log('[DEBUG] Price update fetch failed or not ok');
+      }
+
       const [activeRes, historyRes, perfRes, statusRes] = await Promise.all([
         timeoutPromise(config.authFetch(activeEndpoint), 15000),
         timeoutPromise(config.authFetch(`${PAPER_TRADES_HISTORY_API}?days=7&limit=100`), 15000),
@@ -432,10 +443,16 @@ const AutoTradingDashboard = () => {
       const history = historyData.trades || [];
       const backendStatus = statusData.status || statusData;
 
+      // --- DEBUG: Log active trades after fetch ---
+      console.log('[DEBUG] Active trades after fetch:', active);
+
       // Deduplicate active trades by symbol, action, entry_price, and entry_time
+      // Only keep trades that are still open (status OPEN, or not closed)
+      const openStatuses = ['OPEN', 'ACTIVE', 'RUNNING'];
       const dedupedActive = Array.isArray(active)
         ? active.filter((trade, idx, arr) => {
-            return (
+            const isOpen = openStatuses.includes(String(trade.status).toUpperCase());
+            return isOpen && (
               arr.findIndex(t =>
                 t.symbol === trade.symbol &&
                 (t.action || t.side) === (trade.action || trade.side) &&
@@ -444,9 +461,16 @@ const AutoTradingDashboard = () => {
               ) === idx
             );
           })
-        : active;
-      setActiveTrades(dedupedActive);
-      setTradeHistory(history);
+        : [];
+      if (dedupedActive && dedupedActive.length > 0) {
+        console.log('[DEBUG] Setting active trades state:', dedupedActive);
+        setActiveTrades(dedupedActive);
+      } else {
+        setActiveTrades([]);
+      }
+      if (history && history.length > 0) {
+        setTradeHistory(history);
+      }
       setReportSummary(perfData);
       setHasActiveTrade(active.length > 0);
 
@@ -492,8 +516,7 @@ const AutoTradingDashboard = () => {
       });
     } catch (e) {
       // Silent error handling - graceful degradation
-      setActiveTrades([]);
-      setTradeHistory([]);
+      // Do not reset to blank, keep previous values
       setReportSummary(null);
     } finally {
       fetchData.isRunning = false;
@@ -1029,7 +1052,7 @@ const AutoTradingDashboard = () => {
     const signalType = String(signal?.signal_type || signal?.type || signal?.strategy || '').toLowerCase();
     return signalType.includes('intraday');
   });
-  // Only apply Golden Pullback (EMA) filter for table and AI recommendation
+  // Only apply Golden Pullback (EMA) filter for table display
   const filteredOptionSignalsRaw = intradayOptionSignals.filter((signal) => isGoldenPullback(signal));
   const filteredOptionSignals = filteredOptionSignalsRaw;
   // Group signals by index to show CE and PE side-by-side (with filters)
@@ -1046,6 +1069,7 @@ const AutoTradingDashboard = () => {
     return acc;
   }, {});
 
+
   // Get selected signal from grouped signals
   const selectedSignal = selectedSignalSymbol
     ? optionSignals.find((s) => s.symbol === selectedSignalSymbol)
@@ -1061,38 +1085,42 @@ const AutoTradingDashboard = () => {
   // If no signals, force null for all signal-driven UI
   const effectiveBestQualityTrade = noQualityTrades ? null : bestQualityTrade;
 
-  // Enhanced AI Recommendation: Prefer Golden Pullback, else 80%+, else first valid signal
+  // AI Recommendation: Use qualityTrades (with computed quality) instead of optionSignals
   let aiRecommendedSignal = null;
-  if (!noFilteredSignals) {
-    // If Golden Pullback signals exist, pick the best among them
-    if (filteredOptionSignalsRaw.length > 0) {
-      aiRecommendedSignal = filteredOptionSignalsRaw.reduce((best, curr) => {
-        if (curr.error || !curr.symbol || !curr.entry_price || curr.entry_price <= 0) return best;
-        if (!curr.confirmation_score && !curr.confidence) return best;
-        return (!best || ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence))) ? curr : best;
-      }, null);
-      console.log('[DEBUG] AI Recommended Signal (Golden Pullback):', aiRecommendedSignal);
-    } else {
-      // If no Golden Pullback, pick best signal with confidence/quality >= 80%
-      const eligibleSignals = optionSignals.filter(s => {
-        const conf = Number(s.confirmation_score ?? s.confidence ?? 0);
-        const qual = Number(s.quality_score ?? s.quality ?? 0);
-        return !s.error && s.symbol && s.entry_price > 0 && (conf >= 80 || qual >= 80);
-      });
-      if (eligibleSignals.length > 0) {
-        aiRecommendedSignal = eligibleSignals.reduce((best, curr) => {
-          const currScore = Number(curr.confirmation_score ?? curr.confidence ?? 0);
-          const bestScore = best ? Number(best.confirmation_score ?? best.confidence ?? 0) : -1;
-          return currScore > bestScore ? curr : best;
-        }, null);
-        console.log('[DEBUG] AI Recommended Signal (Fallback 80%+):', aiRecommendedSignal);
-      } else {
-        // If still nothing, pick the first valid signal from optionSignals
-        const firstValid = optionSignals.find(s => !s.error && s.symbol && s.entry_price > 0);
-        aiRecommendedSignal = firstValid || null;
-        console.log('[DEBUG] AI Recommended Signal (First available):', aiRecommendedSignal);
+  // Debug: log all quality trades
+  const parsedQualityTrades = (qualityTrades || []).map(s => ({
+    ...s,
+    quality: Number(s.quality),
+    quality_score: Number(s.quality_score),
+    confirmation_score: Number(s.confirmation_score),
+    confidence: Number(s.confidence)
+  }));
+  console.log('[DEBUG] qualityTrades (parsed):', parsedQualityTrades);
+  // Always pick the best signal with quality >= 80% (explicitly check both fields)
+  parsedQualityTrades.forEach((s, i) => {
+    console.log(`[DEBUG] Signal #${i+1}: symbol=${s.symbol}, quality=${s.quality}, quality_score=${s.quality_score}`);
+  });
+  const aiCandidates = parsedQualityTrades.filter(s =>
+    (typeof s.quality_score === 'number' && s.quality_score >= 90) ||
+    (typeof s.quality === 'number' && s.quality >= 90)
+  );
+  console.log('[DEBUG] AI Recommendation candidates (quality >= 90%):', aiCandidates);
+  if (aiCandidates.length > 0) {
+    aiRecommendedSignal = aiCandidates.reduce((best, curr) => {
+      const currQuality = curr.quality_score || curr.quality || 0;
+      const bestQuality = best ? (best.quality_score || best.quality || 0) : -1;
+      if (currQuality > bestQuality) return curr;
+      if (currQuality === bestQuality) {
+        const currConf = curr.confirmation_score || curr.confidence || 0;
+        const bestConf = best ? (best.confirmation_score || best.confidence || 0) : -1;
+        return currConf > bestConf ? curr : best;
       }
-    }
+      return best;
+    }, null);
+    console.log('[DEBUG] AI Recommended Signal (quality >= 90%):', aiRecommendedSignal);
+  } else {
+    aiRecommendedSignal = null;
+    console.log('[DEBUG] No AI Recommendation: No signal with quality >= 90%. qualityTrades:', parsedQualityTrades);
   }
 
   // Use quality trade if available, otherwise use AI recommended signal
@@ -1626,8 +1654,10 @@ const AutoTradingDashboard = () => {
         return;
       }
       await fetchData();
+      // Also refresh quality trades for AI Recommendation and signals every second
+      await scanMarketForQualityTrades(true);
       prevActiveTradesCount.current = activeTrades.length;
-    }, 2000);
+    }, 1000);
     return () => {
       clearTimeout(initialDataTimeout);
       clearInterval(dataRefreshInterval);
