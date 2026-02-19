@@ -1586,6 +1586,7 @@ async def execute(
     if not is_market_open(market_start, market_end, now_ist):
         raise HTTPException(status_code=403, detail="Market is closed. No trades can be started.")
 
+
     async with execute_lock:
         if len(active_trades) >= MAX_TRADES and not auto_demo:
             raise HTTPException(status_code=429, detail="Max active trades reached")
@@ -1593,6 +1594,31 @@ async def execute(
         existing = next((t for t in active_trades if t.get("status") == "OPEN"), None)
         if existing:
             raise HTTPException(status_code=429, detail="Another trade is already open")
+
+        # --- Symbol cooldown: prevent re-entry for 2 minutes after SL/exit ---
+        from datetime import datetime, timedelta
+        root = _symbol_root(trade.symbol)
+        cooldown_info = state.get("symbol_cooldowns", {}).get(root)
+        if cooldown_info and cooldown_info.get("exit_time"):
+            last_exit = cooldown_info["exit_time"]
+            try:
+                last_exit_dt = datetime.fromisoformat(last_exit)
+            except Exception:
+                last_exit_dt = None
+            if last_exit_dt:
+                now_dt = datetime.utcnow()
+                if (now_dt - last_exit_dt) < timedelta(minutes=2):
+                    raise HTTPException(status_code=429, detail=f"Cooldown active: Wait 2 minutes after last exit for {root} before re-entry.")
+
+        # --- AI recommendation confidence check (require >90%) ---
+        # If this trade is triggered by AI, require confidence >90
+        if hasattr(trade, 'confidence') and trade.confidence is not None:
+            try:
+                conf_val = float(trade.confidence)
+            except Exception:
+                conf_val = None
+            if conf_val is not None and conf_val < 90:
+                raise HTTPException(status_code=403, detail="AI recommendation confidence must be above 90% for auto-trade.")
 
         broker_response: Dict[str, any] = {}
 
