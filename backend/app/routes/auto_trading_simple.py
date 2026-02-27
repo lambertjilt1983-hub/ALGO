@@ -129,6 +129,8 @@ from app.engine.auto_trading_engine import AutoTradingEngine
 from app.engine.zerodha_broker import ZerodhaBroker
 from app.engine.simple_momentum_strategy import SimpleMomentumStrategy
 from app.core.market_hours import ist_now, is_market_open, market_status
+from app.engine.sl_recovery_manager import sl_recovery_manager, RecoverySignal
+from app.engine.ai_loss_restriction import ai_loss_restriction_engine
 
 
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
@@ -668,6 +670,10 @@ def _close_trade(trade: Dict[str, any], exit_price: float) -> None:
     else:
         state["consecutive_losses"] = 0
         logging.info(f"  ✅ Win! Resetting consecutive loss counter")
+    
+    # Record trade result in AI loss restriction engine for daily win rate tracking
+    symbol = trade.get("symbol") or trade.get("index")
+    ai_loss_restriction_engine.record_trade_result(symbol=symbol, pnl=pnl)
 
     # Persist closed trade to database for reporting
     try:
@@ -1869,6 +1875,21 @@ async def update_trade_price(symbol: str, price: float, authorization: Optional[
                 closed += 1
                 continue
             if _stop_hit(trade, price):
+                # Record SL hit with details for recovery
+                symbol = trade.get("symbol")
+                option_type = _option_kind(symbol)
+                entry_price = trade.get("price", 0.0)
+                entry_time = datetime.fromisoformat(trade.get("entry_time")) if isinstance(trade.get("entry_time"), str) else datetime.utcnow()
+                if symbol and option_type:
+                    sl_recovery_manager.record_sl_hit(
+                        symbol=symbol,
+                        option_type=option_type,
+                        entry_price=entry_price,
+                        exit_price=price,
+                        entry_time=entry_time,
+                        exit_time=datetime.utcnow()
+                    )
+                trade["exit_reason"] = "SL_HIT"
                 _close_trade(trade, price)
                 to_close.append(trade)
                 closed += 1
@@ -1900,6 +1921,225 @@ async def get_trade_history(limit: int = 50, authorization: Optional[str] = Head
     return {
         "trades": history[-limit:],
         "total_profit": sum(t.get("pnl", 0) for t in history[-limit:]),
+    }
+
+
+@router.get("/recovery-status")
+async def recovery_status(authorization: Optional[str] = Header(None)):
+    """
+    Get SL recovery status - which symbols need recovery signals
+    """
+    recovery_stats = sl_recovery_manager.get_recovery_stats()
+    
+    # Identify symbols that need recovery signals
+    symbols_needing_recovery = []
+    for base_symbol in recovery_stats['symbols_with_sl']:
+        can_retry, reason = sl_recovery_manager.can_retry(base_symbol)
+        if not can_retry and reason:
+            symbols_needing_recovery.append({
+                "symbol": base_symbol,
+                "reason": reason,
+                "retry_count": recovery_stats['retry_attempts'].get(base_symbol, 0)
+            })
+    
+    return {
+        "success": True,
+        "total_sl_hits": recovery_stats['total_sl_hits'],
+        "symbols_with_sl": recovery_stats['symbols_with_sl'],
+        "symbols_needing_recovery": symbols_needing_recovery,
+        "wait_minutes": recovery_stats['wait_minutes'],
+        "min_confidence": f"{recovery_stats['min_confidence']:.2%}",
+        "max_retries_per_day": recovery_stats['max_retries_per_day'],
+        "retry_attempts_today": recovery_stats['retry_attempts']
+    }
+
+
+@router.post("/recovery-signal")
+async def generate_recovery_signal(
+    base_symbol: str,
+    signal_confidence: float,
+    current_price: float,
+    recent_prices: Optional[List[float]] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Generate recovery signal after SL hit
+    Checks if symbol can be retried and provides a recovery action
+    """
+    can_retry, reason = sl_recovery_manager.can_retry(base_symbol)
+    
+    if not can_retry:
+        return {
+            "success": False,
+            "recommendation": "WAIT",
+            "reason": reason,
+            "can_trade": False
+        }
+    
+    # Get the last SL hit for this symbol to determine option type
+    sl_records = sl_recovery_manager.sl_hit_history.get(base_symbol, [])
+    last_option_type = sl_records[-1].option_type if sl_records else 'CE'
+    
+    recovery_signal = sl_recovery_manager.generate_recovery_signal(
+        base_symbol=base_symbol,
+        signal_confidence=signal_confidence,
+        current_price=current_price,
+        recent_prices=recent_prices,
+        last_sl_option_type=last_option_type
+    )
+    
+    should_execute, execution_reason = sl_recovery_manager.should_execute_recovery_trade(recovery_signal)
+    
+    # Increment retry counter if we're going to retry
+    if should_execute:
+        sl_recovery_manager.retry_attempts[base_symbol] = sl_recovery_manager.retry_attempts.get(base_symbol, 0) + 1
+    
+    return {
+        "success": True,
+        "symbol": recovery_signal.symbol,
+        "option_type": recovery_signal.option_type,
+        "recommendation": recovery_signal.recommendation,
+        "confidence": f"{recovery_signal.confidence:.2%}",
+        "market_trend": recovery_signal.market_trend,
+        "trend_strength": f"{recovery_signal.trend_strength:.2f}",
+        "reason": recovery_signal.reason,
+        "should_execute": should_execute,
+        "execution_reason": execution_reason,
+        "can_trade": should_execute,
+        "min_confidence_required": f"{sl_recovery_manager.min_confidence:.2%}"
+    }
+
+
+@router.post("/ai-evaluate-signal")
+async def ai_evaluate_signal(
+    symbol: str,
+    signal_confidence: float,
+    market_trend: str = "NEUTRAL",
+    trend_strength: float = 0.5,
+    option_type: str = "CE",
+    volatility_level: str = "MEDIUM",
+    rsi_level: int = 50,
+    macd_histogram: float = 0,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    AI-powered trade quality evaluation
+    Predicts win probability and determines if trade should be executed
+    Enforces 80% daily win rate (8 wins out of 10 trades)
+    """
+    
+    signal_data = {
+        'symbol': symbol,
+        'signal_confidence': signal_confidence,
+        'market_trend': market_trend,
+        'trend_strength': trend_strength,
+        'option_type': option_type,
+        'volatility_level': volatility_level,
+        'rsi_level': rsi_level,
+        'macd_histogram': macd_histogram,
+        'is_recovery_trade': False,
+        'consecutive_losses': state.get('consecutive_losses', 0),
+        'last_loss_time': state.get('last_loss_time'),
+    }
+    
+    # Evaluate signal using AI
+    prediction = ai_loss_restriction_engine.evaluate_signal(
+        symbol=symbol,
+        signal_data=signal_data,
+        all_recent_trades=history[-20:]  # Use recent trades for context
+    )
+    
+    # Get daily stats
+    daily_stats = ai_loss_restriction_engine.get_daily_analytics()
+    
+    return {
+        "success": True,
+        "symbol": prediction.symbol,
+        "signal_confidence": f"{prediction.signal_confidence:.2%}",
+        "predicted_win_probability": f"{prediction.predicted_win_probability:.2%}",
+        "recommendation": prediction.recommendation,
+        "confidence_level": prediction.confidence_level,
+        "risk_score": f"{prediction.risk_score:.2f}",
+        "reason": prediction.reason,
+        "expected_pnl_direction": prediction.expected_pnl_direction,
+        "can_execute": prediction.recommendation in ["EXECUTE"],
+        "daily_stats": {
+            "trades_executed": daily_stats['trades_executed'],
+            "trades_remaining": daily_stats['trades_remaining'],
+            "wins": daily_stats['wins'],
+            "losses": daily_stats['losses'],
+            "current_win_rate": f"{daily_stats['current_win_rate']:.1%}",
+            "required_win_rate": f"{daily_stats['required_win_rate']:.0%}",
+            "wins_needed": daily_stats['wins_needed'],
+            "status": daily_stats['status_message']
+        }
+    }
+
+
+@router.get("/ai-daily-analytics")
+async def ai_daily_analytics(authorization: Optional[str] = Header(None)):
+    """
+    Get detailed daily analytics with AI insights
+    Shows 80% win rate requirement progress (8 wins out of 10 trades)
+    """
+    
+    analytics = ai_loss_restriction_engine.get_daily_analytics()
+    symbol_report = ai_loss_restriction_engine.get_symbol_quality_report()
+    
+    return {
+        "success": True,
+        "date": analytics['date'],
+        "daily_quota": {
+            "trades_executed": analytics['trades_executed'],
+            "trades_remaining": analytics['trades_remaining'],
+            "daily_limit": analytics['daily_limit'],
+            "wins": analytics['wins'],
+            "losses": analytics['losses'],
+            "current_win_rate": f"{analytics['current_win_rate']:.1%}",
+            "required_win_rate": f"{analytics['required_win_rate']:.0%}",
+            "required_wins": analytics['required_wins'],
+            "wins_needed": analytics['wins_needed'],
+            "achievable": analytics['can_execute'],
+            "message": analytics['status_message']
+        },
+        "analytics": {
+            "recent_win_rate": analytics['analytics']['recent_win_rate'],
+            "recent_trades_count": analytics['analytics']['recent_trades_count'],
+            "cumulative_trades": analytics['analytics']['cumulative_trades'],
+            "cumulative_wins": analytics['analytics']['cumulative_wins'],
+            "cumulative_losses": analytics['analytics']['cumulative_losses'],
+            "cumulative_win_rate": f"{analytics['analytics']['cumulative_wins'] / analytics['analytics']['cumulative_trades']:.1%}" if analytics['analytics']['cumulative_trades'] > 0 else "N/A"
+        },
+        "symbol_quality": symbol_report,
+        "recommendation": "GREEN 🟢 - Ready to trade" if analytics['current_win_rate'] >= 0.70 else "YELLOW 🟡 - Proceed cautiously" if analytics['current_win_rate'] >= 0.50 else "RED 🔴 - Hold and improve"
+    }
+
+
+@router.get("/ai-symbol-quality")
+async def ai_symbol_quality(authorization: Optional[str] = Header(None)):
+    """
+    Get quality report for each symbol
+    Shows which symbols are performing well (>50% win rate)
+    """
+    
+    symbol_report = ai_loss_restriction_engine.get_symbol_quality_report()
+    
+    good_symbols = {k: v for k, v in symbol_report.items() if v['status'] == 'GOOD'}
+    caution_symbols = {k: v for k, v in symbol_report.items() if v['status'] == 'CAUTION'}
+    avoid_symbols = {k: v for k, v in symbol_report.items() if v['status'] == 'AVOID'}
+    
+    return {
+        "success": True,
+        "summary": {
+            "total_symbols": len(symbol_report),
+            "good_symbols": len(good_symbols),
+            "caution_symbols": len(caution_symbols),
+            "avoid_symbols": len(avoid_symbols)
+        },
+        "good_performers": good_symbols,
+        "caution_performers": caution_symbols,
+        "avoid_performers": avoid_symbols,
+        "all_symbols": symbol_report
     }
 
 
