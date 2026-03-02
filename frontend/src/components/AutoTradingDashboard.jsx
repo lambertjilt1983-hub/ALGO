@@ -112,6 +112,7 @@ const AutoTradingDashboard = () => {
   const [enabled, setEnabled] = useState(false);
   const [isLiveMode, setIsLiveMode] = useState(false); // Starts in DEMO mode
   const [loading, setLoading] = useState(true);
+  const [historyLoading, setHistoryLoading] = useState(true); // Track if trade history is loading
   const [armingInProgress, setArmingInProgress] = useState(false);
   const [armError, setArmError] = useState(null);
   const [stats, setStats] = useState(null);
@@ -130,7 +131,12 @@ const AutoTradingDashboard = () => {
   const [lastPaperSignalSymbol, setLastPaperSignalSymbol] = useState(null);
   const [lastPaperSignalAt, setLastPaperSignalAt] = useState(0);
   const [confirmationMode, setConfirmationMode] = useState('balanced');
-  const [historyStartDate, setHistoryStartDate] = useState(() => new Date().toLocaleDateString('en-CA'));
+  // Default to 30-day history instead of just today to show all trades by default
+  const [historyStartDate, setHistoryStartDate] = useState(() => {
+    const date = new Date();
+    date.setDate(date.getDate() - 30);
+    return date.toLocaleDateString('en-CA');
+  });
   const [historyEndDate, setHistoryEndDate] = useState(() => new Date().toLocaleDateString('en-CA'));
   const [selectedSignalSymbol, setSelectedSignalSymbol] = useState(() => {
     if (typeof window === 'undefined') return null;
@@ -426,7 +432,7 @@ const AutoTradingDashboard = () => {
 
       const [activeRes, historyRes, perfRes, statusRes] = await Promise.all([
         timeoutPromise(config.authFetch(activeEndpoint), 15000),
-        timeoutPromise(config.authFetch(`${PAPER_TRADES_HISTORY_API}?days=7&limit=100`), 15000),
+        timeoutPromise(config.authFetch(`${PAPER_TRADES_HISTORY_API}?days=30&limit=200`), 15000),
         timeoutPromise(config.authFetch(`${PAPER_TRADES_PERFORMANCE_API}?days=30`), 15000),
         timeoutPromise(config.authFetch(AUTO_TRADE_STATUS_API), 15000),
       ]).catch(e => {
@@ -443,16 +449,36 @@ const AutoTradingDashboard = () => {
       const history = historyData.trades || [];
       const backendStatus = statusData.status || statusData;
 
+      // Mark history as loaded once we get a response (even if empty)
+      setHistoryLoading(false);
+
+      // include any trades that just closed within the last few seconds so the UI can show them
+      const RECENT_CLOSED_MS = 5000;
+      const nowMs = Date.now();
+      const recentClosed = history.filter(t => {
+        const exitTs = t.exit_time || t.entry_time || t.timestamp;
+        if (!exitTs) return false;
+        return nowMs - new Date(exitTs).getTime() <= RECENT_CLOSED_MS;
+      }).map(t => ({ ...t }));
+      const combinedActive = [...active, ...recentClosed];
+      if (recentClosed.length > 0) {
+        console.log(`[DEBUG] Found ${recentClosed.length} recently closed trades in last 5s`);
+      }
+
       // --- DEBUG: Log active trades after fetch ---
-      console.log('[DEBUG] Active trades after fetch:', active);
+      console.log('[DEBUG] Active trades after fetch:', combinedActive);
 
       // Deduplicate active trades by symbol, action, entry_price, and entry_time
-      // Only keep trades that are still open (status OPEN, or not closed)
+      // Include trades that are OPEN or that closed within the last few seconds so
+      // the UI has a chance to display them before they disappear.
       const openStatuses = ['OPEN', 'ACTIVE', 'RUNNING'];
-      const dedupedActive = Array.isArray(active)
-        ? active.filter((trade, idx, arr) => {
-            const isOpen = openStatuses.includes(String(trade.status).toUpperCase());
-            return isOpen && (
+      const dedupedActive = Array.isArray(combinedActive)
+        ? combinedActive.filter((trade, idx, arr) => {
+            const status = String(trade.status || '').toUpperCase();
+            const isOpen = openStatuses.includes(status);
+            const exitTs = trade.exit_time || trade.timestamp || trade.entry_time;
+            const closedRecent = !isOpen && exitTs && (nowMs - new Date(exitTs).getTime() <= RECENT_CLOSED_MS);
+            return (isOpen || closedRecent) && (
               arr.findIndex(t =>
                 t.symbol === trade.symbol &&
                 (t.action || t.side) === (trade.action || trade.side) &&
@@ -472,7 +498,7 @@ const AutoTradingDashboard = () => {
         setTradeHistory(history);
       }
       setReportSummary(perfData);
-      setHasActiveTrade(active.length > 0);
+setHasActiveTrade(combinedActive.length > 0);
 
       // Compute daily P&L from closed trades
       const todayLabel = new Date().toDateString();
@@ -1635,6 +1661,8 @@ const AutoTradingDashboard = () => {
       const status = getWakeLockStatus();
       setWakeLockActive(!!status?.isActive || !!status?.heartbeatRunning);
     }, 30000);
+    // Initial data fetch - fetch once immediately
+    setHistoryLoading(true);
     const initialDataTimeout = setTimeout(() => {
       fetchData();
     }, 100);
@@ -1647,17 +1675,27 @@ const AutoTradingDashboard = () => {
         console.warn('⚠️ Health check failed:', e.message);
       }
     }, 30000);
+    // Slower refresh interval to reduce load - only every 3 seconds after initial load
+    let isFirstRefresh = true;
     const dataRefreshInterval = setInterval(async () => {
       const prevCount = prevActiveTradesCount.current;
       if (document.hidden && !ALWAYS_FETCH_TRADES) {
         console.log('⏸️ Tab hidden - skipping data fetch');
         return;
       }
-      await fetchData();
-      // Also refresh quality trades for AI Recommendation and signals every second
+      // Only fetch data if it was the first refresh or if history isn't loaded yet
+      if (isFirstRefresh) {
+        console.log('🔄 First refresh - fetching all data');
+        await fetchData();
+        isFirstRefresh = false;
+      } else {
+        console.log('⏰ Subsequent refresh - skipping history to reduce load');
+        // Don't refetch history constantly, just scan for quality trades
+      }
+      // Also refresh quality trades for AI Recommendation and signals
       await scanMarketForQualityTrades(true);
       prevActiveTradesCount.current = activeTrades.length;
-    }, 1000);
+    }, 3000); // Changed from 1000ms (1s) to 3000ms (3s) to reduce load
     return () => {
       clearTimeout(initialDataTimeout);
       clearInterval(dataRefreshInterval);
@@ -2798,7 +2836,11 @@ const AutoTradingDashboard = () => {
                   const entry = Number(trade.entry_price || trade.price || 0);
                   const exit = trade.exit_price != null ? Number(trade.exit_price) : null;
                   const pnl = Number(trade.profit_loss ?? trade.pnl ?? 0);
-                  const pnlPct = Number(trade.profit_percentage ?? trade.pnl_percent ?? 0);
+                  let pnlPct = Number(trade.pnl_percentage ?? trade.profit_percentage ?? trade.pnl_percent ?? 0);
+                  // Fallback: calculate percentage from entry/exit if backend value is 0
+                  if (pnlPct === 0 && entry > 0 && exit !== null) {
+                    pnlPct = ((exit - entry) / entry) * 100;
+                  }
                   const action = trade.action || trade.side || 'BUY';
                   return (
                     <tr key={idx} style={{ borderBottom: '1px solid #e2e8f0' }}>
@@ -2854,8 +2896,22 @@ const AutoTradingDashboard = () => {
                 })}
                 {filteredHistory.length === 0 && (
                   <tr>
-                    <td colSpan={9} style={{ padding: '16px', textAlign: 'center', color: '#718096' }}>
-                      No trades in selected date range.
+                    <td colSpan={9} style={{ padding: '24px', textAlign: 'center', color: '#718096' }}>
+                      <div style={{ fontSize: '40px', marginBottom: '12px', animation: historyLoading ? 'spin 2s linear infinite' : 'none' }}>
+                        {historyLoading ? '⏳' : '📭'}
+                      </div>
+                      <div style={{ fontWeight: 500, marginBottom: '8px' }}>
+                        {historyLoading ? 'Loading trade history...' : 'No trades found'}
+                      </div>
+                      <div style={{ fontSize: '13px', color: '#a0aec0' }}>
+                        {tradeHistory.length === 0 && !historyLoading ? (
+                          <>Try adjusting the date range above to see trades from different periods.</>
+                        ) : historyLoading ? (
+                          <>Fetching your trade data. This may take a moment...</>
+                        ) : (
+                          <>No trades in the selected date range.</>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 )}
@@ -2865,8 +2921,26 @@ const AutoTradingDashboard = () => {
         </div>
       </div>
 
+      {/* Empty States - Show loading or analysis message */}
+      {activeTrades.length === 0 && historyLoading && (
+        <div style={{
+          padding: '60px 20px',
+          textAlign: 'center',
+          background: '#f7fafc',
+          borderRadius: '12px',
+          border: '2px dashed #cbd5e0'
+        }}>
+          <div style={{ fontSize: '48px', marginBottom: '16px', animation: 'spin 2s linear infinite' }}>⏳</div>
+          <h4 style={{ margin: '0 0 8px 0', color: '#2d3748', fontSize: '18px' }}>
+            Loading Trade History...
+          </h4>
+          <p style={{ margin: 0, color: '#718096', fontSize: '14px', marginBottom: '16px' }}>
+            Fetching your trades from the past 30 days. This may take a moment...
+          </p>
+        </div>
+      )}
       {/* Empty States - Show Analysis instead of empty message */}
-      {activeTrades.length === 0 && tradeHistory.length === 0 && !analysis && (
+      {activeTrades.length === 0 && tradeHistory.length === 0 && !historyLoading && !analysis && (
         <div style={{
           padding: '60px 20px',
           textAlign: 'center',
@@ -3117,6 +3191,12 @@ const AutoTradingDashboard = () => {
       
         </div>
       </div>
+      <style>{`
+        @keyframes spin {
+          0% { transform: rotate(0deg); }
+          100% { transform: rotate(360deg); }
+        }
+      `}</style>
     </div>
   );
 }

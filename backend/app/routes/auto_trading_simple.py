@@ -633,12 +633,19 @@ def _maybe_update_trail(trade: Dict[str, Any], new_price: float) -> None:
                 trade["trail_stop"] = trail_stop
 
 def _close_trade(trade: Dict[str, any], exit_price: float) -> None:
-    qty = trade.get("quantity", 0) or 0
+    qty = trade.get("quantity", 1) or 1  # Default to 1 if missing
     side = trade.get("side", "BUY").upper()
     entry = trade.get("price", 0.0)
     pnl = (exit_price - entry) * qty * (1 if side == "BUY" else -1)
-    pnl_percentage = (pnl / (entry * qty) * 100) if entry and qty else 0.0
+    # Calculate percentage change per unit
+    pnl_percentage = ((exit_price - entry) / entry * 100) if entry else 0.0
     exit_dt = datetime.utcnow()
+    
+    # Skip ghost trades: entry == exit (zero P&L) and no recorded price movement
+    if abs(pnl) < 0.01 and exit_price == entry:
+        logging.warning(f"[TRADE SKIPPED] Ghost trade detected: entry={entry}, exit={exit_price}, P&L=₹0")
+        return
+    
     trade.update({
         "status": "CLOSED",
         "exit_price": exit_price,
