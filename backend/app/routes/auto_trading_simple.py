@@ -100,7 +100,14 @@ async def auto_close_trades_task():
 # Start background task on startup
 @router.on_event("startup")
 async def start_auto_close_trades():
+    # kick off background task to auto-close trades
     asyncio.create_task(auto_close_trades_task())
+    # bootstrap AI model from any existing history stored on disk
+    try:
+        ai_model.train_from_history(history)
+        logging.info(f"[AI MODEL] Trained on {len(history)} historical trades at startup")
+    except Exception as e:
+        logging.error(f"[AI MODEL] Failed to train on startup history: {e}")
 """Auto Trading Engine wired to live market data (no mocks)."""
 
 import math
@@ -660,6 +667,11 @@ def _close_trade(trade: Dict[str, any], exit_price: float) -> None:
             "exit_time": exit_dt.isoformat(),
         }
     history.append(trade.copy())
+    # update AI model with the new trade so it can learn from its outcome
+    try:
+        ai_model.train_from_history([trade])
+    except Exception as e:
+        logging.error(f"[AI MODEL] Error updating model from history: {e}")
     
     # Track daily P&L (both loss and profit)
     state["daily_loss"] += pnl
@@ -910,12 +922,13 @@ def _signal_from_index(symbol: str, data: Dict[str, any], instrument_type: str, 
     direction = "BUY" if change_pct >= 0 else "SELL"
 
     uptrend = 1 if (data.get("trend", "").lower() == "uptrend") else 0
-    ai_decision = ai_model.predict([change_pct, data.get("rsi", 50), uptrend])
-
-    if ai_decision != 1:
-        logging.info(f"[AI MODEL] {symbol}: AI model did not predict BUY (decision={ai_decision})")
+    # ask model for probability of profitable move
+    ai_prob = ai_model.predict([change_pct, data.get("rsi", 50), uptrend], probability=True)
+    logging.info(f"[AI MODEL] {symbol}: profitability probability={ai_prob:.2f}")
+    # require at least 60% chance of profit (tunable threshold)
+    if ai_prob < 0.60:
+        logging.info(f"[AI MODEL] {symbol}: skipping signal due to low AI probability")
         return None
-    logging.info(f"[AI MODEL] {symbol}: AI model predicted BUY (decision={ai_decision})")
 
     # --- Simple momentum-only signal logic ---
     if abs(change_pct) < 0.1:  # Only require 0.1% move for signal
@@ -937,6 +950,14 @@ def _signal_from_index(symbol: str, data: Dict[str, any], instrument_type: str, 
     target = price + target_move if direction == "BUY" else price - target_move
     stop_loss = price - stop_move if direction == "BUY" else price + stop_move
 
+    # include AI probability in signal metadata
+    signal = {
+        "symbol": symbol,
+        "price": price,
+        "direction": direction,
+        "change_pct": change_pct,
+        "ai_probability": ai_prob,
+    }
     # Respect nearby support/resistance when available (keep a small buffer)
     if direction == "BUY" and support:
         stop_loss = round(support * 0.997, 2)  # just below support
@@ -980,6 +1001,7 @@ def _signal_from_index(symbol: str, data: Dict[str, any], instrument_type: str, 
     today_str = datetime.now().strftime("%d-%b-%Y")
 
     return {
+        **signal,
         "symbol": f"{symbol} INDEX",
         "action": direction,
         "confidence": round(confidence, 2),

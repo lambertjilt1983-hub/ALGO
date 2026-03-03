@@ -113,6 +113,7 @@ const AutoTradingDashboard = () => {
   const [isLiveMode, setIsLiveMode] = useState(false); // Starts in DEMO mode
   const [loading, setLoading] = useState(true);
   const [historyLoading, setHistoryLoading] = useState(true); // Track if trade history is loading
+  const [activeLoading, setActiveLoading] = useState(true); // Track if active trades are being fetched
   const [armingInProgress, setArmingInProgress] = useState(false);
   const [armError, setArmError] = useState(null);
   const [stats, setStats] = useState(null);
@@ -409,6 +410,8 @@ const AutoTradingDashboard = () => {
         return;
       }
       fetchData.isRunning = true;
+      // mark active trades loading before network call
+      setActiveLoading(true);
 
       // Fetch trade data in parallel with 8s timeout each
       const timeoutPromise = (promise, ms) => Promise.race([
@@ -498,7 +501,8 @@ const AutoTradingDashboard = () => {
         setTradeHistory(history);
       }
       setReportSummary(perfData);
-setHasActiveTrade(combinedActive.length > 0);
+      setHasActiveTrade(combinedActive.length > 0);
+      setActiveLoading(false); // finished fetching active data
 
       // Compute daily P&L from closed trades
       const todayLabel = new Date().toDateString();
@@ -547,6 +551,7 @@ setHasActiveTrade(combinedActive.length > 0);
     } finally {
       fetchData.isRunning = false;
       setLoading(false);
+      setActiveLoading(false); // make sure spinner stops even on error
     }
   };
 
@@ -1663,6 +1668,7 @@ setHasActiveTrade(combinedActive.length > 0);
     }, 30000);
     // Initial data fetch - fetch once immediately
     setHistoryLoading(true);
+    setActiveLoading(true);
     const initialDataTimeout = setTimeout(() => {
       fetchData();
     }, 100);
@@ -2087,7 +2093,14 @@ setHasActiveTrade(combinedActive.length > 0);
             {' • '}Max {stats?.max_trades || 10} Concurrent Trades
             {activeTrades.length > 0 && (
               <span style={{ color: '#f56565', fontWeight: '600' }}>
-                {' '}• 🔒 {activeTrades.length} TRADE{activeTrades.length > 1 ? 'S' : ''} ACTIVE - Waiting to close...
+                {' '}
+            {activeLoading && activeTrades.length === 0 ? (
+              <span style={{ color: '#718096', fontStyle: 'italic' }}>• Loading active trades…</span>
+            ) : (
+              <span style={{ color: '#f56565', fontWeight: '600' }}>
+                • 🔒 {activeTrades.length} TRADE{activeTrades.length > 1 ? 'S' : ''} ACTIVE - Waiting to close...
+              </span>
+            )}
               </span>
             )}
           </p>
@@ -2103,8 +2116,8 @@ setHasActiveTrade(combinedActive.length > 0);
           }}>
             <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Active Trades</div>
             <div style={{ fontSize: '32px', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '8px' }}>
-              {(stats?.active_trades_count ?? 0)} / {(stats?.max_trades ?? 2)}
-              {(stats?.active_trades_count ?? 0) >= (stats?.max_trades ?? 2) && (
+              {activeLoading ? '⏳' : (stats?.active_trades_count ?? 0)} / {(stats?.max_trades ?? 2)}
+              {!activeLoading && (stats?.active_trades_count ?? 0) >= (stats?.max_trades ?? 2) && (
                 <span style={{ fontSize: '16px', background: '#fc8181', padding: '2px 8px', borderRadius: '4px' }}>FULL</span>
               )}
             </div>
@@ -2598,7 +2611,9 @@ setHasActiveTrade(combinedActive.length > 0);
         }}>
           ⚡ Active Trades (LIVE P&L)
         </h4>
-        {activeTrades.length > 0 ? (
+        {activeLoading ? (
+          <p style={{ color: '#718096', fontStyle: 'italic' }}>Loading active trades…</p>
+        ) : activeTrades.length > 0 ? (
           <div style={{ overflowX: 'auto' }}>
             <table style={{
               width: '100%',
@@ -2827,6 +2842,7 @@ setHasActiveTrade(combinedActive.length > 0);
                   <th style={{ padding: '10px', textAlign: 'right' }}>Exit</th>
                   <th style={{ padding: '10px', textAlign: 'right' }}>P&L</th>
                   <th style={{ padding: '10px', textAlign: 'right' }}>%</th>
+                  <th style={{ padding: '10px', textAlign: 'right' }}>AI Prob</th>
                   <th style={{ padding: '10px', textAlign: 'left' }}>Status</th>
                   <th style={{ padding: '10px', textAlign: 'left' }}>Exit Time</th>
                 </tr>
@@ -2876,6 +2892,14 @@ setHasActiveTrade(combinedActive.length > 0);
                       }}>
                         {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%
                       </td>
+                      <td style={{
+                        padding: '10px',
+                        textAlign: 'right',
+                        fontWeight: '600',
+                        color: (trade.ai_probability || 0) >= 0.5 ? '#48bb78' : '#f56565'
+                      }}>
+                        {(trade.ai_probability != null ? (trade.ai_probability*100).toFixed(1) + '%' : '-')}
+                      </td>
                       <td style={{ padding: '10px' }}>
                         <span style={{
                           padding: '2px 6px',
@@ -2922,7 +2946,7 @@ setHasActiveTrade(combinedActive.length > 0);
       </div>
 
       {/* Empty States - Show loading or analysis message */}
-      {activeTrades.length === 0 && historyLoading && (
+      {activeTrades.length === 0 && (historyLoading || activeLoading) && (
         <div style={{
           padding: '60px 20px',
           textAlign: 'center',
@@ -2940,7 +2964,7 @@ setHasActiveTrade(combinedActive.length > 0);
         </div>
       )}
       {/* Empty States - Show Analysis instead of empty message */}
-      {activeTrades.length === 0 && tradeHistory.length === 0 && !historyLoading && !analysis && (
+      {activeTrades.length === 0 && tradeHistory.length === 0 && !historyLoading && !activeLoading && !analysis && (
         <div style={{
           padding: '60px 20px',
           textAlign: 'center',
