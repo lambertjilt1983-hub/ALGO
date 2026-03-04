@@ -652,7 +652,8 @@ def _close_trade(trade: Dict[str, any], exit_price: float) -> None:
     pnl = (exit_price - entry) * qty * (1 if side == "BUY" else -1)
     # Calculate percentage change per unit
     pnl_percentage = ((exit_price - entry) / entry * 100) if entry else 0.0
-    exit_dt = datetime.utcnow()
+    from datetime import timedelta
+    exit_dt = datetime.utcnow() + timedelta(hours=5, minutes=30)  # Convert UTC to IST
     
     # Skip ghost trades: entry == exit (zero P&L) and no recorded price movement
     if abs(pnl) < 0.01 and exit_price == entry:
