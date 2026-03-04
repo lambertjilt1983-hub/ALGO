@@ -506,9 +506,7 @@ const AutoTradingDashboard = () => {
       } else {
         setActiveTrades([]);
       }
-      if (history && history.length > 0) {
-        setTradeHistory(history);
-      }
+      setTradeHistory(history);
       setReportSummary(perfData);
       setHasActiveTrade(combinedActive.length > 0);
       // hide spinner only if we showed it earlier
