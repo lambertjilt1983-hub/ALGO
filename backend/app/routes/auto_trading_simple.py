@@ -1730,10 +1730,70 @@ async def execute(
 
 
 @router.get("/trades/active")
-async def get_active_trades(authorization: Optional[str] = Header(None)):
-    logging.info(f"[API /trades/active] Returning {len(active_trades)} active trades from Zerodha")
-    trades = active_trades
+async def get_active_trades(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+    token: str = Depends(AuthService.verify_bearer_token),
+):
+    """Return list of currently open trades with DB fallback.
+    
+    Attempts to fetch live broker positions first; if none available,
+    falls back to persisted OPEN trades from the database.
+    """
+    logging.info(f"[API /trades/active] Returning {len(active_trades)} active trades (memory)")
+    trades = list(active_trades)
+
+    # Try to overlay with live broker positions if possible
+    try:
+        payload = AuthService.verify_token(token)
+        user_id = int(payload.get("sub"))
+        cred = BrokerAuthService.get_credentials(user_id=user_id, broker_name="zerodha", db=db)
+        api_key = _safe_decrypt(getattr(cred, "api_key", None))
+        api_secret = _safe_decrypt(getattr(cred, "api_secret", None))
+        access_token = _safe_decrypt(getattr(cred, "access_token", None))
+
+        from app.core.trading_engine import OrderExecutor
+        executor = OrderExecutor("zerodha", {"api_key": api_key, "api_secret": api_secret, "access_token": access_token})
+        positions = await executor.get_positions()
+        if positions:
+            broker_trades = []
+            for pos in positions:
+                broker_trades.append({
+                    "symbol": pos.symbol,
+                    "quantity": pos.quantity,
+                    "entry_price": getattr(pos, "average_price", None) or getattr(pos, "entry_price", None),
+                    "current_price": getattr(pos, "last_price", None),
+                    "side": pos.side,
+                    "status": "OPEN",
+                })
+            trades = broker_trades
+            logging.info(f"[API /trades/active] Overriding with {len(trades)} broker positions")
+    except Exception as e:
+        logging.warning(f"[API /trades/active] failed to fetch broker positions: {e}")
+
+    # If no trades from broker and we have persisted OPEN reports, include them
+    if not trades:
+        try:
+            reports = db.query(TradeReport).filter(TradeReport.status == "OPEN").all()
+            if reports:
+                logging.info(f"[API /trades/active] Adding {len(reports)} open trades from DB")
+                trades = []
+                for r in reports:
+                    trades.append({
+                        "symbol": r.symbol,
+                        "quantity": r.quantity,
+                        "entry_price": r.entry_price,
+                        "current_price": None,
+                        "side": r.side,
+                        "status": "OPEN",
+                        "entry_time": r.entry_time.isoformat() if r.entry_time else None,
+                        "meta": r.meta,
+                    })
+        except Exception as e:
+            logging.warning(f"[API /trades/active] failed to fetch open reports: {e}")
+
     return {"trades": trades, "is_demo_mode": False, "count": len(trades)}
+
 
 
 @router.post("/trades/update-prices")
@@ -1871,19 +1931,9 @@ async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
     }
 
 
-@router.get("/trades/active")
-async def get_active_trades(authorization: Optional[str] = Header(None)):
-    trades = active_trades
-    # Add more status details
-    for t in trades:
-        entry_price = t.get("entry_price", 0)
-        if entry_price is None:
-            entry_price = 0.0
-        current_price = t.get("current_price")
-        if current_price is None:
-            current_price = entry_price
-        t["unrealized_pnl"] = (current_price - entry_price) * t.get("quantity", 0)
-    return {"trades": trades, "is_demo_mode": False, "count": len(trades)}
+# Duplicate simple active-trades endpoint removed so the DB-backed implementation
+# defined earlier in this module is used. The real endpoint attempts to fetch
+# broker positions and falls back to persisted OPEN TradeReport rows.
 
 
 @router.post("/trades/price")
