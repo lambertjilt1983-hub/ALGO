@@ -116,6 +116,7 @@ const AutoTradingDashboard = () => {
   const [isLiveMode, setIsLiveMode] = useState(false); // Starts in DEMO mode
   const [loading, setLoading] = useState(true);
   const [historyLoading, setHistoryLoading] = useState(true); // Track if trade history is loading
+  const [lastHistoryTs, setLastHistoryTs] = useState(null); // ISO timestamp of most recent trade in history, for incremental updates
   const [activeLoading, setActiveLoading] = useState(true); // Track if active trades are being fetched
   const [armingInProgress, setArmingInProgress] = useState(false);
   const [armError, setArmError] = useState(null);
@@ -136,12 +137,24 @@ const AutoTradingDashboard = () => {
   const [lastPaperSignalAt, setLastPaperSignalAt] = useState(0);
   const [confirmationMode, setConfirmationMode] = useState('balanced');
   // Default to 30-day history instead of just today to show all trades by default
+  const formatISO = (d) => d.toISOString().slice(0,10);
   const [historyStartDate, setHistoryStartDate] = useState(() => {
+    // load from storage if available (persists across reloads)
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('historyStartDate');
+      if (saved) return saved;
+    }
     const date = new Date();
     date.setDate(date.getDate() - 30);
-    return date.toLocaleDateString('en-CA');
+    return formatISO(date);
   });
-  const [historyEndDate, setHistoryEndDate] = useState(() => new Date().toLocaleDateString('en-CA'));
+  const [historyEndDate, setHistoryEndDate] = useState(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('historyEndDate');
+      if (saved) return saved;
+    }
+    return formatISO(new Date());
+  });
   const [selectedSignalSymbol, setSelectedSignalSymbol] = useState(() => {
     if (typeof window === 'undefined') return null;
     return localStorage.getItem('selectedSignalSymbol');
@@ -442,9 +455,13 @@ const AutoTradingDashboard = () => {
         console.log('[DEBUG] Price update fetch failed or not ok');
       }
 
+      // build history URL - fetch full history, let backend handle caching with etag if needed
+      // Store in localStorage to persist across refreshes
+      let historyUrl = `${PAPER_TRADES_HISTORY_API}?days=30&limit=200`;
+      console.log('[DEBUG] history fetch url:', historyUrl);
       const [activeRes, historyRes, perfRes, statusRes] = await Promise.all([
         timeoutPromise(config.authFetch(activeEndpoint), 15000),
-        timeoutPromise(config.authFetch(`${PAPER_TRADES_HISTORY_API}?days=30&limit=200`), 15000),
+        timeoutPromise(config.authFetch(historyUrl), 15000),
         timeoutPromise(config.authFetch(`${PAPER_TRADES_PERFORMANCE_API}?days=30`), 15000),
         timeoutPromise(config.authFetch(AUTO_TRADE_STATUS_API), 15000),
       ]).catch(e => {
@@ -453,12 +470,50 @@ const AutoTradingDashboard = () => {
       });
 
       const activeData = activeRes?.ok ? await activeRes.json() : { trades: [] };
-      const historyData = historyRes?.ok ? await historyRes.json() : { trades: [] };
+      // parse history only on successful response
+      let history = [];
+      if (historyRes?.ok) {
+        try {
+          const parsed = await historyRes.json();
+          history = parsed.trades || [];
+          console.log('[DEBUG] Fetched history from backend:', history.length, 'trades');
+          // Save to localStorage for persistence
+          if (history.length > 0) {
+            localStorage.setItem('tradeHistory', JSON.stringify(history));
+            console.log('[DEBUG] Saved', history.length, 'trades to localStorage');
+          }
+        } catch (e) {
+          console.error('[DEBUG] Error parsing history response', e);
+          // Try to restore from localStorage if fetch failed
+          try {
+            const saved = localStorage.getItem('tradeHistory');
+            if (saved) {
+              history = JSON.parse(saved);
+              console.log('[DEBUG] Restored', history.length, 'trades from localStorage');
+            }
+          } catch (storageErr) {
+            console.error('[DEBUG] Error restoring from localStorage', storageErr);
+          }
+        }
+      } else {
+        // Fetch failed - restore from localStorage
+        try {
+          const saved = localStorage.getItem('tradeHistory');
+          if (saved) {
+            history = JSON.parse(saved);
+            console.log('[DEBUG] Fetch failed. Restored', history.length, 'trades from localStorage');
+          }
+        } catch (storageErr) {
+          console.error('[DEBUG] Error restoring from localStorage after fetch failure', storageErr);
+        }
+      }
+      const active = activeData.trades || [];
+      console.log('[DEBUG] activeData.trades count', active.length);
+      const prevHistLen = tradeHistory.length;
+      console.log('[DEBUG] history count', history.length, '(previous', prevHistLen + ')');
+      
       const perfData = perfRes?.ok ? await perfRes.json() : null;
       const statusData = statusRes?.ok ? await statusRes.json() : {};
-
-      const active = activeData.trades || [];
-      const history = historyData.trades || [];
       const backendStatus = statusData.status || statusData;
 
       // Mark history as loaded once we get a response (even if empty)
@@ -1728,15 +1783,14 @@ const AutoTradingDashboard = () => {
         console.log('⏸️ Tab hidden - skipping data fetch');
         return;
       }
-      // Only fetch data if it was the first refresh or if history isn't loaded yet
       if (isFirstRefresh) {
         console.log('🔄 First refresh - fetching all data');
-        await fetchData();
         isFirstRefresh = false;
       } else {
-        console.log('⏰ Subsequent refresh - skipping history to reduce load');
-        // Don't refetch history constantly, just scan for quality trades
+        console.log('🔄 Subsequent refresh - fetching all data');
       }
+      // fetchData itself guards against concurrent execution
+      await fetchData();
       // Also refresh quality trades for AI Recommendation and signals
       await scanMarketForQualityTrades(true);
       prevActiveTradesCount.current = activeTrades.length;
@@ -1952,7 +2006,8 @@ const AutoTradingDashboard = () => {
   const dateFilteredHistory = tradeHistory.filter((trade) => {
     const ts = trade.exit_time || trade.entry_time || trade.timestamp;
     if (!ts) return false;
-    const tradeDate = new Date(ts).toLocaleDateString('en-CA');
+    // always use ISO date (YYYY-MM-DD) so filtering works reliably
+    const tradeDate = new Date(ts).toISOString().slice(0, 10);
     if (historyStartDate && tradeDate < historyStartDate) return false;
     if (historyEndDate && tradeDate > historyEndDate) return false;
     return true;
@@ -2800,6 +2855,11 @@ const AutoTradingDashboard = () => {
               type="date"
               value={historyStartDate}
               onChange={(e) => setHistoryStartDate(e.target.value)}
+              onBlur={() => {
+                if (typeof window !== 'undefined') {
+                  localStorage.setItem('historyStartDate', historyStartDate);
+                }
+              }}
               style={{
                 padding: '6px 10px',
                 border: '1px solid #e2e8f0',
@@ -2812,6 +2872,11 @@ const AutoTradingDashboard = () => {
               type="date"
               value={historyEndDate}
               onChange={(e) => setHistoryEndDate(e.target.value)}
+              onBlur={() => {
+                if (typeof window !== 'undefined') {
+                  localStorage.setItem('historyEndDate', historyEndDate);
+                }
+              }}
               style={{
                 padding: '6px 10px',
                 border: '1px solid #e2e8f0',
@@ -2821,9 +2886,13 @@ const AutoTradingDashboard = () => {
             />
             <button
               onClick={() => {
-                const today = new Date().toISOString().slice(0, 10);
+                        const today = new Date().toISOString().slice(0, 10);
                 setHistoryStartDate(today);
                 setHistoryEndDate(today);
+                if (typeof window !== 'undefined') {
+                  localStorage.setItem('historyStartDate', today);
+                  localStorage.setItem('historyEndDate', today);
+                }
               }}
               style={{
                 padding: '6px 10px',
@@ -2991,24 +3060,7 @@ const AutoTradingDashboard = () => {
         </div>
       </div>
 
-      {/* Empty States - Show loading or analysis message */}
-      {activeTrades.length === 0 && (historyLoading || activeLoading) && (
-        <div style={{
-          padding: '60px 20px',
-          textAlign: 'center',
-          background: '#f7fafc',
-          borderRadius: '12px',
-          border: '2px dashed #cbd5e0'
-        }}>
-          <div style={{ fontSize: '48px', marginBottom: '16px', animation: 'spin 2s linear infinite' }}>⏳</div>
-          <h4 style={{ margin: '0 0 8px 0', color: '#2d3748', fontSize: '18px' }}>
-            Loading Trade History...
-          </h4>
-          <p style={{ margin: 0, color: '#718096', fontSize: '14px', marginBottom: '16px' }}>
-            Fetching your trades from the past 30 days. This may take a moment...
-          </p>
-        </div>
-      )}
+      {/* Loading state removed - auto-load history silently in background */}
       {/* Empty States - Show Analysis instead of empty message */}
       {activeTrades.length === 0 && tradeHistory.length === 0 && !historyLoading && !activeLoading && !analysis && (
         <div style={{

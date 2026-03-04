@@ -126,17 +126,41 @@ def get_active_paper_trades(db: Session = Depends(get_db)):
 def get_paper_trade_history(
     days: int = 7,
     limit: int = 100,
+    since: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    """Get closed paper trades history"""
-    since_date = date.today() - timedelta(days=days)
-    
-    trades = db.query(PaperTrade).filter(
-        and_(
-            PaperTrade.status != "OPEN",
-            PaperTrade.trading_date >= since_date
-        )
-    ).order_by(PaperTrade.exit_time.desc()).limit(limit).all()
+    """Get closed paper trades history
+
+    If ``since`` is provided the endpoint will return only trades whose
+    ``exit_time`` is strictly greater than the given timestamp.  This makes it
+    cheaper for clients to poll for new records without re-fetching the entire
+    history every time.  When ``since`` is absent the behaviour is unchanged
+    and the ``days`` parameter is used as before.
+    """
+    query = db.query(PaperTrade).filter(PaperTrade.status != "OPEN")
+
+    # debug logging so we can see what value was received
+    print("[DEBUG] paper-trades/history since parameter (raw):", since)
+
+    if since:
+        try:
+            # Parse ISO format string manually - FastAPI has trouble with query param datetimes
+            since_dt = datetime.fromisoformat(since.replace('Z', '+00:00'))
+            # Strip timezone info (store times in UTC/naive) so comparison works
+            if since_dt.tzinfo is not None:
+                from datetime import timezone
+                since_dt = since_dt.astimezone(timezone.utc).replace(tzinfo=None)
+            print("[DEBUG] Parsed since_dt:", since_dt)
+            query = query.filter(PaperTrade.exit_time > since_dt)
+        except Exception as e:
+            print("[ERROR] Failed to parse since parameter:", e)
+            raise HTTPException(status_code=400, detail=f"Invalid since format: {str(e)}")
+    else:
+        since_date = date.today() - timedelta(days=days)
+        since_datetime = datetime.combine(since_date, datetime.min.time())
+        query = query.filter(PaperTrade.exit_time >= since_datetime)
+
+    trades = query.order_by(PaperTrade.exit_time.desc()).limit(limit).all()
     
     return {
         "success": True,

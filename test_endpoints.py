@@ -19,6 +19,9 @@ endpoints = [
     ("GET", "/autotrade/trades/history", None),
     ("GET", "/autotrade/market/indices", None),
     ("POST", "/autotrade/execute?symbol=NIFTY&price=25000", None),
+    # verify paper trading history behaves (first full, then since filter)
+    ("GET", "/paper-trades/history?days=1", None),
+    ("GET", "/paper-trades/history?since=2000-01-01T00:00:00Z", None),
 ]
 
 passed = 0
