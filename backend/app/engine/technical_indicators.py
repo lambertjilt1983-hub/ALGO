@@ -212,6 +212,25 @@ def calculate_comprehensive_signals(
     # Signal strength calculation (0-100)
     signal_strength = 0
     signals = []
+    # --- custom band indicator (green/red) used for CE/PE signals ---
+    # we approximate the screenshot by using a fast/slow EMA ribbon.  the
+    # band turns green when ema9 > ema21, red otherwise.  a crossover from
+    # red->green produces a buy (CE) cue; green->red produces a sell (PE) cue.
+    band_signal = None
+    try:
+        ema9_vals = pd.Series(prices).ewm(span=9, adjust=False).mean()
+        ema21_vals = pd.Series(prices).ewm(span=21, adjust=False).mean()
+        if len(ema9_vals) >= 2 and len(ema21_vals) >= 2:
+            prev_color = 'green' if ema9_vals.iloc[-2] > ema21_vals.iloc[-2] else 'red'
+            cur_color = 'green' if ema9_vals.iloc[-1] > ema21_vals.iloc[-1] else 'red'
+            if prev_color == 'red' and cur_color == 'green':
+                band_signal = 'BUY_CE'
+                signals.append('📈 Band crossover BUY (CE)')
+            elif prev_color == 'green' and cur_color == 'red':
+                band_signal = 'SELL_PE'
+                signals.append('📉 Band crossover SELL (PE)')
+    except Exception:
+        band_signal = None
     
     # RSI signals (25 points)
     if rsi > 70:
@@ -276,6 +295,7 @@ def calculate_comprehensive_signals(
         "support_resistance": support_resistance,
         "signal_strength": signal_strength,
         "signals": signals,
+        "band_signal": band_signal,
         "recommendation": recommendation,
         "timestamp": pd.Timestamp.now().isoformat()
     }

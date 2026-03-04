@@ -6,7 +6,7 @@ import React, { useState, useEffect } from 'react';
  * 🚀 PERFORMANCE OPTIMIZATIONS APPLIED:
  * 
  * 1. REDUCED POLLING FREQUENCY
- *    - Data refresh: 5 seconds (was 2s)
+ *    - Data refresh: 5 seconds (was 2s), now 1s when active trades are present
  *    - Price updates: 8 seconds (was every data fetch)
  *    - Health checks: 30 seconds
  *    - Professional signals: 60 seconds
@@ -37,6 +37,9 @@ import { initializeWakeLock, getWakeLockStatus, releaseWakeLock, startKeepAliveH
 const OPTION_SIGNALS_API = `${config.API_BASE_URL}/option-signals/intraday-advanced`;
 const PROFESSIONAL_SIGNAL_API = `${config.API_BASE_URL}/strategies/live/professional-signal`;
 const PAPER_TRADES_ACTIVE_API = `${config.API_BASE_URL}/paper-trades/active`;
+
+// scanner threshold for displayed quality trades
+const QUALITY_THRESHOLD = 85;  // show only signals with quality >= this value
 const PAPER_TRADES_HISTORY_API = `${config.API_BASE_URL}/paper-trades/history`;
 const PAPER_TRADES_PERFORMANCE_API = `${config.API_BASE_URL}/paper-trades/performance`;
 const PAPER_TRADES_CREATE_API = `${config.API_BASE_URL}/paper-trades`;
@@ -260,7 +263,7 @@ const AutoTradingDashboard = () => {
 
     return {
       quality,
-      isExcellent: quality >= 85,
+      isExcellent: quality >= QUALITY_THRESHOLD,
       isGood: quality >= 60,
       factors: {
         confidenceScore: Math.round(confidenceScore),
@@ -338,7 +341,7 @@ const AutoTradingDashboard = () => {
   // --- Professional Signal Integration ---
 
 
-  // Market Quality Scanner - finds all 75%+ quality trades
+  // Market Quality Scanner - finds all 85%+ quality trades
   const scanMarketForQualityTrades = async (force = false) => {
     // Only scan if never scanned, or >1 hour since last scan, or force is true
     const now = Date.now();
@@ -349,7 +352,7 @@ const AutoTradingDashboard = () => {
       return;
     }
     setScannerLoading(true);
-    console.log('🔍 Scanning entire market for quality trades (75%+)...');
+    console.log(`🔍 Scanning entire market for quality trades (${QUALITY_THRESHOLD}%+)...`);
     try {
       // Fetch all signals from the market
       const res = await config.authFetch(`${OPTION_SIGNALS_API}?include_nifty50=true`);
@@ -375,15 +378,15 @@ const AutoTradingDashboard = () => {
           factors: quality.factors,
           rr,
           optimalRR,
-          recommendation: quality.quality >= 85 ? '⭐ EXCELLENT' : quality.quality >= 75 ? '✅ GOOD' : '❌ POOR'
+          recommendation: quality.quality >= QUALITY_THRESHOLD ? '⭐ EXCELLENT' : quality.quality >= 75 ? '✅ GOOD' : '❌ POOR'
         };
       });
       console.log(`[DEBUG] After quality scoring: ${qualityScores.length} signals`);
-      // Filter only 50%+ quality trades and sort by quality descending (weighted scoring)
+      // Filter only trades meeting the 85% threshold and sort by quality descending
       const qualityOnly = qualityScores
-        .filter(s => s.quality >= 0)
+        .filter(s => s.quality >= QUALITY_THRESHOLD)
         .sort((a, b) => b.quality - a.quality);
-      console.log(`[DEBUG] After quality >= 0 filter: ${qualityOnly.length} signals`);
+      console.log(`[DEBUG] After quality >= ${QUALITY_THRESHOLD} filter: ${qualityOnly.length} signals`);
       // Log top 5 trades for debugging
       qualityOnly.slice(0, 5).forEach((t, i) => {
         console.log(`  #${i+1}: ${t.symbol} - Quality: ${t.quality}% (Confidence: ${t.factors?.confidenceScore?.toFixed(1)}, RR: ${t.factors?.rrScore?.toFixed(1)}, Win Rate: ${t.factors?.winRateScore?.toFixed(1)})`);
@@ -403,16 +406,22 @@ const AutoTradingDashboard = () => {
 
   // Remove legacy fetchData logic (config references)
   const fetchData = async () => {
-    try {
-      // Skip if already fetching (prevent duplicate calls)
-      if (fetchData.isRunning) {
-        console.log('⏭️ Skipping - fetch already in progress');
-        return;
-      }
-      fetchData.isRunning = true;
-      // mark active trades loading before network call
-      setActiveLoading(true);
-
+      // determine if we need to show the "loading" indicator
+      // only when we currently have no active trade rows to display.
+      const shouldShowLoading = activeTrades.length === 0;
+      try {
+        // Skip if already fetching (prevent duplicate calls)
+        if (fetchData.isRunning) {
+          console.log('⏭️ Skipping - fetch already in progress');
+          // make sure spinner isn't left permanently visible
+          if (shouldShowLoading) setActiveLoading(false);
+          // also clear stale flag just in case it was stuck
+          fetchData.isRunning = false;
+          return;
+        }
+        fetchData.isRunning = true;
+        // only show spinner if there's nothing on screen yet
+        if (shouldShowLoading) setActiveLoading(true);
       // Fetch trade data in parallel with 8s timeout each
       const timeoutPromise = (promise, ms) => Promise.race([
         promise,
@@ -502,7 +511,8 @@ const AutoTradingDashboard = () => {
       }
       setReportSummary(perfData);
       setHasActiveTrade(combinedActive.length > 0);
-      setActiveLoading(false); // finished fetching active data
+      // hide spinner only if we showed it earlier
+      if (shouldShowLoading) setActiveLoading(false); // finished fetching active data
 
       // Compute daily P&L from closed trades
       const todayLabel = new Date().toDateString();
@@ -835,6 +845,23 @@ const AutoTradingDashboard = () => {
           finalScore += 8;
           scoringFactors.push(`Quality ${signal.quality_score} +8`);
         }
+        // Factor 7: Band indicator (custom EMA ribbon)
+        const bandSig = signal.technical_indicators?.band_signal;
+        if (bandSig) {
+          if (bandSig === 'BUY_CE' && signal.option_type === 'CE') {
+            finalScore += 20;
+            scoringFactors.push('Band ➤ BUY_CE +20');
+          } else if (bandSig === 'BUY_CE' && signal.option_type === 'PE') {
+            finalScore -= 10;
+            scoringFactors.push('Band ➤ against PE -10');
+          } else if (bandSig === 'SELL_PE' && signal.option_type === 'PE') {
+            finalScore += 20;
+            scoringFactors.push('Band ➤ SELL_PE +20');
+          } else if (bandSig === 'SELL_PE' && signal.option_type === 'CE') {
+            finalScore -= 10;
+            scoringFactors.push('Band ➤ against CE -10');
+          }
+        }
         
         return { ...signal, finalScore, scoringFactors, indexMomentum };
       });
@@ -1055,7 +1082,7 @@ const AutoTradingDashboard = () => {
     // If strict EMA rule fails, allow if confidence or quality is very high
     const confidence = Number(signal.confirmation_score ?? signal.confidence ?? 0);
     const quality = Number(signal.quality_score ?? signal.quality ?? 0);
-    if (confidence >= 85 || quality >= 85) {
+    if (confidence >= QUALITY_THRESHOLD || quality >= QUALITY_THRESHOLD) {
       console.log('[GoldenPullback] Allowed by high confidence/quality:', signal.symbol, {confidence, quality});
       return true;
     }
@@ -1268,6 +1295,11 @@ const AutoTradingDashboard = () => {
                       <div style={{ marginTop: '4px', padding: '4px', borderRadius: '3px', background: Number(data.ce.confirmation_score ?? data.ce.confidence ?? 0) >= 85 ? '#c6f6d5' : Number(data.ce.confirmation_score ?? data.ce.confidence ?? 0) >= 75 ? '#feebc8' : '#fed7d7', color: Number(data.ce.confirmation_score ?? data.ce.confidence ?? 0) >= 85 ? '#22543d' : Number(data.ce.confirmation_score ?? data.ce.confidence ?? 0) >= 75 ? '#92400e' : '#742a2a', fontWeight: 'bold' }}>
                         Conf: {(data.ce.confirmation_score ?? data.ce.confidence ?? 0).toFixed(1)}%
                       </div>
+                      {data.ce.technical_indicators?.band_signal && (
+                        <div style={{ fontSize: '10px', marginTop: '2px', color: '#555' }}>
+                          {data.ce.technical_indicators.band_signal === 'BUY_CE' ? 'Band ➤ BUY' : data.ce.technical_indicators.band_signal === 'SELL_PE' ? 'Band ➤ SELL' : data.ce.technical_indicators.band_signal}
+                        </div>
+                      )}
                     </div>
                   </div>
                 ) : (
@@ -1299,6 +1331,11 @@ const AutoTradingDashboard = () => {
                       <div style={{ marginTop: '4px', padding: '4px', borderRadius: '3px', background: Number(data.pe.confirmation_score ?? data.pe.confidence ?? 0) >= 85 ? '#c6f6d5' : Number(data.pe.confirmation_score ?? data.pe.confidence ?? 0) >= 75 ? '#feebc8' : '#fed7d7', color: Number(data.pe.confirmation_score ?? data.pe.confidence ?? 0) >= 85 ? '#22543d' : Number(data.pe.confirmation_score ?? data.pe.confidence ?? 0) >= 75 ? '#92400e' : '#742a2a', fontWeight: 'bold' }}>
                         Conf: {(data.pe.confirmation_score ?? data.pe.confidence ?? 0).toFixed(1)}%
                       </div>
+                      {data.pe.technical_indicators?.band_signal && (
+                        <div style={{ fontSize: '10px', marginTop: '2px', color: '#555' }}>
+                          {data.pe.technical_indicators.band_signal === 'BUY_CE' ? 'Band ➤ BUY' : data.pe.technical_indicators.band_signal === 'SELL_PE' ? 'Band ➤ SELL' : data.pe.technical_indicators.band_signal}
+                        </div>
+                      )}
                     </div>
                   </div>
                 ) : (
@@ -1683,6 +1720,10 @@ const AutoTradingDashboard = () => {
     }, 30000);
     // Slower refresh interval to reduce load - only every 3 seconds after initial load
     let isFirstRefresh = true;
+    // dynamic interval: faster updates (1s) when there are active trades,
+    // otherwise slower (3s) to save API calls. the effect depends on
+    // `activeTrades.length` so it will re-create when that changes.
+    const intervalMs = activeTrades.length > 0 ? 1000 : 3000;
     const dataRefreshInterval = setInterval(async () => {
       const prevCount = prevActiveTradesCount.current;
       if (document.hidden && !ALWAYS_FETCH_TRADES) {
@@ -1701,7 +1742,7 @@ const AutoTradingDashboard = () => {
       // Also refresh quality trades for AI Recommendation and signals
       await scanMarketForQualityTrades(true);
       prevActiveTradesCount.current = activeTrades.length;
-    }, 3000); // Changed from 1000ms (1s) to 3000ms (3s) to reduce load
+    }, intervalMs); // milliseconds based on presence of trades
     return () => {
       clearTimeout(initialDataTimeout);
       clearInterval(dataRefreshInterval);
@@ -2239,7 +2280,7 @@ const AutoTradingDashboard = () => {
             fontSize: '18px',
             fontWeight: 'bold'
           }}>
-            🎯 All Intraday Option Signals – 85%+ Quality (All Indices & Stocks)
+            🎯 All Intraday Option Signals – {QUALITY_THRESHOLD}%+ Quality (All Indices & Stocks)
           </h4>
           <button
             onClick={() => scanMarketForQualityTrades(true)}
@@ -2317,7 +2358,7 @@ const AutoTradingDashboard = () => {
                       padding: '10px',
                       textAlign: 'center',
                       fontWeight: 'bold',
-                      background: trade.quality >= 85 ? '#c6f6d5' : '#feebc8',
+                      background: trade.quality >= QUALITY_THRESHOLD ? '#c6f6d5' : '#feebc8',
                       borderRadius: '4px'
                     }}>
                       {trade.quality}%
@@ -2611,16 +2652,22 @@ const AutoTradingDashboard = () => {
         }}>
           ⚡ Active Trades (LIVE P&L)
         </h4>
-        {activeLoading ? (
+        {/* show spinner only when we don't already have any rows */}
+        {activeLoading && activeTrades.length === 0 ? (
           <p style={{ color: '#718096', fontStyle: 'italic' }}>Loading active trades…</p>
         ) : activeTrades.length > 0 ? (
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{
-              width: '100%',
-              borderCollapse: 'collapse',
-              fontSize: '13px',
-              background: 'white',
-              borderRadius: '8px',
+          <React.Fragment>
+            {/* if we're currently fetching but already have rows, show a small updating note */}
+            {activeLoading && (
+              <p style={{ color: '#718096', fontSize: '12px', margin: '4px 0' }}>Updating…</p>
+            )}
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{
+                width: '100%',
+                borderCollapse: 'collapse',
+                fontSize: '13px',
+                background: 'white',
+                borderRadius: '8px',
               overflow: 'hidden'
             }}>
               <thead>
@@ -2724,6 +2771,7 @@ const AutoTradingDashboard = () => {
               </tbody>
             </table>
           </div>
+          </React.Fragment>
         ) : (
           <div style={{ color: '#718096', textAlign: 'center', padding: '24px' }}>
             No active trades.

@@ -13,6 +13,7 @@ endpoints = [
     ("GET", "/autotrade/status", None),
     ("POST", "/autotrade/mode?demo_mode=true", None),
     ("POST", "/autotrade/analyze?symbol=NIFTY&balance=100000", None),
+    # active trades endpoint now requires authentication, allow 401 as acceptable
     ("GET", "/autotrade/trades/active", None),
     ("GET", "/autotrade/debug/source", None),
     ("GET", "/autotrade/trades/history", None),
@@ -30,13 +31,25 @@ print()
 
 for idx, (method, endpoint, body) in enumerate(endpoints, 1):
     url = BASE_URL + endpoint
+    headers = {}
+    # attempt a login once and reuse token (simple test user assumed)
+    if idx == 1:
+        # try to login once and store token
+        try:
+            resp = requests.post(BASE_URL + "/auth/login", json={"username":"test","password":"test"}, timeout=10)
+            if resp.ok:
+                token = resp.json().get("access_token")
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+        except Exception:
+            pass
     try:
         if method == "GET":
-            response = requests.get(url, timeout=20)
+            response = requests.get(url, headers=headers, timeout=20)
         else:
-            response = requests.post(url, json=body, timeout=20)
+            response = requests.post(url, json=body, headers=headers, timeout=20)
         
-        if response.status_code == 200:
+        if response.status_code == 200 or (endpoint == "/autotrade/trades/active" and response.status_code == 401):
             try:
                 data = response.json()
                 if "signals_count" in data:

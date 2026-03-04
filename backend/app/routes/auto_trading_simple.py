@@ -1,8 +1,14 @@
 import logging
 from pathlib import Path
 from fastapi.responses import JSONResponse
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, Depends
 from typing import Optional
+
+# dependencies used by some routes later
+from sqlalchemy.orm import Session
+from app.auth.service import AuthService, BrokerAuthService
+from app.routes.broker import _safe_decrypt
+from app.core.database import get_db
 log_dir = Path("backend/logs")
 log_dir.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
@@ -699,23 +705,53 @@ def _close_trade(trade: Dict[str, any], exit_price: float) -> None:
         db = SessionLocal()
         exit_dt = datetime.fromisoformat(trade.get("exit_time")) if isinstance(trade.get("exit_time"), str) else datetime.utcnow()
         entry_dt = datetime.fromisoformat(trade.get("entry_time")) if isinstance(trade.get("entry_time"), str) else datetime.utcnow()
-        report = TradeReport(
-            symbol=trade.get("symbol") or trade.get("index"),
-            side=side,
-            quantity=qty,
-            entry_price=entry,
-            exit_price=exit_price,
-            pnl=round(pnl, 2),
-            pnl_percentage=round(pnl_percentage, 2),
-            strategy=trade.get("strategy") or trade.get("strategy_name"),
-            status=trade.get("status") or "CLOSED",
-            entry_time=entry_dt,
-            exit_time=exit_dt,
-            trading_date=exit_dt.date(),
-            meta={"support": trade.get("support"), "resistance": trade.get("resistance")},
-        )
-        db.add(report)
-        db.commit()
+        # if we previously stored a report for this open trade, update that row
+        report = None
+        if trade.get("report_id"):
+            report = db.query(TradeReport).get(trade.get("report_id"))
+        if not report:
+            # fallback: find most recent OPEN record for same symbol
+            report = (
+                db.query(TradeReport)
+                .filter(TradeReport.symbol == (trade.get("symbol") or trade.get("index")))
+                .filter(TradeReport.status == "OPEN")
+                .order_by(TradeReport.entry_time.desc())
+                .first()
+            )
+        if report:
+            report.side = side
+            report.quantity = qty
+            report.entry_price = entry
+            report.exit_price = exit_price
+            report.pnl = round(pnl, 2)
+            report.pnl_percentage = round(pnl_percentage, 2)
+            report.strategy = trade.get("strategy") or trade.get("strategy_name")
+            report.status = trade.get("status") or "CLOSED"
+            report.entry_time = entry_dt
+            report.exit_time = exit_dt
+            report.trading_date = exit_dt.date()
+            meta = report.meta or {}
+            meta.update({"support": trade.get("support"), "resistance": trade.get("resistance")})
+            report.meta = meta
+            db.commit()
+        else:
+            report = TradeReport(
+                symbol=trade.get("symbol") or trade.get("index"),
+                side=side,
+                quantity=qty,
+                entry_price=entry,
+                exit_price=exit_price,
+                pnl=round(pnl, 2),
+                pnl_percentage=round(pnl_percentage, 2),
+                strategy=trade.get("strategy") or trade.get("strategy_name"),
+                status=trade.get("status") or "CLOSED",
+                entry_time=entry_dt,
+                exit_time=exit_dt,
+                trading_date=exit_dt.date(),
+                meta={"support": trade.get("support"), "resistance": trade.get("resistance")},
+            )
+            db.add(report)
+            db.commit()
     except Exception as e:
         logging.warning(f"Warning: failed to persist trade report: {e}")
     finally:
@@ -1361,7 +1397,9 @@ async def analyze(
                         "target_points": sig.get("target_points"),
                         "option_type": opt_type,
                         "strike": atm_strike,
-                        "data_source": "option_chain"
+                        "data_source": "option_chain",
+                        # carry over directional trend info from parent signal (if any)
+                        "trend": sig.get("trend") or sig.get("trend_direction"),
                     }
                     extended_signals.append(opt_signal)
                 else:
@@ -1676,6 +1714,31 @@ async def execute(
             "resistance": trade.resistance,
             **trail_fields,
         }
+        # persist initial/open trade report so active trades can be queried later
+        try:
+            db = SessionLocal()
+            entry_dt = datetime.fromisoformat(trade_obj["timestamp"]) if isinstance(trade_obj.get("timestamp"), str) else datetime.utcnow()
+            report = TradeReport(
+                symbol=trade_obj.get("symbol"),
+                side=trade_obj.get("side"),
+                quantity=trade_obj.get("quantity"),
+                entry_price=trade_obj.get("price"),
+                status="OPEN",
+                entry_time=entry_dt,
+                trading_date=entry_dt.date(),
+                meta={"support": trade_obj.get("support"), "resistance": trade_obj.get("resistance")},
+            )
+            db.add(report)
+            db.commit()
+            # remember report id so it can be updated later when closed
+            trade_obj["report_id"] = report.id
+        except Exception as e:
+            logging.warning(f"Warning: failed to persist open trade report: {e}")
+        finally:
+            try:
+                db.close()
+            except Exception:
+                pass
 
         # --- REAL ZERODHA ORDER PLACEMENT ---
         zerodha_symbol = trade.symbol
@@ -1703,6 +1766,29 @@ async def execute(
             else:
                 logging.error(f"[API /execute] ✗ Zerodha order REJECTED - Error: {real_order.get('error', 'Unknown')}")
                 logging.error(f"[API /execute] EXIT: trade execution failed. Response: {real_order}")
+                # record rejected trade in database as well
+                try:
+                    db = SessionLocal()
+                    entry_dt = datetime.fromisoformat(trade_obj.get("timestamp")) if isinstance(trade_obj.get("timestamp"), str) else datetime.utcnow()
+                    report = TradeReport(
+                        symbol=trade_obj.get("symbol"),
+                        side=trade_obj.get("side"),
+                        quantity=trade_obj.get("quantity"),
+                        entry_price=trade_obj.get("price"),
+                        status="REJECTED",
+                        entry_time=entry_dt,
+                        trading_date=entry_dt.date(),
+                        meta={"error": real_order.get("error")},
+                    )
+                    db.add(report)
+                    db.commit()
+                except Exception as e:
+                    logging.warning(f"Warning: failed to persist rejected trade report: {e}")
+                finally:
+                    try:
+                        db.close()
+                    except Exception:
+                        pass
                 return {
                     "success": False,
                     "message": real_order["error"],
@@ -1730,9 +1816,84 @@ async def execute(
 
 
 @router.get("/trades/active")
-async def get_active_trades(authorization: Optional[str] = Header(None)):
-    logging.info(f"[API /trades/active] Returning {len(active_trades)} active trades from Zerodha")
-    trades = active_trades
+async def get_active_trades(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+    token: str = Depends(AuthService.verify_bearer_token),
+):
+    """Return list of currently open trades.
+
+    Previously this endpoint simply returned the in-memory ``active_trades`` list
+    which meant that any position that was closed by the auto-close task (or lost
+    due to a rapid Zerodha postback) would disappear immediately.  In the live
+    system the frontend expects to see *actual* open positions from the broker
+    so the dashboard can show them even if they were created outside of the
+    local state or closed quickly.
+
+    To make the response more reliable we now always attempt a broker API call
+    to fetch current positions.  If the broker returns one or more open
+    positions we convert those into the same lightweight trade dicts and return
+    them instead of the stale memory list.  The user must be authenticated so we
+    can look up their Zerodha credentials from the database.
+    """
+
+    logging.info(f"[API /trades/active] Returning {len(active_trades)} active trades (memory)")
+    trades = list(active_trades)  # copy
+
+    # try to overlay with live broker positions if possible
+    try:
+        payload = AuthService.verify_token(token)
+        user_id = int(payload.get("sub"))
+        # fetch the user's Zerodha credentials (assumes single zerodha broker)
+        cred = BrokerAuthService.get_credentials(user_id=user_id, broker_name="zerodha", db=db)
+
+        # decrypt values stored in DB
+        api_key = _safe_decrypt(getattr(cred, "api_key", None))
+        api_secret = _safe_decrypt(getattr(cred, "api_secret", None))
+        access_token = _safe_decrypt(getattr(cred, "access_token", None))
+
+        from app.core.trading_engine import OrderExecutor
+
+        executor = OrderExecutor("zerodha", {"api_key": api_key, "api_secret": api_secret, "access_token": access_token})
+        positions = await executor.get_positions()
+        if positions:
+            # convert broker positions to API response format
+            broker_trades = []
+            for pos in positions:
+                broker_trades.append({
+                    "symbol": pos.symbol,
+                    "quantity": pos.quantity,
+                    "entry_price": getattr(pos, "average_price", None) or getattr(pos, "entry_price", None),
+                    "current_price": getattr(pos, "last_price", None),
+                    "side": pos.side,
+                    "status": "OPEN",
+                })
+            trades = broker_trades
+            logging.info(f"[API /trades/active] Overriding with {len(trades)} broker positions")
+    except Exception as e:
+        logging.warning(f"[API /trades/active] failed to fetch broker positions: {e}")
+
+    # if no trades from broker and we have persisted OPEN reports, include them
+    if not trades:
+        try:
+            reports = db.query(TradeReport).filter(TradeReport.status == "OPEN").all()
+            if reports:
+                logging.info(f"[API /trades/active] Adding {len(reports)} open trades from DB")
+                trades = []
+                for r in reports:
+                    trades.append({
+                        "symbol": r.symbol,
+                        "quantity": r.quantity,
+                        "entry_price": r.entry_price,
+                        "current_price": None,
+                        "side": r.side,
+                        "status": "OPEN",
+                        "entry_time": r.entry_time.isoformat() if r.entry_time else None,
+                        "meta": r.meta,
+                    })
+        except Exception as e:
+            logging.warning(f"[API /trades/active] failed to fetch open reports: {e}")
+
     return {"trades": trades, "is_demo_mode": False, "count": len(trades)}
 
 

@@ -63,12 +63,15 @@ export default function Dashboard() {
     const fetchActiveTrade = async () => {
       try {
         const response = await axios.get('/autotrade/trades/active');
-        if (response.data && response.data.length > 0) {
-          setActiveTrade(response.data[0]);
+        // API returns an object: { trades: [...], is_demo_mode, count }
+        const trades = response.data && response.data.trades ? response.data.trades : [];
+        if (trades.length > 0) {
+          setActiveTrade(trades[0]);
         } else {
           setActiveTrade(null);
         }
       } catch (error) {
+        console.error('Error fetching active trade', error);
         setActiveTrade(null);
       }
     };
@@ -133,6 +136,33 @@ export default function Dashboard() {
           </div>
         </div>
       )}
+
+      {/* Active Trade (live) */}
+      <div className="bg-white rounded-lg shadow p-6 mb-8">
+        <h2 className="text-xl font-bold text-gray-900 mb-4">Active Trade</h2>
+        {activeTrade ? (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <p><strong>Symbol:</strong> {activeTrade.symbol}</p>
+              <p><strong>Action:</strong> {activeTrade.side || activeTrade.action}</p>
+              <p><strong>Quantity:</strong> {activeTrade.quantity}</p>
+              <p><strong>Entry:</strong> ₹{activeTrade.entry_price || activeTrade.entry}</p>
+              <p><strong>Target:</strong> ₹{activeTrade.target || '--'}</p>
+              <p><strong>Stop Loss:</strong> ₹{activeTrade.stop_loss || '--'}</p>
+              <p><strong>Expiry:</strong> {activeTrade.expiry_date || activeTrade.expiry || '-'}</p>
+            </div>
+            <div>
+              {/* live P&L could be added if prices are fetched elsewhere */}
+              <p><strong>Status:</strong> {activeTrade.status || 'OPEN'}</p>
+              {activeTrade.current_price && (
+                <p><strong>Current Price:</strong> ₹{activeTrade.current_price}</p>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="text-center py-4 text-gray-500">No active trades.</div>
+        )}
+      </div>
 
       {/* All Strategy Signals (including CE/PE) */}
       <div className="bg-white rounded-lg shadow p-6 mb-8">

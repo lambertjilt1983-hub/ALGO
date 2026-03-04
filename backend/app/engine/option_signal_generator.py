@@ -105,7 +105,17 @@ def fetch_stock_option_chain(
     if pe_score > 90:
         high_quality_signals.append(pe_signal)
     if high_quality_signals:
-        return high_quality_signals
+        # band_signal is same for both signals (calculated from underlying prices).
+        # if it suggests one side only, filter accordingly before returning.
+        band_val = None
+        if high_quality_signals:
+            band_val = high_quality_signals[0].get("technical_indicators", {}).get("band_signal")
+        if band_val == 'BUY_CE':
+            high_quality_signals = [s for s in high_quality_signals if s.get('option_type') == 'CE']
+        elif band_val == 'SELL_PE':
+            high_quality_signals = [s for s in high_quality_signals if s.get('option_type') == 'PE']
+        if high_quality_signals:
+            return high_quality_signals
     # Fallback to previous logic if neither is > 90
     ce_reco = ce_signal.get("technical_indicators", {}).get("recommendation", "")
     pe_reco = pe_signal.get("technical_indicators", {}).get("recommendation", "")
@@ -290,7 +300,8 @@ def _validate_signal_quality(signal: dict, kite: KiteConnect, quote_data: dict) 
                     "macd": tech_analysis.get("macd", {}),
                     "bollinger": tech_analysis.get("bollinger_bands", {}),
                     "volatility": tech_analysis.get("volatility", 0),
-                    "recommendation": tech_analysis.get("recommendation", "HOLD")
+                    "recommendation": tech_analysis.get("recommendation", "HOLD"),
+                    "band_signal": tech_analysis.get("band_signal")
                 }
                 
                 # Enhanced scoring with technical indicators
@@ -332,6 +343,25 @@ def _validate_signal_quality(signal: dict, kite: KiteConnect, quote_data: dict) 
                 elif recommendation == "HOLD":
                     quality_score += 10
                     quality_factors.append(f"~ Tech signal: {recommendation}")
+                # Factor 5: Band indicator from custom EMA ribbon (0-20 points)
+                band_sig = tech_analysis.get("band_signal")
+                if band_sig:
+                    # save for output
+                    signal["technical_indicators"]["band_signal"] = band_sig
+                    if band_sig == "BUY_CE":
+                        if signal.get("option_type") == "CE":
+                            quality_score += 20
+                            quality_factors.append("✓ Band favors CE (buy)")
+                        else:
+                            quality_score -= 10
+                            quality_factors.append("⚠️ Band against PE")
+                    elif band_sig == "SELL_PE":
+                        if signal.get("option_type") == "PE":
+                            quality_score += 20
+                            quality_factors.append("✓ Band favors PE (sell)")
+                        else:
+                            quality_score -= 10
+                            quality_factors.append("⚠️ Band against CE")
                 
         except Exception as tech_error:
             # Fallback to basic analysis if technical indicators fail
@@ -780,8 +810,23 @@ def select_best_signal(signals: List[Dict]) -> Dict | None:
     if good_rr:
         viable = good_rr
     
-    # Select best by quality score (tie-break by confidence)
-    return max(viable, key=lambda s: (s.get("quality_score", 0), s.get("confidence", 0)))
+    # Helper: add small bonus for signals aligned with market trend
+    def _trend_alignment_bonus(sig: Dict) -> float:
+        trend = (sig.get("trend") or sig.get("trend_direction") or "").lower()
+        opt = sig.get("option_type")
+        if not trend or not opt:
+            return 0.0
+        if "up" in trend and opt == "CE":
+            return 5.0
+        if "down" in trend and opt == "PE":
+            return 5.0
+        # slightly penalize option opposite to trend to discourage
+        if ("up" in trend and opt == "PE") or ("down" in trend and opt == "CE"):
+            return -3.0
+        return 0.0
+
+    # Select best by (quality_score + trend bonus), tie-break by confidence
+    return max(viable, key=lambda s: (s.get("quality_score", 0) + _trend_alignment_bonus(s), s.get("confidence", 0)))
 
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:
