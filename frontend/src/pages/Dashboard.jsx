@@ -4,6 +4,26 @@ import { Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, Re
 import { ordersAPI, strategiesAPI, marketAPI } from '../api/client';
 import toast from 'react-hot-toast';
 
+// Helper function to format dates in IST timezone
+const formatTimeIST = (dateString) => {
+  if (!dateString) return '--';
+  try {
+    const date = new Date(dateString);
+    return date.toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    });
+  } catch {
+    return dateString;
+  }
+};
+
 export default function Dashboard() {
   const [orders, setOrders] = useState([]);
   const [strategies, setStrategies] = useState([]);
@@ -288,7 +308,7 @@ export default function Dashboard() {
                     </span>
                   </td>
                   <td className="px-6 py-4 text-sm text-gray-600">
-                    {new Date(strategy.created_at).toLocaleDateString()}
+                    {formatTimeIST(strategy.created_at)}
                   </td>
                 </tr>
               ))}

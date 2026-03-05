@@ -1,7 +1,25 @@
 import React, { useEffect, useState } from 'react';
 import { ordersAPI, brokerAPI } from '../api/client';
 import toast from 'react-hot-toast';
-
+// Helper function to format dates in IST timezone
+const formatTimeIST = (dateString) => {
+  if (!dateString) return '--';
+  try {
+    const date = new Date(dateString);
+    return date.toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    });
+  } catch {
+    return dateString;
+  }
+};
 export default function OrdersPage() {
   const [orders, setOrders] = useState([]);
   const [brokers, setBrokers] = useState([]);
@@ -253,7 +271,7 @@ export default function OrdersPage() {
                   </span>
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600">
-                  {new Date(order.created_at).toLocaleDateString()}
+                  {formatTimeIST(order.created_at)}
                 </td>
               </tr>
             ))}

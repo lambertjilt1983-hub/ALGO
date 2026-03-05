@@ -2,6 +2,26 @@ import React, { useEffect, useState } from 'react';
 import { strategiesAPI } from '../api/client';
 import toast from 'react-hot-toast';
 
+// Helper function to format dates in IST timezone
+const formatTimeIST = (dateString) => {
+  if (!dateString) return '--';
+  try {
+    const date = new Date(dateString);
+    return date.toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    });
+  } catch {
+    return dateString;
+  }
+};
+
 export default function StrategiesPage() {
   const [strategies, setStrategies] = useState([]);
   const [showNewStrategy, setShowNewStrategy] = useState(false);
@@ -173,7 +193,7 @@ export default function StrategiesPage() {
                 Type: {strategy.strategy_type}
               </p>
               <p className="text-xs text-gray-600">
-                Created: {new Date(strategy.created_at).toLocaleDateString()}
+                Created: {formatTimeIST(strategy.created_at)}
               </p>
             </div>
 

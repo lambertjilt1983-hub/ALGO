@@ -3,6 +3,26 @@ import { useNavigate } from 'react-router-dom';
 import config from './config/api';
 import AdminPanel from './components/AdminPanel';
 
+// Helper function to format dates in IST timezone
+const formatTimeIST = (dateString) => {
+  if (!dateString) return '--';
+  try {
+    const date = new Date(dateString);
+    return date.toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    });
+  } catch {
+    return dateString;
+  }
+};
+
 function Dashboard() {
   const [user, setUser] = useState(null);
   const [brokers, setBrokers] = useState([]);
@@ -618,7 +638,7 @@ function Dashboard() {
                 color: '#718096',
                 fontSize: '14px'
               }}>
-                Member since {new Date(user.created_at).toLocaleDateString()}
+                Member since {formatTimeIST(user.created_at)}
               </p>
             </div>
 
@@ -871,7 +891,7 @@ function Dashboard() {
                         color: '#718096',
                         fontSize: '13px'
                       }}>
-                        Connected: {new Date(broker.created_at).toLocaleDateString()}
+                        Connected: {formatTimeIST(broker.created_at)}
                       </p>
                     </div>
                     <span style={{
@@ -1828,7 +1848,7 @@ function Dashboard() {
                           <span>•</span>
                           <span>{news.category}</span>
                           <span>•</span>
-                          <span>{new Date(news.timestamp).toLocaleTimeString()}</span>
+                          <span>{formatTimeIST(news.timestamp)}</span>
                         </div>
                       </div>
                       <span style={{

@@ -4,7 +4,7 @@ import React, { useState, useEffect } from 'react';
  * 🚀 PERFORMANCE OPTIMIZATIONS APPLIED:
  * 
  * 1. REDUCED POLLING FREQUENCY
- *    - Data refresh: 5 seconds (was 2s)
+ *    - Data refresh: 5 seconds (was 2s) 
  *    - Price updates: 8 seconds (was every data fetch)
  *    - Health checks: 30 seconds
  *    - Professional signals: 60 seconds
@@ -13,19 +13,20 @@ import React, { useState, useEffect } from 'react';
  *    - Trade data now refreshes even when tab is hidden
  *    - Ensures trades stay updated anytime
  * 
- * 3. REQUEST DEDUPLICATION
- *    - Added fetchData.isRunning flag to prevent concurrent calls
- *    - Separate intervals for data vs price updates
+ * 3. REQUEST THROTTLING (Timestamp-based)
+ *    - Prevents concurrent fetches using timestamp throttling (3s minimum between calls)
+ *    - More efficient than flag-based blocking
+ *    - Eliminates "Skipping - fetch already in progress" spam
  * 
  * 4. BATCHED PRICE UPDATES
  *    - Backend now fetches all prices in ONE Kite API call
  *    - Rate limited to max 1 update per 5 seconds
  * 
  * 5. TIMEOUT PROTECTION
- *    - 8s timeout on each API call
+ *    - 15s timeout on each API call
  *    - Graceful degradation on timeouts
  * 
- * Result: ~75% reduction in API calls, faster page loads, no Kite API timeouts
+ * Result: ~75% reduction in API calls, faster page loads, no Kite API timeouts, stable data flow
  */
 
 // Use environment-based API URL if available
@@ -85,12 +86,32 @@ const MARKET_HOLIDAYS = [
 // Keep fetching trade data even when the tab is hidden
 const ALWAYS_FETCH_TRADES = true;
 
+// Helper function to format dates in IST timezone
+const formatTimeIST = (dateString) => {
+  if (!dateString) return '--';
+  try {
+    const date = new Date(dateString);
+    return date.toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    });
+  } catch {
+    return dateString;
+  }
+};
+
 // Screen Wake Lock - Prevent browser/system sleep
 
 const AutoTradingDashboard = () => {
   const [enabled, setEnabled] = useState(false);
   const [isLiveMode, setIsLiveMode] = useState(false); // Starts in DEMO mode
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [armingInProgress, setArmingInProgress] = useState(false);
   const [armError, setArmError] = useState(null);
   const [stats, setStats] = useState(null);
@@ -338,112 +359,123 @@ const AutoTradingDashboard = () => {
     }
   };
 
-  // Remove legacy fetchData logic (config references)
+  // Core data fetch logic (extracted for reuse)
+  const performDataFetch = async () => {
+    const timeoutPromise = (promise, ms) => Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), ms))
+    ]);
+
+    const useLive = autoTradingActive && isLiveMode;
+    const activeEndpoint = useLive ? AUTO_TRADE_ACTIVE_API : PAPER_TRADES_ACTIVE_API;
+    const updateEndpoint = useLive ? AUTO_TRADE_UPDATE_API : PAPER_TRADES_UPDATE_API;
+
+    await timeoutPromise(config.authFetch(updateEndpoint, { method: 'POST' }), 15000).catch(() => null);
+    const [activeRes, historyRes, perfRes, statusRes] = await Promise.all([
+      timeoutPromise(config.authFetch(activeEndpoint), 15000),
+      timeoutPromise(config.authFetch(`${PAPER_TRADES_HISTORY_API}?days=7&limit=100`), 15000),
+      timeoutPromise(config.authFetch(`${PAPER_TRADES_PERFORMANCE_API}?days=30`), 15000),
+      timeoutPromise(config.authFetch(AUTO_TRADE_STATUS_API), 15000),
+    ]).catch(e => {
+      // Silent timeout - will use empty defaults
+      return [{ ok: false }, { ok: false }, null, { ok: false }];
+    });
+
+    const activeData = activeRes?.ok ? await activeRes.json() : { trades: [] };
+    const historyData = historyRes?.ok ? await historyRes.json() : { trades: [] };
+    const perfData = perfRes?.ok ? await perfRes.json() : null;
+    const statusData = statusRes?.ok ? await statusRes.json() : {};
+
+    const active = activeData.trades || [];
+    const history = historyData.trades || [];
+    const backendStatus = statusData.status || statusData;
+
+    // Deduplicate active trades by symbol, action, entry_price, and entry_time
+    const dedupedActive = Array.isArray(active)
+      ? active.filter((trade, idx, arr) => {
+          return (
+            arr.findIndex(t =>
+              t.symbol === trade.symbol &&
+              (t.action || t.side) === (trade.action || trade.side) &&
+              Number(t.entry_price ?? t.price) === Number(trade.entry_price ?? trade.price) &&
+              (t.entry_time || t.timestamp) === (trade.entry_time || trade.timestamp)
+            ) === idx
+          );
+        })
+      : active;
+    
+    setActiveTrades(dedupedActive);
+    setTradeHistory(history);
+    setReportSummary(perfData);
+    setHasActiveTrade(active.length > 0);
+
+    // Compute daily P&L from closed trades
+    const todayLabel = new Date().toDateString();
+    const dailyTrades = history.filter((t) => {
+      const ts = t.exit_time || t.entry_time;
+      if (!ts) return false;
+      return new Date(ts).toDateString() === todayLabel;
+    });
+    const dailyPnl = dailyTrades.reduce((acc, t) => acc + Number(t.pnl ?? t.profit_loss ?? 0), 0);
+    const winCount = dailyTrades.filter(t => (t.pnl ?? t.profit_loss ?? 0) > 0).length;
+    const lossCount = dailyTrades.filter(t => (t.pnl ?? t.profit_loss ?? 0) < 0).length;
+
+    const capitalInUse = active.reduce((acc, t) => acc + Number(t.entry_price ?? 0) * Number(t.quantity ?? 0), 0);
+
+    const targetPoints = Number(activeSignal?.target_points ?? 0) || (activeSignal && activeSignal.entry_price && activeSignal.target
+      ? Math.max(0, Number(activeSignal.target) - Number(activeSignal.entry_price))
+      : 25);
+
+    setStats({
+      daily_pnl: dailyPnl,
+      daily_loss: Number(backendStatus?.daily_loss ?? 0),
+      daily_profit: Number(backendStatus?.daily_profit ?? 0),
+      daily_loss_limit: Number(backendStatus?.daily_loss_limit ?? 5000),
+      daily_profit_limit: Number(backendStatus?.daily_profit_limit ?? 10000),
+      active_trades_count: active.length,
+      max_trades: 1,
+      target_points_per_trade: Math.round(targetPoints),
+      capital_in_use: capitalInUse,
+      win_rate: backendStatus?.win_rate ?? 0,
+      win_sample: backendStatus?.win_sample ?? 0,
+      today_wins: winCount,
+      today_losses: lossCount,
+      trading_paused: backendStatus?.trading_paused ?? false,
+      pause_reason: backendStatus?.pause_reason,
+      market_open: typeof backendStatus?.market_open === 'boolean' ? backendStatus.market_open : null,
+      market_reason: backendStatus?.market_reason ?? null,
+      market_date: backendStatus?.market_date ?? null,
+      market_time: backendStatus?.market_time ?? null,
+      remaining_capital: null,
+      portfolio_cap: null,
+    });
+  };
+
+  // User-triggered fetch with loading state
   const fetchData = async () => {
     try {
-      // Skip if already fetching (prevent duplicate calls)
-      if (fetchData.isRunning) {
-        console.log('⏭️ Skipping - fetch already in progress');
-        return;
-      }
-      fetchData.isRunning = true;
-
-      // Fetch trade data in parallel with 8s timeout each
-      const timeoutPromise = (promise, ms) => Promise.race([
-        promise,
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), ms))
-      ]);
-
-      const useLive = autoTradingActive && isLiveMode;
-      const activeEndpoint = useLive ? AUTO_TRADE_ACTIVE_API : PAPER_TRADES_ACTIVE_API;
-      const updateEndpoint = useLive ? AUTO_TRADE_UPDATE_API : PAPER_TRADES_UPDATE_API;
-
-      await timeoutPromise(config.authFetch(updateEndpoint, { method: 'POST' }), 15000).catch(() => null);
-      const [activeRes, historyRes, perfRes, statusRes] = await Promise.all([
-        timeoutPromise(config.authFetch(activeEndpoint), 15000),
-        timeoutPromise(config.authFetch(`${PAPER_TRADES_HISTORY_API}?days=7&limit=100`), 15000),
-        timeoutPromise(config.authFetch(`${PAPER_TRADES_PERFORMANCE_API}?days=30`), 15000),
-        timeoutPromise(config.authFetch(AUTO_TRADE_STATUS_API), 15000),
-      ]).catch(e => {
-        // Silent timeout - will use empty defaults
-        return [{ ok: false }, { ok: false }, null, { ok: false }];
-      });
-
-      const activeData = activeRes?.ok ? await activeRes.json() : { trades: [] };
-      const historyData = historyRes?.ok ? await historyRes.json() : { trades: [] };
-      const perfData = perfRes?.ok ? await perfRes.json() : null;
-      const statusData = statusRes?.ok ? await statusRes.json() : {};
-
-      const active = activeData.trades || [];
-      const history = historyData.trades || [];
-      const backendStatus = statusData.status || statusData;
-
-      // Deduplicate active trades by symbol, action, entry_price, and entry_time
-      const dedupedActive = Array.isArray(active)
-        ? active.filter((trade, idx, arr) => {
-            return (
-              arr.findIndex(t =>
-                t.symbol === trade.symbol &&
-                (t.action || t.side) === (trade.action || trade.side) &&
-                Number(t.entry_price ?? t.price) === Number(trade.entry_price ?? trade.price) &&
-                (t.entry_time || t.timestamp) === (trade.entry_time || trade.timestamp)
-              ) === idx
-            );
-          })
-        : active;
-      setActiveTrades(dedupedActive);
-      setTradeHistory(history);
-      setReportSummary(perfData);
-      setHasActiveTrade(active.length > 0);
-
-      // Compute daily P&L from closed trades
-      const todayLabel = new Date().toDateString();
-      const dailyTrades = history.filter((t) => {
-        const ts = t.exit_time || t.entry_time;
-        if (!ts) return false;
-        return new Date(ts).toDateString() === todayLabel;
-      });
-      const dailyPnl = dailyTrades.reduce((acc, t) => acc + Number(t.pnl ?? t.profit_loss ?? 0), 0);
-      const winCount = dailyTrades.filter(t => (t.pnl ?? t.profit_loss ?? 0) > 0).length;
-      const lossCount = dailyTrades.filter(t => (t.pnl ?? t.profit_loss ?? 0) < 0).length;
-
-      const capitalInUse = active.reduce((acc, t) => acc + Number(t.entry_price ?? 0) * Number(t.quantity ?? 0), 0);
-
-      const targetPoints = Number(activeSignal?.target_points ?? 0) || (activeSignal && activeSignal.entry_price && activeSignal.target
-        ? Math.max(0, Number(activeSignal.target) - Number(activeSignal.entry_price))
-        : 25);
-
-      setStats({
-        daily_pnl: dailyPnl,
-        daily_loss: Number(backendStatus?.daily_loss ?? 0),
-        daily_profit: Number(backendStatus?.daily_profit ?? 0),
-        daily_loss_limit: Number(backendStatus?.daily_loss_limit ?? 5000),
-        daily_profit_limit: Number(backendStatus?.daily_profit_limit ?? 10000),
-        active_trades_count: active.length,
-        max_trades: 1,
-        target_points_per_trade: Math.round(targetPoints),
-        capital_in_use: capitalInUse,
-        win_rate: backendStatus?.win_rate ?? 0,
-        win_sample: backendStatus?.win_sample ?? 0,
-        today_wins: winCount,
-        today_losses: lossCount,
-        trading_paused: backendStatus?.trading_paused ?? false,
-        pause_reason: backendStatus?.pause_reason,
-        market_open: typeof backendStatus?.market_open === 'boolean' ? backendStatus.market_open : null,
-        market_reason: backendStatus?.market_reason ?? null,
-        market_date: backendStatus?.market_date ?? null,
-        market_time: backendStatus?.market_time ?? null,
-        remaining_capital: null,
-        portfolio_cap: null,
-      });
+      await performDataFetch();
     } catch (e) {
       // Silent error handling - graceful degradation
       setActiveTrades([]);
       setTradeHistory([]);
       setReportSummary(null);
-    } finally {
-      fetchData.isRunning = false;
-      setLoading(false);
+    }
+  };
+
+  // Background refresh WITHOUT loading state (prevents flickering)
+  const refreshTradesQuietly = async () => {
+    try {
+      // Throttle: Skip if fetched within last 3 seconds
+      const now = Date.now();
+      if (refreshTradesQuietly.lastRun && (now - refreshTradesQuietly.lastRun) < 3000) {
+        return; // Silent skip
+      }
+      refreshTradesQuietly.lastRun = now;
+      
+      await performDataFetch();
+    } catch (e) {
+      // Silent error - don't update state, keep stale data
     }
   };
 
@@ -1067,8 +1099,12 @@ const AutoTradingDashboard = () => {
   useEffect(() => {
     if (!autoTradingActive || !isLiveMode || executing) return;
     if (!isMarketOpen) return;
-    const maxTrades = stats?.max_trades ?? 2;
-    if (activeTrades.length >= maxTrades) return;
+    
+    // ✅ STRICT: Only ONE active trade allowed at a time
+    if (activeTrades.length >= 1) {
+      console.log(`⏸️ Auto-trading paused: ${activeTrades.length} active trade(s) running. Wait for completion.`);
+      return;
+    }
 
     const candidate = activeSignal;
     if (!candidate) return;
@@ -1079,7 +1115,7 @@ const AutoTradingDashboard = () => {
       await fetchData();
     })();
     // eslint-disable-next-line
-  }, [activeSignal, isLiveMode, autoTradingActive, executing, activeTrades, optionSignals, stats?.max_trades]);
+  }, [activeSignal, isLiveMode, autoTradingActive, executing, activeTrades, optionSignals]);
 
   // Remove legacy toggleAutoTrading logic (config references)
   const toggleAutoTrading = async () => {};
@@ -1103,9 +1139,9 @@ const AutoTradingDashboard = () => {
       return;
     }
     
-    const maxTrades = stats?.max_trades ?? 2;
-    if (activeTrades.length >= maxTrades) {
-      console.log('Max active trades reached, skipping...');
+    // ✅ STRICT: Only ONE active trade allowed at a time
+    if (activeTrades.length >= 1) {
+      console.log(`⏸️ Trade blocked: ${activeTrades.length} active trade already running. System enforces one-at-a-time.`);
       return;
     }
 
@@ -1249,6 +1285,13 @@ const AutoTradingDashboard = () => {
 
   const createPaperTradeFromSignal = async (signal) => {
     if (!signal || !signal.symbol) return;
+    
+    // ✅ ENFORCE ONE TRADE AT A TIME
+    if (activeTrades.length > 0) {
+      console.log('⏸️ Trade creation blocked: Already have an active trade. Wait for it to close.');
+      return;
+    }
+    
     const paperSignalKey = `${signal.symbol}:${signal.entry_price}:${signal.target}:${signal.stop_loss}`;
     const now = Date.now();
     if (lastPaperSignalSymbol === paperSignalKey && (now - lastPaperSignalAt) < 60000) return;
@@ -1291,13 +1334,18 @@ const AutoTradingDashboard = () => {
       });
       if (res.ok) {
         const data = await res.json();
-        if (data?.success !== false) {
+        if (data?.success === true) {
+          console.log(`✅ Paper trade created: ${signal.symbol}`);
           setLastPaperSignalSymbol(paperSignalKey);
           setLastPaperSignalAt(Date.now());
+        } else if (data?.success === false) {
+          console.log(`⏸️ Paper trade rejected: ${data.message || 'Must close active trade first'}`);
         }
+      } else {
+        console.error(`❌ Paper trade creation failed: ${res.status}`);
       }
     } catch (e) {
-      // ignore paper trade creation errors in demo mode
+      console.error('Paper trade creation error:', e);
     }
   };
 
@@ -1346,10 +1394,6 @@ const AutoTradingDashboard = () => {
   };
 
   useEffect(() => {
-    // Set loading to false immediately to show UI
-    // Data will load in background
-    setLoading(false);
-    
     // Auto-scan market for quality trades on load
     setTimeout(() => {
       scanMarketForQualityTrades();
@@ -1390,7 +1434,8 @@ const AutoTradingDashboard = () => {
       try {
         await config.authFetch(`${config.API_BASE_URL}/health`);
         console.log('💓 Health check passed - connection alive');
-        document.title = `🚀 Auto Trading - Alive ${new Date().toLocaleTimeString()}`;
+        const istTime = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+        document.title = `🚀 Auto Trading - Alive ${istTime}`;
       } catch (e) {
         console.warn('⚠️ Health check failed:', e.message);
       }
@@ -1406,7 +1451,8 @@ const AutoTradingDashboard = () => {
         return;
       }
       
-      await fetchData();
+      // Use quiet refresh to prevent flickering
+      await refreshTradesQuietly();
       
       // CRITICAL: Detect trade exit (count went from 1+ to 0)
       if (autoTradingActive && prevCount > 0 && activeTrades.length === 0) {
@@ -1421,7 +1467,7 @@ const AutoTradingDashboard = () => {
       
       // Update ref for next iteration
       prevActiveTradesCount.current = activeTrades.length;
-    }, 2000); // 2 seconds for data refresh
+    }, 5000); // 5 seconds for data refresh
 
     return () => {
       clearTimeout(initialDataTimeout);
@@ -1432,7 +1478,7 @@ const AutoTradingDashboard = () => {
       releaseWakeLock();
       stopKeepAliveHeartbeat();
     };
-  }, [enabled, autoTradingActive, activeTrades.length]);
+  }, [enabled]); // Only re-run when component is enabled, not on every trade change
 
   // Default: auto-trading OFF on load (paper trades only until user clicks Start)
   useEffect(() => {
@@ -1499,70 +1545,6 @@ const AutoTradingDashboard = () => {
       }
     }
   }, [autoTradingActive, isLiveMode, signalsLoaded, activeTrades.length, bestQualityTrade, activeSignal, lotMultiplier, optionSignals]);
-
-  if (loading) {
-    return (
-      <div style={{
-        display: 'flex',
-        justifyContent: 'center',
-        alignItems: 'center',
-        minHeight: '100vh',
-        background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)'
-      }}>
-        <div style={{
-          textAlign: 'center',
-          padding: '40px',
-          background: 'white',
-          borderRadius: '16px',
-          boxShadow: '0 20px 60px rgba(0, 0, 0, 0.3)'
-        }}>
-          <div style={{
-            fontSize: '32px',
-            marginBottom: '16px',
-            animation: 'spin 2s linear infinite',
-            display: 'inline-block'
-          }}>
-            🚀
-          </div>
-          <h2 style={{
-            margin: '0 0 8px 0',
-            color: '#2d3748',
-            fontSize: '20px',
-            fontWeight: '600'
-          }}>
-            Initializing Auto Trading Engine
-          </h2>
-          <p style={{
-            margin: 0,
-            color: '#718096',
-            fontSize: '14px'
-          }}>
-            Connecting to market data and loading your strategies...
-          </p>
-          <div style={{
-            marginTop: '20px',
-            height: '4px',
-            background: '#e2e8f0',
-            borderRadius: '2px',
-            overflow: 'hidden'
-          }}>
-            <div style={{
-              height: '100%',
-              background: 'linear-gradient(90deg, #667eea, #764ba2)',
-              animation: 'pulse 1.5s ease-in-out infinite',
-              width: '100%'
-            }} />
-          </div>
-        </div>
-        <style>{`
-          @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-          }
-        `}</style>
-      </div>
-    );
-  }
 
   const todayLabel = new Date().toDateString();
   const todayIso = new Date().toISOString().slice(0, 10);
@@ -1752,87 +1734,6 @@ const AutoTradingDashboard = () => {
           </p>
         </div>
         <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
-          <div style={{
-            padding: '20px',
-            background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-            borderRadius: '12px',
-            color: 'white',
-            textAlign: 'center'
-          }}>
-            <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Daily Loss</div>
-            <div style={{
-              fontSize: '24px',
-              fontWeight: 'bold',
-              color: (stats?.daily_loss ?? 0) >= 0 ? '#c6f6d5' : '#fed7d7'
-            }}>
-              ₹{(stats?.daily_loss ?? 0).toLocaleString()}
-            </div>
-            <div style={{ fontSize: '11px', marginTop: '6px', opacity: 0.8 }}>
-              Limit: ₹{lossLimit}
-            </div>
-            <div style={{ marginTop: '8px', display: 'flex', gap: '6px', alignItems: 'center', justifyContent: 'center' }}>
-              <span style={{ fontSize: '10px', opacity: 0.9 }}>Set</span>
-              <input
-                type="number"
-                min="1"
-                step="100"
-                value={lossLimit}
-                onChange={(e) => {
-                  const next = Number(e.target.value);
-                  if (Number.isFinite(next) && next > 0) setLossLimit(next);
-                }}
-                style={{
-                  width: '90px',
-                  padding: '4px 6px',
-                  borderRadius: '6px',
-                  border: 'none',
-                  fontSize: '11px',
-                  textAlign: 'center'
-                }}
-              />
-            </div>
-          </div>
-          
-          <div style={{
-            padding: '20px',
-            background: 'linear-gradient(135deg, #48bb78 0%, #38a169 100%)',
-            borderRadius: '12px',
-            color: 'white',
-            textAlign: 'center'
-          }}>
-            <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Daily Profit</div>
-            <div style={{
-              fontSize: '24px',
-              fontWeight: 'bold',
-              color: '#c6f6d5'
-            }}>
-              ₹{(stats?.daily_profit ?? 0).toLocaleString()}
-            </div>
-            <div style={{ fontSize: '11px', marginTop: '6px', opacity: 0.8 }}>
-              Target: ₹{profitTarget}
-            </div>
-            <div style={{ marginTop: '8px', display: 'flex', gap: '6px', alignItems: 'center', justifyContent: 'center' }}>
-              <span style={{ fontSize: '10px', opacity: 0.9 }}>Set</span>
-              <input
-                type="number"
-                min="1"
-                step="100"
-                value={profitTarget}
-                onChange={(e) => {
-                  const next = Number(e.target.value);
-                  if (Number.isFinite(next) && next > 0) setProfitTarget(next);
-                }}
-                style={{
-                  width: '90px',
-                  padding: '4px 6px',
-                  borderRadius: '6px',
-                  border: 'none',
-                  fontSize: '11px',
-                  textAlign: 'center'
-                }}
-              />
-            </div>
-          </div>
           <div style={{
             padding: '20px',
             background: 'linear-gradient(135deg, #ed8936 0%, #dd6b20 100%)',
@@ -2557,7 +2458,7 @@ const AutoTradingDashboard = () => {
                       </td>
                       <td style={{ padding: '10px', textAlign: 'right' }}>{trade.quantity}</td>
                       <td style={{ padding: '10px', fontSize: '11px', color: '#718096' }}>
-                        {trade.entry_time ? new Date(trade.entry_time).toLocaleString() : '-'}
+                        {formatTimeIST(trade.entry_time)}
                       </td>
                       <td style={{ padding: '10px', textAlign: 'center' }}>
                         <button
@@ -2754,7 +2655,7 @@ const AutoTradingDashboard = () => {
                         </span>
                       </td>
                       <td style={{ padding: '10px', fontSize: '11px', color: '#718096' }}>
-                        {trade.exit_time ? new Date(trade.exit_time).toLocaleString() : '-'}
+                        {formatTimeIST(trade.exit_time)}
                       </td>
                     </tr>
                   );
@@ -2865,7 +2766,7 @@ const AutoTradingDashboard = () => {
                     <th style={{ padding: '8px', textAlign: 'right' }}>Entry</th>
                     <th style={{ padding: '8px', textAlign: 'right' }}>Exit</th>
                     <th style={{ padding: '8px', textAlign: 'right' }}>P&L</th>
-                    <th style={{ padding: '8px', textAlign: 'left' }}>Status</th>
+                    <th style={{ padding: '8px', textAlign: 'left' }}>Time (IST)</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -2895,7 +2796,9 @@ const AutoTradingDashboard = () => {
                         <td style={{ padding: '8px', textAlign: 'right', fontWeight: '700', color: pnl >= 0 ? '#48bb78' : '#f56565' }}>
                           {pnl >= 0 ? '+' : ''}₹{pnl.toLocaleString()}
                         </td>
-                        <td style={{ padding: '8px', fontSize: '11px', color: '#718096' }}>{t.status || 'CLOSED'}</td>
+                        <td style={{ padding: '8px', fontSize: '11px', color: '#718096' }}>
+                          {formatTimeIST(t.exit_time || t.entry_time)}
+                        </td>
                       </tr>
                     );
                   })}
@@ -2983,7 +2886,7 @@ const AutoTradingDashboard = () => {
                           </span>
                         </td>
                         <td style={{ padding: '10px', fontSize: '11px', color: '#718096' }}>
-                          {trade.exit_time ? new Date(trade.exit_time).toLocaleDateString() : (trade.entry_time ? new Date(trade.entry_time).toLocaleDateString() : '-')}
+                          {formatTimeIST(trade.exit_time || trade.entry_time)}
                         </td>
                       </tr>
                     );

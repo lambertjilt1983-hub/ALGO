@@ -23,7 +23,23 @@ const formatValue = (value) => {
   if (typeof value === 'boolean') return value ? badge('YES', '#16a34a', 'rgba(22, 163, 74, 0.12)') : badge('NO', '#dc2626', 'rgba(220, 38, 38, 0.12)');
   if (typeof value === 'number') return value;
   if (typeof value === 'string' && value.length > 42) return value.slice(0, 39) + '…';
-  if (typeof value === 'string' && value.includes('T')) return new Date(value).toLocaleString();
+  if (typeof value === 'string' && value.includes('T')) {
+    try {
+      const date = new Date(value);
+      return date.toLocaleString('en-IN', {
+        timeZone: 'Asia/Kolkata',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true
+      });
+    } catch {
+      return value;
+    }
+  }
   return value;
 };
 
