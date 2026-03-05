@@ -1,3 +1,4 @@
+
 from datetime import datetime, date
 from typing import Optional
 
@@ -9,6 +10,9 @@ from app.auth.service import AuthService
 from app.core.database import get_db
 from app.core.security import encryption_manager
 from app.models.auth import User, BrokerCredential, RefreshToken
+from app.models.trading import TradeReport
+
+router = APIRouter()
 from app.models.trading import (
     Order,
     Position,

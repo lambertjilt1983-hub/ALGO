@@ -14,7 +14,7 @@ from app.models.trading import PaperTrade
 
 router = APIRouter()
 
-MAX_PAPER_TRADES = 1  # Only one paper trade at a time
+MAX_PAPER_TRADES = 10  # Allow up to 10 paper trades at a time
 
 
 def _option_kind(symbol: str | None) -> str | None:

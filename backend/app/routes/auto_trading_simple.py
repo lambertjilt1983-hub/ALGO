@@ -1838,8 +1838,11 @@ async def get_active_trades(
     can look up their Zerodha credentials from the database.
     """
 
-    logging.info(f"[API /trades/active] Returning {len(active_trades)} active trades (memory)")
+    logging.info(f"[API /trades/active] [START] Memory active_trades count: {len(active_trades)}")
     trades = list(active_trades)  # copy
+    if trades:
+        for t in trades:
+            logging.info(f"[API /trades/active] [MEMORY] Trade: {t}")
 
     # try to overlay with live broker positions if possible
     try:
@@ -1857,10 +1860,11 @@ async def get_active_trades(
 
         executor = OrderExecutor("zerodha", {"api_key": api_key, "api_secret": api_secret, "access_token": access_token})
         positions = await executor.get_positions()
+        logging.info(f"[API /trades/active] [BROKER] Positions fetched: {len(positions) if positions else 0}")
         if positions:
-            # convert broker positions to API response format
             broker_trades = []
             for pos in positions:
+                logging.info(f"[API /trades/active] [BROKER] Position: {pos}")
                 broker_trades.append({
                     "symbol": pos.symbol,
                     "quantity": pos.quantity,
@@ -1870,7 +1874,7 @@ async def get_active_trades(
                     "status": "OPEN",
                 })
             trades = broker_trades
-            logging.info(f"[API /trades/active] Overriding with {len(trades)} broker positions")
+            logging.info(f"[API /trades/active] [BROKER] Overriding with {len(trades)} broker positions")
     except Exception as e:
         logging.warning(f"[API /trades/active] failed to fetch broker positions: {e}")
 
@@ -1878,10 +1882,11 @@ async def get_active_trades(
     if not trades:
         try:
             reports = db.query(TradeReport).filter(TradeReport.status == "OPEN").all()
+            logging.info(f"[API /trades/active] [DB] Open TradeReport count: {len(reports)}")
             if reports:
-                logging.info(f"[API /trades/active] Adding {len(reports)} open trades from DB")
                 trades = []
                 for r in reports:
+                    logging.info(f"[API /trades/active] [DB] TradeReport: {r}")
                     trades.append({
                         "symbol": r.symbol,
                         "quantity": r.quantity,
@@ -1893,8 +1898,9 @@ async def get_active_trades(
                         "meta": r.meta,
                     })
         except Exception as e:
-            logging.warning(f"[API /trades/active] failed to fetch open reports: {e}")
+            logging.warning(f"[API /trades/active] [DB] failed to fetch open reports: {e}")
 
+    logging.info(f"[API /trades/active] [END] Returning {len(trades)} trades: {trades}")
     return {"trades": trades, "is_demo_mode": False, "count": len(trades)}
 
 

@@ -541,10 +541,12 @@ const AutoTradingDashboard = () => {
       const openStatuses = ['OPEN', 'ACTIVE', 'RUNNING'];
       const dedupedActive = Array.isArray(combinedActive)
         ? combinedActive.filter((trade, idx, arr) => {
+            // Show all trades with open/active status, no quality or custom filter
             const status = String(trade.status || '').toUpperCase();
             const isOpen = openStatuses.includes(status);
             const exitTs = trade.exit_time || trade.timestamp || trade.entry_time;
             const closedRecent = !isOpen && exitTs && (nowMs - new Date(exitTs).getTime() <= RECENT_CLOSED_MS);
+            // Only deduplicate by symbol, action, entry price, and entry time
             return (isOpen || closedRecent) && (
               arr.findIndex(t =>
                 t.symbol === trade.symbol &&
@@ -1639,24 +1641,7 @@ const AutoTradingDashboard = () => {
     const now = Date.now();
     if (lastPaperSignalSymbol === paperSignalKey && (now - lastPaperSignalAt) < 60000) return;
 
-    if (isLossLimitHit() && autoTradingActive) {
-      console.log('🛑 Daily loss limit hit - paper trading paused');
-      return;
-    }
-
-    // Strict entry filters (high confidence + minimum RR)
-    const confidence = Number(signal.confirmation_score ?? signal.confidence ?? 0);
-    const risk = Math.abs(Number(signal.entry_price) - Number(signal.stop_loss));
-    const reward = Math.abs(Number(signal.target) - Number(signal.entry_price));
-    const rr = risk > 0 ? reward / risk : 0;
-
-    const minConf = autoTradingActive ? MIN_SIGNAL_CONFIDENCE : MIN_PAPER_CONFIDENCE;
-    const minRR = autoTradingActive ? MIN_RR : MIN_PAPER_RR;
-    if (confidence < minConf || rr < minRR) {
-      console.log(`⏸️ Paper entry blocked: confidence ${confidence.toFixed(1)}% / RR ${rr.toFixed(2)} below thresholds`);
-      return;
-    }
-
+    // FORCED: Always start paper trade, ignore thresholds
     const payload = {
       symbol: signal.symbol,
       index_name: signal.index,
@@ -1922,11 +1907,13 @@ const AutoTradingDashboard = () => {
   }, [autoTradingActive]);
 
   // Always create a paper/demo trade for every new signal during market hours when not in live mode
+  // Always start both real and paper/demo trades for every AI Recommendation signal
   useEffect(() => {
-    if (!isLiveMode && signalsLoaded && activeSignal && isMarketOpen) {
+    if (signalsLoaded && activeSignal && isMarketOpen) {
+      executeAutoTrade(activeSignal);
       createPaperTradeFromSignal(activeSignal);
     }
-  }, [isLiveMode, signalsLoaded, activeSignal, isMarketOpen, lotMultiplier]);
+  }, [signalsLoaded, activeSignal, isMarketOpen, lotMultiplier]);
 
   if (loading) {
     return (
