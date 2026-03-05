@@ -2692,14 +2692,55 @@ const AutoTradingDashboard = () => {
         }}>
           ⚡ Active Trades (LIVE P&L)
         </h4>
-        {/* show spinner only when we don't already have any rows */}
+        {/* Show spinner only when we don't have any rows AND loading */}
         {activeLoading && activeTrades.length === 0 ? (
-          <p style={{ color: '#718096', fontStyle: 'italic' }}>Loading active trades…</p>
+          <div style={{ 
+            padding: '24px', 
+            textAlign: 'center',
+            display: 'flex',
+            justifyContent: 'center',
+            alignItems: 'center',
+            gap: '8px'
+          }}>
+            <div style={{
+              display: 'inline-block',
+              width: '16px',
+              height: '16px',
+              border: '2px solid #e2e8f0',
+              borderTopColor: '#4299e1',
+              borderRadius: '50%',
+              animation: 'spin 0.8s linear infinite',
+              marginRight: '8px'
+            }}></div>
+            <span style={{ color: '#718096', fontSize: '14px' }}>Loading active trades…</span>
+          </div>
         ) : activeTrades.length > 0 ? (
           <React.Fragment>
             {/* if we're currently fetching but already have rows, show a small updating note */}
             {activeLoading && (
-              <p style={{ color: '#718096', fontSize: '12px', margin: '4px 0' }}>Updating…</p>
+              <div style={{ 
+                padding: '8px 12px',
+                background: '#f0f9ff',
+                border: '1px solid #bee3f8',
+                borderRadius: '4px',
+                fontSize: '12px',
+                color: '#2c5282',
+                marginBottom: '12px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px'
+              }}>
+                <div style={{
+                  display: 'inline-block',
+                  width: '12px',
+                  height: '12px',
+                  border: '2px solid #90cdf4',
+                  borderTopColor: '#2c5282',
+                  borderRadius: '50%',
+                  animation: 'spin 0.8s linear infinite'
+                }}></div>
+                Updating prices…
+              </div>
             )}
             <div style={{ overflowX: 'auto' }}>
               <table style={{
@@ -2812,11 +2853,12 @@ const AutoTradingDashboard = () => {
             </table>
           </div>
           </React.Fragment>
-        ) : (
+        ) : !activeLoading ? (
           <div style={{ color: '#718096', textAlign: 'center', padding: '24px' }}>
             No active trades.
           </div>
-        )}
+        ) : null
+        }
       </div>
 
       {/* Trade History */}
