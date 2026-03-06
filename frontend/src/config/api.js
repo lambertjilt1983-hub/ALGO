@@ -6,14 +6,8 @@ const getApiBaseUrl = () => {
   if (import.meta.env.VITE_API_URL) {
     return import.meta.env.VITE_API_URL;
   }
-  // Priority 2: Auto-detect based on hostname
-  const hostname = window.location.hostname;
-  // Production detection
-  if (hostname !== 'localhost' && hostname !== '127.0.0.1') {
-    return `https://algo-trade-backend.up.railway.app`;
-  }
-  // For development, fallback to Railway backend or local dev server if needed
-  return `https://algo-trade-backend.up.railway.app`;
+  // Local-only mode.
+  return `http://127.0.0.1:8000`;
 };
 
 const getWebSocketUrl = () => {

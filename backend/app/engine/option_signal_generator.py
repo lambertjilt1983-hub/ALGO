@@ -3,6 +3,8 @@ from typing import List, Dict
 import functools
 import threading
 import time
+import re
+import asyncio
 from kiteconnect import KiteConnect
 import os
 from app.core.database import SessionLocal
@@ -442,9 +444,23 @@ def fetch_index_option_chain(
         if lot_size == 15:  # If we got default, use index-specific
             lot_size = lot_size_map.get(index_name, 15)
         
-        # Determine trend direction based on price momentum
-        change_pct = ((spot_price - quote.get(quote_symbol, {}).get('open_price', spot_price)) / quote.get(quote_symbol, {}).get('open_price', spot_price) * 100) if quote.get(quote_symbol, {}).get('open_price') else 0
+        # Determine trend direction robustly using open->last move.
+        # Prefer OHLC open when available, then fallback to legacy open_price.
+        ohlc_open = (quote_data.get("ohlc") or {}).get("open")
+        session_open = ohlc_open if ohlc_open not in (None, 0) else quote_data.get("open_price")
+        if session_open in (None, 0):
+            session_open = spot_price
+
+        change_pct = ((spot_price - session_open) / session_open * 100) if session_open else 0
         trend_bullish = change_pct >= 0
+        trend_direction = "UPTREND" if trend_bullish else "DOWNTREND"
+        abs_change = abs(change_pct)
+        if abs_change >= 1.0:
+            trend_strength = "STRONG"
+        elif abs_change >= 0.4:
+            trend_strength = "MODERATE"
+        else:
+            trend_strength = "WEAK"
         
         # Return BOTH CE and PE signals
         ce_signal = {
@@ -466,7 +482,11 @@ def fetch_index_option_chain(
             "expiry_date": str(nearest_expiry),
             "potential_profit": 25 * lot_size,
             "risk": 20 * lot_size,
-            "option_type": "CE"
+            "option_type": "CE",
+            "trend_direction": trend_direction,
+            "trend_strength": trend_strength,
+            "trend_change_pct": round(change_pct, 3),
+            "trend_aligned": trend_bullish,
         }
         
         pe_signal = {
@@ -488,15 +508,32 @@ def fetch_index_option_chain(
             "expiry_date": str(nearest_expiry),
             "potential_profit": 25 * lot_size,
             "risk": 20 * lot_size,
-            "option_type": "PE"
+            "option_type": "PE",
+            "trend_direction": trend_direction,
+            "trend_strength": trend_strength,
+            "trend_change_pct": round(change_pct, 3),
+            "trend_aligned": not trend_bullish,
         }
         
         # Validate signal quality for both CE and PE
         ce_signal = _validate_signal_quality(ce_signal, kite, quote_data)
         pe_signal = _validate_signal_quality(pe_signal, kite, quote_data)
         
-        # Return the most bullish signal first, PE second
-        return [ce_signal, pe_signal] if trend_bullish else [pe_signal, ce_signal]
+        # Directional enhancement:
+        # - Uptrend: prefer CE only
+        # - Downtrend: prefer PE only
+        # This reduces CE/PE noise and aligns entries with market direction.
+        preferred = ce_signal if trend_bullish else pe_signal
+        counter = pe_signal if trend_bullish else ce_signal
+        preferred["trend_logic"] = "directional_primary"
+        counter["trend_logic"] = "counter_trend_filtered"
+        preferred["counter_signal"] = {
+            "symbol": counter.get("symbol"),
+            "option_type": counter.get("option_type"),
+            "confidence": counter.get("confidence"),
+            "trend_aligned": counter.get("trend_aligned"),
+        }
+        return [preferred]
     except Exception as e:
         return {"index": index_name, "error": str(e)}
 
@@ -514,24 +551,68 @@ def analyze_option_chain(chain: Dict) -> Dict:
 
 
 # --- Simple in-memory cache and rate limiter ---
-_signals_cache = None
-_signals_cache_time = 0
+_signals_cache = {}
 _signals_cache_lock = threading.Lock()
 _signals_cache_ttl = 60  # seconds - increased from 30 to reduce API calls
 _signals_rate_limit = 5  # seconds between calls - reduced from 10
 _signals_last_call = 0
 
+
+def _signals_cache_key(
+    user_id: int | None,
+    symbols: List[str] | None,
+    include_nifty50: bool,
+    include_fno_universe: bool,
+    max_symbols: int,
+) -> str:
+    normalized_symbols = tuple(sorted(s.strip().upper() for s in (symbols or []) if isinstance(s, str) and s.strip()))
+    return (
+        f"user={user_id}|nifty50={int(bool(include_nifty50))}|"
+        f"fno={int(bool(include_fno_universe))}|max={int(max_symbols)}|"
+        f"symbols={','.join(normalized_symbols)}"
+    )
+
+
+def _build_fno_stock_universe(instruments_nfo: List[Dict], max_symbols: int = 120) -> List[str]:
+    """Build a broad yet bounded stock option universe from NFO instruments."""
+    max_symbols = max(20, min(int(max_symbols or 120), 300))
+    index_roots = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"}
+    counts: Dict[str, int] = {}
+
+    for ins in instruments_nfo or []:
+        if ins.get("segment") != "NFO-OPT":
+            continue
+        name = str(ins.get("name") or "").upper().strip()
+        if not name or name in index_roots:
+            continue
+        if not re.match(r"^[A-Z0-9-]+$", name):
+            continue
+        counts[name] = counts.get(name, 0) + 1
+
+    ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+    return [sym for sym, _ in ranked[:max_symbols]]
+
 def generate_signals(
     user_id: int | None = None,
     symbols: List[str] | None = None,
     include_nifty50: bool = False,
+    include_fno_universe: bool = False,
+    max_symbols: int = 120,
 ) -> List[Dict]:
-    global _signals_cache, _signals_cache_time, _signals_last_call
+    global _signals_cache, _signals_last_call
     now = time.time()
+    cache_key = _signals_cache_key(
+        user_id=user_id,
+        symbols=symbols,
+        include_nifty50=include_nifty50,
+        include_fno_universe=include_fno_universe,
+        max_symbols=max_symbols,
+    )
     with _signals_cache_lock:
-        # Serve from cache if not expired
-        if _signals_cache is not None and (now - _signals_cache_time) < _signals_cache_ttl:
-            return _signals_cache
+        # Serve from cache if not expired (cache key includes request parameters).
+        cached = _signals_cache.get(cache_key)
+        if cached and (now - cached["ts"]) < _signals_cache_ttl:
+            return cached["signals"]
         # Rate limit: if last call was too recent, return error signals
         if (now - _signals_last_call) < _signals_rate_limit:
             return [
@@ -577,6 +658,8 @@ def generate_signals(
             selected = indices.copy()
             if include_nifty50:
                 selected.extend(NIFTY_50_SYMBOLS)
+            if include_fno_universe:
+                selected.extend(_build_fno_stock_universe(instruments_nfo, max_symbols=max_symbols))
         # de-duplicate while preserving order
         seen = set()
         selected_symbols = []
@@ -599,8 +682,13 @@ def generate_signals(
                 signals.extend(result)
             else:
                 signals.append(result)
-        _signals_cache = signals
-        _signals_cache_time = now
+        _signals_cache[cache_key] = {"signals": signals, "ts": now}
+
+        # Prevent unbounded growth if many unique keys are requested.
+        if len(_signals_cache) > 20:
+            oldest_key = min(_signals_cache.items(), key=lambda item: item[1]["ts"])[0]
+            _signals_cache.pop(oldest_key, None)
+
         return signals
 
 def select_best_signal(signals: List[Dict]) -> Dict | None:
@@ -728,8 +816,18 @@ async def generate_signals_advanced(
     mode: str = "balanced",
     symbols: List[str] | None = None,
     include_nifty50: bool = False,
+    include_fno_universe: bool = False,
+    max_symbols: int = 120,
 ) -> List[Dict]:
-    signals = generate_signals(user_id=user_id, symbols=symbols, include_nifty50=include_nifty50)
+    # Run heavy sync signal generation off the event loop to keep API responsive.
+    signals = await asyncio.to_thread(
+        generate_signals,
+        user_id,
+        symbols,
+        include_nifty50,
+        include_fno_universe,
+        max_symbols,
+    )
     try:
         sentiment = news_analyzer.get_market_sentiment_summary()
     except Exception:

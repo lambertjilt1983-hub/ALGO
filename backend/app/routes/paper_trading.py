@@ -5,16 +5,19 @@ Track signal performance without real execution
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time as dt_time
 from typing import List, Optional
 from pydantic import BaseModel
+import re
 
 from app.core.database import get_db
+from app.core.market_hours import market_status
 from app.models.trading import PaperTrade
 
 router = APIRouter()
 
 MAX_PAPER_TRADES = 1  # Only one paper trade at a time
+PAPER_SL_COOLDOWN_MINUTES = 2
 
 
 def _option_kind(symbol: str | None) -> str | None:
@@ -26,6 +29,54 @@ def _option_kind(symbol: str | None) -> str | None:
     if upper.endswith("PE"):
         return "PE"
     return None
+
+
+def _symbol_root(symbol: str | None) -> str:
+    """Normalize option/equity symbol to a root (e.g., BANKNIFTY26MAR... -> BANKNIFTY)."""
+    if not symbol:
+        return ""
+    s = symbol.upper().strip()
+    s = re.sub(r'^(NFO:|NSE:|BFO:|BSE:)', '', s)
+    match = re.match(r'([A-Z]+)', s)
+    return match.group(1) if match else s
+
+
+def _paper_sl_cooldown_info(db: Session, symbol: str, side: str, minutes: int = PAPER_SL_COOLDOWN_MINUTES):
+    """Return cooldown status after SL_HIT for same symbol/root + side."""
+    now = datetime.utcnow()
+    cutoff = now - timedelta(minutes=minutes)
+    normalized_side = (side or "BUY").upper()
+    requested_symbol = (symbol or "").upper()
+    requested_root = _symbol_root(requested_symbol)
+
+    recent_sl = db.query(PaperTrade).filter(
+        and_(
+            PaperTrade.status == "SL_HIT",
+            PaperTrade.side == normalized_side,
+            PaperTrade.exit_time.isnot(None),
+            PaperTrade.exit_time >= cutoff,
+        )
+    ).order_by(PaperTrade.exit_time.desc()).all()
+
+    for trade in recent_sl:
+        closed_symbol = (trade.symbol or "").upper()
+        closed_root = _symbol_root(closed_symbol)
+        same_symbol = closed_symbol == requested_symbol
+        same_root = bool(requested_root) and requested_root == closed_root
+        if not (same_symbol or same_root):
+            continue
+
+        elapsed = (now - trade.exit_time).total_seconds()
+        remaining = max(0, int(minutes * 60 - elapsed))
+        if remaining > 0:
+            return True, remaining, {
+                "blocked_by": "SL_HIT_COOLDOWN",
+                "last_sl_trade_id": trade.id,
+                "last_sl_symbol": trade.symbol,
+                "cooldown_minutes": minutes,
+            }
+
+    return False, 0, None
 
 
 class PaperTradeCreate(BaseModel):
@@ -51,6 +102,25 @@ class PaperTradeUpdate(BaseModel):
 @router.post("/paper-trades")
 def create_paper_trade(trade: PaperTradeCreate, db: Session = Depends(get_db)):
     """Log a new paper trade signal - only one open trade allowed"""
+    market = market_status(dt_time(9, 15), dt_time(15, 29))
+    if not market.get("is_open", False):
+        return {
+            "success": False,
+            "message": "Market is closed. New paper trades are blocked outside market hours.",
+            "market_open": False,
+            "market_reason": market.get("reason", "Market closed"),
+            "current_time": market.get("current_time"),
+        }
+
+    blocked, wait_seconds, meta = _paper_sl_cooldown_info(db, trade.symbol, trade.side)
+    if blocked:
+        return {
+            "success": False,
+            "message": "SL cooldown active for this symbol/side. Wait before re-entry.",
+            "wait_seconds": wait_seconds,
+            **(meta or {}),
+        }
+
     open_trades = db.query(PaperTrade).filter(PaperTrade.status == "OPEN").all()
     active_count = len(open_trades)
 

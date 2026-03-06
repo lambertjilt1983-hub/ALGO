@@ -5,6 +5,7 @@ Runs batched price updates and enforces SL/target logic.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime
 from typing import Optional, Dict, List
 
@@ -16,6 +17,24 @@ _price_update_cache = {
     "last_update": 0.0,
     "min_interval": 2.0,  # seconds
 }
+
+
+def _fetch_ltp_with_timeout(kite, symbols: List[str], timeout_s: float = 2.5):
+    """Fetch LTP with a hard timeout so API route does not hang indefinitely."""
+    if not symbols:
+        return {}, None
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(kite.ltp, symbols)
+    try:
+        return future.result(timeout=timeout_s), None
+    except FuturesTimeoutError:
+        future.cancel()
+        return None, f"Price fetch timed out after {timeout_s:.1f}s"
+    except Exception as e:
+        return None, str(e)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _quote_symbol(trade_symbol: str, index_name: Optional[str] = None) -> str:
@@ -90,15 +109,18 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
         except Exception:
             continue
 
-    try:
-        quotes = kite.ltp(quote_symbols)
-    except Exception as e:
+    # Avoid duplicate instruments in one broker call.
+    quote_symbols = list(dict.fromkeys(quote_symbols))
+
+    quotes, fetch_error = _fetch_ltp_with_timeout(kite, quote_symbols, timeout_s=2.5)
+    if fetch_error:
         return {
             "success": False,
-            "message": f"Failed to fetch prices: {str(e)}",
+            "message": f"Failed to fetch prices: {fetch_error}",
             "updated_count": 0,
             "closed_count": 0,
             "total_open": len(open_trades),
+            "timeout": "timed out" in fetch_error.lower(),
         }
 
     updated_count = 0

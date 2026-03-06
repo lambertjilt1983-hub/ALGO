@@ -17,6 +17,8 @@ async def auto_close_trades_task():
             price = trade.get("current_price") or trade.get("entry_price")
             _maybe_update_trail(trade, price)
             if _stop_hit(trade, price):
+                trade["status"] = "SL_HIT"
+                trade["exit_reason"] = "SL_HIT"
                 _close_trade(trade, price)
         # Remove closed trades from active_trades
         active_trades[:] = [t for t in active_trades if t.get("status") == "OPEN"]
@@ -89,7 +91,7 @@ risk_config = {
     "max_position_pct": 0.10,        # 10% max per position
     "max_portfolio_pct": 0.10,       # 10% total exposure
     "cooldown_minutes": 0,           # NO COOLDOWN - trade immediately if conditions met
-    "symbol_cooldown_minutes": 10,   # Cooldown after SL on same symbol/root
+    "symbol_cooldown_minutes": 2,    # Cooldown after SL on same symbol/root
     "min_momentum_pct": 0.5,         # Very strong momentum (0.5%) - avoid weak entries
     "min_trend_strength": 0.8,       # HIGH trend strength (80%) required - quality only
     "require_trend_confirmation": True,  # STRICT: Confirm trend before entry
@@ -166,6 +168,121 @@ def _option_kind(symbol: str | None) -> str | None:
     if upper.endswith("PE"):
         return "PE"
     return None
+
+
+def _cooldown_keys_for_trade(symbol: str | None, side: str | None) -> List[str]:
+    root = _symbol_root(symbol)
+    kind = _option_kind(symbol) or "NA"
+    norm_side = (side or "BUY").upper()
+    keys: List[str] = []
+    if root:
+        keys.append(f"{root}:{norm_side}")
+        keys.append(f"{root}:{kind}:{norm_side}")
+    if symbol:
+        keys.append(f"{symbol.upper()}:{norm_side}")
+    return keys
+
+
+def _record_sl_cooldown(symbol: str | None, side: str | None, at: Optional[datetime] = None) -> None:
+    at = at or datetime.utcnow()
+    cooldowns = state.setdefault("symbol_cooldowns", {})
+    expiry = at + timedelta(minutes=int(risk_config.get("symbol_cooldown_minutes", 2) or 2))
+    for key in _cooldown_keys_for_trade(symbol, side):
+        cooldowns[key] = {
+            "reason": "SL_HIT",
+            "expires_at": expiry.isoformat(),
+            "symbol": symbol,
+            "side": (side or "BUY").upper(),
+        }
+
+
+def _cooldown_info(symbol: str | None, side: str | None) -> Tuple[bool, float, Optional[str]]:
+    now = datetime.utcnow()
+    cooldowns = state.setdefault("symbol_cooldowns", {})
+    active_remaining = 0.0
+    hit_key: Optional[str] = None
+    stale_keys: List[str] = []
+
+    for key in _cooldown_keys_for_trade(symbol, side):
+        rec = cooldowns.get(key)
+        if not rec:
+            continue
+        expires_at_raw = rec.get("expires_at")
+        if not expires_at_raw:
+            stale_keys.append(key)
+            continue
+        try:
+            expires_at = datetime.fromisoformat(expires_at_raw)
+        except Exception:
+            stale_keys.append(key)
+            continue
+
+        remaining = (expires_at - now).total_seconds()
+        if remaining > 0:
+            if remaining > active_remaining:
+                active_remaining = remaining
+                hit_key = key
+        else:
+            stale_keys.append(key)
+
+    for key in stale_keys:
+        cooldowns.pop(key, None)
+
+    return active_remaining > 0, max(0.0, active_remaining), hit_key
+
+
+def _compute_rr(entry_price: Any, target: Any, stop_loss: Any) -> float:
+    try:
+        entry = float(entry_price or 0)
+        tgt = float(target or 0)
+        sl = float(stop_loss or 0)
+        risk = abs(entry - sl)
+        reward = abs(tgt - entry)
+        return (reward / risk) if risk > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _ai_entry_validation(signal: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """Server-side AI gate: quality + confidence + RR + trend/technical alignment."""
+    reasons: List[str] = []
+
+    quality = float(signal.get("quality_score") or signal.get("quality") or 0)
+    confidence = float(signal.get("confirmation_score") or signal.get("confidence") or 0)
+    rr = _compute_rr(signal.get("entry_price"), signal.get("target"), signal.get("stop_loss"))
+
+    if quality < 70:
+        reasons.append(f"quality<{70} ({quality:.1f})")
+    if confidence < 70:
+        reasons.append(f"confidence<{70} ({confidence:.1f})")
+    if rr < 1.1:
+        reasons.append(f"rr<{1.1} ({rr:.2f})")
+
+    option_type = str(signal.get("option_type") or "").upper()
+    trend_direction = str(signal.get("trend_direction") or "").upper()
+    if trend_direction and option_type in {"CE", "PE"}:
+        trend_ok = (
+            ("UP" in trend_direction and option_type == "CE")
+            or ("DOWN" in trend_direction and option_type == "PE")
+        )
+        if not trend_ok:
+            reasons.append(f"trend_mismatch({trend_direction}->{option_type})")
+
+    tech = signal.get("technical_indicators") or {}
+    if isinstance(tech, dict) and option_type in {"CE", "PE"}:
+        rsi = float(tech.get("rsi") or 50)
+        macd = tech.get("macd") if isinstance(tech.get("macd"), dict) else {}
+        macd_cross = str(macd.get("crossover") or "").lower()
+
+        if option_type == "CE":
+            tech_ok = (45 <= rsi <= 75) and (macd_cross in {"", "bullish"})
+        else:
+            tech_ok = (25 <= rsi <= 55) and (macd_cross in {"", "bearish"})
+
+        if not tech_ok:
+            reasons.append(f"technical_mismatch(rsi={rsi:.1f},macd={macd_cross or 'na'})")
+
+    return len(reasons) == 0, reasons
 
 
 def _best_signal_by_quality(signals: List[Dict]) -> Optional[Dict]:
@@ -557,19 +674,18 @@ def _close_trade(trade: Dict[str, any], exit_price: float) -> None:
     pnl = (exit_price - entry) * qty * (1 if side == "BUY" else -1)
     pnl_percentage = (pnl / (entry * qty) * 100) if entry and qty else 0.0
     exit_dt = datetime.utcnow()
+    terminal_status = (trade.get("status") or "").upper()
+    if terminal_status == "OPEN":
+        terminal_status = "CLOSED"
     trade.update({
-        "status": "CLOSED",
+        "status": terminal_status or "CLOSED",
         "exit_price": exit_price,
         "exit_time": exit_dt.isoformat(),
         "pnl": round(pnl, 2),
         "pnl_percentage": round(pnl_percentage, 2),
     })
-    root = _symbol_root(trade.get("symbol") or trade.get("index"))
-    if root:
-        state.setdefault("symbol_cooldowns", {})[root] = {
-            "status": trade.get("status"),
-            "exit_time": exit_dt.isoformat(),
-        }
+    if terminal_status == "SL_HIT":
+        _record_sl_cooldown(trade.get("symbol") or trade.get("index"), side, exit_dt)
     history.append(trade.copy())
     
     # Track daily P&L (both loss and profit)
@@ -998,8 +1114,18 @@ async def analyze(
     quantity: Optional[int] = None,
     authorization: Optional[str] = Header(None),
 ):
-    # Ignore balance, demo mode, and trading window. Only check for live market data.
-    # Always allow auto trade if market is live.
+    # Block new analysis/trade discovery outside configured market window.
+    if not _within_trade_window():
+        market = market_status(dt_time(9, 15), dt_time(15, 30))
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Market is closed. New trades are blocked outside market hours.",
+                "market_open": market.get("is_open", False),
+                "market_reason": market.get("reason", "Market closed"),
+                "current_time": market.get("current_time"),
+            },
+        )
 
     if symbols is not None:
         if not isinstance(symbols, str):
@@ -1114,11 +1240,31 @@ async def analyze(
 
     # Build recommendations for all signals (including CE/PE ATM options)
     recommendations = []
+    blocked_recommendations = []
+    ai_rejected_recommendations = []
     for sig in signals:
+        blocked, remaining_seconds, _ = _cooldown_info(sig.get("symbol"), sig.get("action"))
+        ai_ok, ai_reasons = _ai_entry_validation(sig)
+        if blocked:
+            blocked_recommendations.append({
+                "symbol": sig.get("symbol"),
+                "side": (sig.get("action") or "BUY").upper(),
+                "wait_seconds": round(remaining_seconds, 1),
+                "reason": "SL_HIT_COOLDOWN",
+            })
+        if not ai_ok:
+            ai_rejected_recommendations.append({
+                "symbol": sig.get("symbol"),
+                "side": (sig.get("action") or "BUY").upper(),
+                "reason": "AI_QUALITY_GATE",
+                "details": ai_reasons,
+            })
         recommendations.append({
             "action": sig["action"],
             "symbol": sig["symbol"],
             "confidence": sig["confidence"],
+            "confirmation_score": sig.get("confirmation_score"),
+            "quality_score": sig.get("quality_score"),
             "strategy": sig["strategy"],
             "entry_price": sig["entry_price"],
             "stop_loss": sig["stop_loss"],
@@ -1139,11 +1285,20 @@ async def analyze(
             },
             "option_type": sig.get("option_type"),
             "strike": sig.get("strike"),
+            "trend_direction": sig.get("trend_direction"),
+            "trend_strength": sig.get("trend_strength"),
+            "technical_indicators": sig.get("technical_indicators"),
             "data_source": sig.get("data_source"),
             "option_chain": option_chains[0] if option_chains else None if sig == signals[0] else None,
+            "blocked_by_cooldown": blocked,
+            "cooldown_wait_seconds": round(remaining_seconds, 1) if blocked else 0,
+            "ai_valid": ai_ok,
+            "ai_reasons": ai_reasons,
         })
-    # For backward compatibility, keep the first as 'recommendation'
-    recommendation = recommendations[0] if recommendations else None
+    # Prefer the best AI-valid signal that is not blocked by SL cooldown.
+    ai_candidates = [r for r in recommendations if (not r.get("blocked_by_cooldown")) and r.get("ai_valid")]
+    ai_candidates.sort(key=lambda r: (float(r.get("quality_score") or 0), float(r.get("confirmation_score") or r.get("confidence") or 0)), reverse=True)
+    recommendation = ai_candidates[0] if ai_candidates else None
     # Log/store all recommendations to a file (append as JSON lines)
     try:
         log_path = Path("backend/logs/recommendations.jsonl")
@@ -1176,19 +1331,18 @@ async def analyze(
 
     # Optionally auto-trigger trade execution for each recommendation
     auto_trade_result = None
-    if can_trade:
+    if can_trade and recommendation:
         try:
             from fastapi import Request
-            if recommendation:
-                auto_trade_result = await execute(
-                    symbol=recommendation["symbol"],
-                    side=recommendation["action"],
-                    quantity=recommendation["quantity"],
-                    price=recommendation["entry_price"],
-                    authorization=authorization
-                )
-                if auto_trade_result is not None:
-                    auto_trade_result["executed"] = True
+            auto_trade_result = await execute(
+                symbol=recommendation["symbol"],
+                side=recommendation["action"],
+                quantity=recommendation["quantity"],
+                price=recommendation["entry_price"],
+                authorization=authorization
+            )
+            if auto_trade_result is not None:
+                auto_trade_result["executed"] = True
         except Exception as e:
             print(f"[AUTO TRADE ERROR] Could not auto-execute trade: {e}")
             if auto_trade_result is None:
@@ -1226,6 +1380,8 @@ async def analyze(
         "portfolio_cap": round(balance * risk_config.get("max_portfolio_pct", 1.0), 2),
         "timestamp": _now(),
         "auto_trade_result": auto_trade_result,
+        "blocked_recommendations": blocked_recommendations,
+        "ai_rejected_recommendations": ai_rejected_recommendations,
     }
 
     return response
@@ -1268,9 +1424,26 @@ async def execute(
     support: Optional[float] = None,
     resistance: Optional[float] = None,
     broker_id: int = 1,
+    quality_score: Optional[float] = None,
+    confirmation_score: Optional[float] = None,
+    option_type: Optional[str] = None,
+    trend_direction: Optional[str] = None,
+    trend_strength: Optional[str] = None,
     authorization: Optional[str] = Header(None),
 ):
-    # Ignore balance, demo mode, trading window, and max trades. Always execute trade if market is live.
+    # Hard gate: never allow new trade execution outside configured market window.
+    if not _within_trade_window():
+        market = market_status(dt_time(9, 15), dt_time(15, 30))
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Market is closed. New trade execution is blocked outside market hours.",
+                "market_open": market.get("is_open", False),
+                "market_reason": market.get("reason", "Market closed"),
+                "current_time": market.get("current_time"),
+            },
+        )
+
     mode = "LIVE"
 
     auto_demo = bool(state.get("is_demo_mode"))
@@ -1286,6 +1459,29 @@ async def execute(
         resistance=resistance,
         broker_id=broker_id,
     )
+
+    # Optional server-side AI enforcement when metadata is provided.
+    ai_context = {
+        "symbol": symbol,
+        "entry_price": price,
+        "target": target,
+        "stop_loss": stop_loss,
+        "quality_score": quality_score,
+        "confirmation_score": confirmation_score,
+        "option_type": option_type,
+        "trend_direction": trend_direction,
+        "trend_strength": trend_strength,
+    }
+    if any(v is not None for v in [quality_score, confirmation_score, option_type, trend_direction]):
+        ai_ok, ai_reasons = _ai_entry_validation(ai_context)
+        if not ai_ok:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "message": "Trade rejected by server-side AI quality gate.",
+                    "reasons": ai_reasons,
+                },
+            )
 
     option_kind = _option_kind(trade.symbol)
 
@@ -1351,6 +1547,18 @@ async def execute(
         if existing:
             raise HTTPException(status_code=429, detail="Another trade is already open")
 
+        blocked, wait_seconds, cooldown_key = _cooldown_info(trade.symbol, trade.side)
+        if blocked and not auto_demo:
+            wait_seconds_rounded = int(math.ceil(wait_seconds))
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "message": "SL cooldown active for this trade side/symbol.",
+                    "cooldown_key": cooldown_key,
+                    "wait_seconds": wait_seconds_rounded,
+                },
+            )
+
         broker_response: Dict[str, any] = {}
 
         trail_fields = _init_trailing_fields(trade.price, trade.side)
@@ -1415,6 +1623,11 @@ async def execute(
 async def get_active_trades(authorization: Optional[str] = Header(None)):
     print(f"[API /trades/active] Returning {len(active_trades)} active trades from Zerodha")
     trades = active_trades
+    for trade in trades:
+        entry_price = float(trade.get("entry_price") or trade.get("price") or 0.0)
+        current_price = float(trade.get("current_price") or entry_price)
+        qty = float(trade.get("quantity") or 0)
+        trade["unrealized_pnl"] = (current_price - entry_price) * qty
     return {"trades": trades, "is_demo_mode": False, "count": len(trades)}
 
 
@@ -1544,27 +1757,12 @@ async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
     return {
         "success": True,
         "is_demo_mode": state["is_demo_mode"],
-        "message": f"{mode} trade accepted for {symbol} at {price}",
+        "updated_count": updated_count,
+        "message": f"Updated prices for {updated_count} open trade(s)",
         "timestamp": _now(),
-        "broker_response": broker_response,
-        "stop_loss": derived_stop,
-        "target": derived_target,
+        "backoff_until": live_update_state["backoff_until"],
+        "last_duration": live_update_state["last_duration"],
     }
-
-
-@router.get("/trades/active")
-async def get_active_trades(authorization: Optional[str] = Header(None)):
-    trades = active_trades
-    # Add more status details
-    for t in trades:
-        entry_price = t.get("entry_price", 0)
-        if entry_price is None:
-            entry_price = 0.0
-        current_price = t.get("current_price")
-        if current_price is None:
-            current_price = entry_price
-        t["unrealized_pnl"] = (current_price - entry_price) * t.get("quantity", 0)
-    return {"trades": trades, "is_demo_mode": False, "count": len(trades)}
 
 
 @router.post("/trades/price")
@@ -1585,6 +1783,8 @@ async def update_trade_price(symbol: str, price: float, authorization: Optional[
                 closed += 1
                 continue
             if _stop_hit(trade, price):
+                trade["status"] = "SL_HIT"
+                trade["exit_reason"] = "SL_HIT"
                 _close_trade(trade, price)
                 to_close.append(trade)
                 closed += 1
