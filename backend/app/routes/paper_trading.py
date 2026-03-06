@@ -14,7 +14,7 @@ from app.models.trading import PaperTrade
 
 router = APIRouter()
 
-MAX_PAPER_TRADES = 10  # Allow up to 10 paper trades at a time
+MAX_PAPER_TRADES = 1  # Hard lock: allow only one open paper trade at a time
 
 
 def _option_kind(symbol: str | None) -> str | None:
@@ -57,7 +57,7 @@ def create_paper_trade(trade: PaperTradeCreate, db: Session = Depends(get_db)):
     if active_count >= MAX_PAPER_TRADES:
         return {
             "success": False,
-            "message": f"Cannot create new trade. {active_count} active trade(s) already exist.",
+            "message": f"Cannot create new trade. {active_count} active trade(s) already exist. Close the current trade first.",
             "active_trades": active_count
         }
 
@@ -106,6 +106,7 @@ def get_active_paper_trades(db: Session = Depends(get_db)):
                 "symbol": t.symbol,
                 "index_name": t.index_name,
                 "side": t.side,
+                   "status": "OPEN",
                 "signal_type": t.signal_type,
                 "quantity": t.quantity,
                 "entry_price": t.entry_price,

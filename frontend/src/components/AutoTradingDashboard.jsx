@@ -39,7 +39,7 @@ const PROFESSIONAL_SIGNAL_API = `${config.API_BASE_URL}/strategies/live/professi
 const PAPER_TRADES_ACTIVE_API = `${config.API_BASE_URL}/paper-trades/active`;
 
 // scanner threshold for displayed quality trades
-const QUALITY_THRESHOLD = 85;  // show only signals with quality >= this value
+const QUALITY_THRESHOLD = 65;  // show signals with quality >= this value (lowered from 85 to show signals from all indices)
 const PAPER_TRADES_HISTORY_API = `${config.API_BASE_URL}/paper-trades/history`;
 const PAPER_TRADES_PERFORMANCE_API = `${config.API_BASE_URL}/paper-trades/performance`;
 const PAPER_TRADES_CREATE_API = `${config.API_BASE_URL}/paper-trades`;
@@ -89,6 +89,7 @@ const MARKET_HOLIDAYS = [
 
 // Keep fetching trade data even when the tab is hidden
 const ALWAYS_FETCH_TRADES = true;
+const EMPTY_ACTIVE_CONFIRMATION_POLLS = 2;
 
 // Screen Wake Lock - Prevent browser/system sleep
 
@@ -295,9 +296,15 @@ const AutoTradingDashboard = () => {
     return null;
   };
 
-  // Allow all NSE option chains, not just index symbols
+  // Classify as 'indices' if symbol or index matches known index names, else 'stocks'
   const getSignalGroup = (signal) => {
-    return 'all';
+    const INDEX_NAMES = ['BANKNIFTY', 'NIFTY', 'SENSEX', 'FINNIFTY'];
+    const symbol = (signal.symbol || '').toUpperCase();
+    const index = (signal.index || '').toUpperCase();
+    if (INDEX_NAMES.some(idx => symbol.includes(idx) || index.includes(idx))) {
+      return 'indices';
+    }
+    return 'stocks';
   };
 
   const getBestSignalByKind = (signals, kind) => {
@@ -320,6 +327,55 @@ const AutoTradingDashboard = () => {
   const prevActiveTradesCount = React.useRef(0);
   const didAutoStart = React.useRef(false);
   const executingRef = React.useRef(false);
+  const activeTradesRef = React.useRef([]);
+  const tradeHistoryRef = React.useRef([]);
+  const emptyActivePollsRef = React.useRef(0);
+  const activeLoadedOnceRef = React.useRef(false);
+
+  const areActiveTradesEqual = (prev = [], next = []) => {
+    if (prev === next) return true;
+    if (!Array.isArray(prev) || !Array.isArray(next)) return false;
+    if (prev.length !== next.length) return false;
+
+    for (let i = 0; i < prev.length; i += 1) {
+      const a = prev[i] || {};
+      const b = next[i] || {};
+      if ((a.id ?? null) !== (b.id ?? null)) return false;
+      if ((a.symbol ?? '') !== (b.symbol ?? '')) return false;
+      if (Number(a.entry_price ?? a.price ?? 0) !== Number(b.entry_price ?? b.price ?? 0)) return false;
+      if (Number(a.current_price ?? 0) !== Number(b.current_price ?? 0)) return false;
+      if (Number(a.pnl ?? 0) !== Number(b.pnl ?? 0)) return false;
+      if (Number(a.pnl_percentage ?? a.profit_percentage ?? a.pnl_percent ?? 0) !== Number(b.pnl_percentage ?? b.profit_percentage ?? b.pnl_percent ?? 0)) return false;
+      if ((a.status ?? '') !== (b.status ?? '')) return false;
+      if (Number(a.target ?? 0) !== Number(b.target ?? 0)) return false;
+      if (Number(a.stop_loss ?? 0) !== Number(b.stop_loss ?? 0)) return false;
+      if (Number(a.quantity ?? 0) !== Number(b.quantity ?? 0)) return false;
+      if ((a.entry_time ?? a.timestamp ?? '') !== (b.entry_time ?? b.timestamp ?? '')) return false;
+    }
+
+    return true;
+  };
+
+  const areHistoryTradesEqual = (prev = [], next = []) => {
+    if (prev === next) return true;
+    if (!Array.isArray(prev) || !Array.isArray(next)) return false;
+    if (prev.length !== next.length) return false;
+
+    for (let i = 0; i < prev.length; i += 1) {
+      const a = prev[i] || {};
+      const b = next[i] || {};
+      if ((a.id ?? null) !== (b.id ?? null)) return false;
+      if ((a.symbol ?? '') !== (b.symbol ?? '')) return false;
+      if (Number(a.entry_price ?? a.price ?? 0) !== Number(b.entry_price ?? b.price ?? 0)) return false;
+      if (Number(a.exit_price ?? 0) !== Number(b.exit_price ?? 0)) return false;
+      if (Number(a.profit_loss ?? a.pnl ?? 0) !== Number(b.profit_loss ?? b.pnl ?? 0)) return false;
+      if ((a.status ?? '') !== (b.status ?? '')) return false;
+      if ((a.exit_time ?? '') !== (b.exit_time ?? '')) return false;
+      if ((a.entry_time ?? '') !== (b.entry_time ?? '')) return false;
+    }
+
+    return true;
+  };
 
   const isLossLimitHit = () => {
     const dailyLoss = Number(stats?.daily_loss ?? 0);
@@ -421,7 +477,7 @@ const AutoTradingDashboard = () => {
   const fetchData = async () => {
       // determine if we need to show the "loading" indicator
       // only when we currently have no active trade rows to display.
-      const shouldShowLoading = activeTrades.length === 0;
+      const shouldShowLoading = !activeLoadedOnceRef.current && activeTradesRef.current.length === 0;
       try {
         // Skip if already fetching (prevent duplicate calls)
         if (fetchData.isRunning) {
@@ -459,16 +515,19 @@ const AutoTradingDashboard = () => {
       // Store in localStorage to persist across refreshes
       let historyUrl = `${PAPER_TRADES_HISTORY_API}?days=30&limit=200`;
       console.log('[DEBUG] history fetch url:', historyUrl);
-      const [activeRes, historyRes, perfRes, statusRes] = await Promise.all([
+      const [activeResult, historyResult, perfResult, statusResult] = await Promise.allSettled([
         timeoutPromise(config.authFetch(activeEndpoint), 15000),
         timeoutPromise(config.authFetch(historyUrl), 15000),
         timeoutPromise(config.authFetch(`${PAPER_TRADES_PERFORMANCE_API}?days=30`), 15000),
         timeoutPromise(config.authFetch(AUTO_TRADE_STATUS_API), 15000),
-      ]).catch(e => {
-        // Silent timeout - will use empty defaults
-        return [{ ok: false }, { ok: false }, null, { ok: false }];
-      });
+      ]);
 
+      const activeRes = activeResult.status === 'fulfilled' ? activeResult.value : null;
+      const historyRes = historyResult.status === 'fulfilled' ? historyResult.value : null;
+      const perfRes = perfResult.status === 'fulfilled' ? perfResult.value : null;
+      const statusRes = statusResult.status === 'fulfilled' ? statusResult.value : null;
+
+      const activeFetchFailed = !(activeRes && activeRes.ok);
       const activeData = activeRes?.ok ? await activeRes.json() : { trades: [] };
       // parse history only on successful response
       let history = [];
@@ -507,7 +566,10 @@ const AutoTradingDashboard = () => {
           console.error('[DEBUG] Error restoring from localStorage after fetch failure', storageErr);
         }
       }
-      const active = activeData.trades || [];
+      const active = activeFetchFailed ? activeTradesRef.current : (activeData.trades || []);
+      if (activeFetchFailed) {
+        console.log('[DEBUG] Active trades fetch failed. Preserving previous active rows to avoid false zero state.');
+      }
       console.log('[DEBUG] activeData.trades count', active.length);
       const prevHistLen = tradeHistory.length;
       console.log('[DEBUG] history count', history.length, '(previous', prevHistLen + ')');
@@ -544,10 +606,12 @@ const AutoTradingDashboard = () => {
             // Show all trades with open/active status, no quality or custom filter
             const status = String(trade.status || '').toUpperCase();
             const isOpen = openStatuses.includes(status);
+             // If status field is missing, treat trade as OPEN
+             const isMissingStatus = !trade.status;
             const exitTs = trade.exit_time || trade.timestamp || trade.entry_time;
             const closedRecent = !isOpen && exitTs && (nowMs - new Date(exitTs).getTime() <= RECENT_CLOSED_MS);
             // Only deduplicate by symbol, action, entry price, and entry time
-            return (isOpen || closedRecent) && (
+             return (isOpen || isMissingStatus || closedRecent) && (
               arr.findIndex(t =>
                 t.symbol === trade.symbol &&
                 (t.action || t.side) === (trade.action || trade.side) &&
@@ -558,20 +622,47 @@ const AutoTradingDashboard = () => {
           })
         : [];
       if (dedupedActive && dedupedActive.length > 0) {
-        console.log('[DEBUG] Setting active trades state:', dedupedActive);
-        setActiveTrades(dedupedActive);
+        emptyActivePollsRef.current = 0;
+        if (!areActiveTradesEqual(activeTradesRef.current, dedupedActive)) {
+          console.log('[DEBUG] Setting active trades state:', dedupedActive);
+          setActiveTrades(dedupedActive);
+        }
+        setHasActiveTrade(true);
       } else {
-        setActiveTrades([]);
+        emptyActivePollsRef.current += 1;
+        const hadRows = activeTradesRef.current.length > 0;
+        const shouldClearNow = !hadRows || emptyActivePollsRef.current >= EMPTY_ACTIVE_CONFIRMATION_POLLS;
+        if (shouldClearNow) {
+          if (activeTradesRef.current.length > 0) {
+            setActiveTrades([]);
+          }
+          setHasActiveTrade(false);
+        } else {
+          console.log('[DEBUG] Keeping previous active trades to avoid flicker (transient empty poll)');
+          setHasActiveTrade(true);
+        }
       }
-      setTradeHistory(history);
+      const shouldKeepPreviousHistory =
+        history.length === 0 &&
+        tradeHistoryRef.current.length > 0 &&
+        !historyRes?.ok;
+      const stableHistory = shouldKeepPreviousHistory ? tradeHistoryRef.current : history;
+
+      if (shouldKeepPreviousHistory) {
+        console.log('[DEBUG] Keeping previous trade history to avoid flicker (history fetch failure)');
+      }
+
+      if (!areHistoryTradesEqual(tradeHistoryRef.current, stableHistory)) {
+        setTradeHistory(stableHistory);
+      }
       setReportSummary(perfData);
-      setHasActiveTrade(combinedActive.length > 0);
       // hide spinner only if we showed it earlier
+      activeLoadedOnceRef.current = true;
       if (shouldShowLoading) setActiveLoading(false); // finished fetching active data
 
       // Compute daily P&L from closed trades
       const todayLabel = new Date().toDateString();
-      const dailyTrades = history.filter((t) => {
+      const dailyTrades = stableHistory.filter((t) => {
         const ts = t.exit_time || t.entry_time;
         if (!ts) return false;
         return new Date(ts).toDateString() === todayLabel;
@@ -616,7 +707,9 @@ const AutoTradingDashboard = () => {
     } finally {
       fetchData.isRunning = false;
       setLoading(false);
-      setActiveLoading(false); // make sure spinner stops even on error
+      if (!activeLoadedOnceRef.current && activeTradesRef.current.length === 0) {
+        setActiveLoading(false); // stop initial spinner even on error
+      }
     }
   };
 
@@ -1214,10 +1307,10 @@ const AutoTradingDashboard = () => {
     console.log(`[DEBUG] Signal #${i+1}: symbol=${s.symbol}, quality=${s.quality}, quality_score=${s.quality_score}`);
   });
   const aiCandidates = parsedQualityTrades.filter(s =>
-    (typeof s.quality_score === 'number' && s.quality_score >= 90) ||
-    (typeof s.quality === 'number' && s.quality >= 90)
+    (typeof s.quality_score === 'number' && s.quality_score >= 70) ||
+    (typeof s.quality === 'number' && s.quality >= 70)
   );
-  console.log('[DEBUG] AI Recommendation candidates (quality >= 90%):', aiCandidates);
+  console.log('[DEBUG] AI Recommendation candidates (quality >= 70%):', aiCandidates);
   if (aiCandidates.length > 0) {
     aiRecommendedSignal = aiCandidates.reduce((best, curr) => {
       const currQuality = curr.quality_score || curr.quality || 0;
@@ -1230,10 +1323,14 @@ const AutoTradingDashboard = () => {
       }
       return best;
     }, null);
-    console.log('[DEBUG] AI Recommended Signal (quality >= 90%):', aiRecommendedSignal);
+    console.log('[DEBUG] AI Recommended Signal (quality >= 70%):', aiRecommendedSignal);
+  } else if (parsedQualityTrades.length > 0) {
+    // Fallback: use best available signal
+    aiRecommendedSignal = parsedQualityTrades[0];
+    console.log('[DEBUG] Using fallback: best available signal', aiRecommendedSignal);
   } else {
     aiRecommendedSignal = null;
-    console.log('[DEBUG] No AI Recommendation: No signal with quality >= 90%. qualityTrades:', parsedQualityTrades);
+    console.log('[DEBUG] No AI Recommendation: No signals available.');
   }
 
   // Use quality trade if available, otherwise use AI recommended signal
@@ -1612,13 +1709,20 @@ const AutoTradingDashboard = () => {
   const closeActiveTrade = async (trade) => {
     if (!trade) return;
     try {
-      let response;
+      let response = null;
       if (autoTradingActive && isLiveMode) {
         response = await config.authFetch(config.endpoints.autoTrade.closeTrade, {
           method: 'POST',
           body: JSON.stringify({ trade_id: trade.id, symbol: trade.symbol })
         });
       } else {
+        response = await config.authFetch(`${config.API_BASE_URL}/paper-trades/${trade.id}`, {
+          method: 'PUT',
+          body: JSON.stringify({ status: 'MANUAL_CLOSE' })
+        });
+      }
+      // Fallback: if live close path fails, try direct paper close for this row.
+      if (!response?.ok) {
         response = await config.authFetch(`${config.API_BASE_URL}/paper-trades/${trade.id}`, {
           method: 'PUT',
           body: JSON.stringify({ status: 'MANUAL_CLOSE' })
@@ -1632,6 +1736,22 @@ const AutoTradingDashboard = () => {
       await fetchData();
     } catch (e) {
       console.error('❌ Close trade error:', e.message);
+    }
+  };
+
+  const closeAllActiveTrades = async () => {
+    try {
+      const response = await config.authFetch(`${config.API_BASE_URL}/paper-trades/close-all`, {
+        method: 'POST'
+      });
+      if (!response.ok) {
+        const errText = await response.text();
+        console.error('❌ Close all trades failed:', errText);
+        return;
+      }
+      await fetchData();
+    } catch (e) {
+      console.error('❌ Close all trades error:', e.message);
     }
   };
 
@@ -1717,6 +1837,14 @@ const AutoTradingDashboard = () => {
   };
 
   useEffect(() => {
+    activeTradesRef.current = activeTrades;
+  }, [activeTrades]);
+
+  useEffect(() => {
+    tradeHistoryRef.current = tradeHistory;
+  }, [tradeHistory]);
+
+  useEffect(() => {
     setLoading(false);
     // On mount, auto-scan market for quality trades (with caching)
     setTimeout(() => {
@@ -1743,7 +1871,7 @@ const AutoTradingDashboard = () => {
     }, 30000);
     // Initial data fetch - fetch once immediately
     setHistoryLoading(true);
-    setActiveLoading(true);
+    setActiveLoading(!activeLoadedOnceRef.current && activeTradesRef.current.length === 0);
     const initialDataTimeout = setTimeout(() => {
       fetchData();
     }, 100);
@@ -1758,10 +1886,6 @@ const AutoTradingDashboard = () => {
     }, 30000);
     // Slower refresh interval to reduce load - only every 3 seconds after initial load
     let isFirstRefresh = true;
-    // dynamic interval: faster updates (1s) when there are active trades,
-    // otherwise slower (3s) to save API calls. the effect depends on
-    // `activeTrades.length` so it will re-create when that changes.
-    const intervalMs = activeTrades.length > 0 ? 1000 : 3000;
     const dataRefreshInterval = setInterval(async () => {
       const prevCount = prevActiveTradesCount.current;
       if (document.hidden && !ALWAYS_FETCH_TRADES) {
@@ -1778,8 +1902,8 @@ const AutoTradingDashboard = () => {
       await fetchData();
       // Also refresh quality trades for AI Recommendation and signals
       await scanMarketForQualityTrades(true);
-      prevActiveTradesCount.current = activeTrades.length;
-    }, intervalMs); // milliseconds based on presence of trades
+      prevActiveTradesCount.current = activeTradesRef.current.length;
+    }, 1000);
     return () => {
       clearTimeout(initialDataTimeout);
       clearInterval(dataRefreshInterval);
@@ -1789,7 +1913,7 @@ const AutoTradingDashboard = () => {
       releaseWakeLock();
       stopKeepAliveHeartbeat();
     };
-  }, [enabled, autoTradingActive, activeTrades.length]);
+  }, [enabled, autoTradingActive]);
 
   // Restore auto-trading state from backend on mount
   useEffect(() => {
@@ -2646,11 +2770,11 @@ const AutoTradingDashboard = () => {
                     <td style={{ padding: '12px', fontWeight: '600', fontSize: '13px' }}>{signal.symbol}</td>
                     <td style={{ padding: '12px' }}>
                       <span style={{
-                        padding: '4px 8px',
-                        borderRadius: '4px',
+                        padding: '2px 6px',
+                        borderRadius: '3px',
                         background: signal.action === 'BUY' ? '#c6f6d5' : '#fed7d7',
                         color: signal.action === 'BUY' ? '#22543d' : '#742a2a',
-                        fontSize: '12px',
+                        fontSize: '11px',
                         fontWeight: 'bold'
                       }}>
                         {signal.action}
@@ -2684,73 +2808,66 @@ const AutoTradingDashboard = () => {
 
       {/* Active Trades */}
       <div style={{ marginBottom: '24px' }}>
-        <h4 style={{
-          margin: '0 0 16px 0',
-          color: '#2d3748',
-          fontSize: '18px',
-          fontWeight: 'bold'
-        }}>
-          ⚡ Active Trades (LIVE P&L)
-        </h4>
-        {/* Show spinner only when we don't have any rows AND loading */}
-        {activeLoading && activeTrades.length === 0 ? (
-          <div style={{ 
-            padding: '24px', 
-            textAlign: 'center',
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+          <h4 style={{
+            margin: 0,
+            color: '#2d3748',
+            fontSize: '18px',
+            fontWeight: 'bold'
+          }}>
+            ⚡ Active Trades (LIVE P&L)
+          </h4>
+          <button
+            onClick={closeAllActiveTrades}
+            disabled={activeTrades.length === 0}
+            style={{
+              padding: '8px 12px',
+              borderRadius: '6px',
+              border: '1px solid #c53030',
+              background: activeTrades.length === 0 ? '#edf2f7' : '#fff5f5',
+              color: activeTrades.length === 0 ? '#a0aec0' : '#c53030',
+              fontSize: '12px',
+              fontWeight: 600,
+              cursor: activeTrades.length === 0 ? 'not-allowed' : 'pointer'
+            }}
+          >
+            Close All Active Trades
+          </button>
+        </div>
+        {activeLoading && (
+          <div style={{
+            padding: '8px 12px',
+            background: '#f0f9ff',
+            border: '1px solid #bee3f8',
+            borderRadius: '4px',
+            fontSize: '12px',
+            color: '#2c5282',
+            marginBottom: '12px',
             display: 'flex',
-            justifyContent: 'center',
             alignItems: 'center',
-            gap: '8px'
+            gap: '6px'
           }}>
             <div style={{
               display: 'inline-block',
-              width: '16px',
-              height: '16px',
-              border: '2px solid #e2e8f0',
-              borderTopColor: '#4299e1',
+              width: '12px',
+              height: '12px',
+              border: '2px solid #90cdf4',
+              borderTopColor: '#2c5282',
               borderRadius: '50%',
-              animation: 'spin 0.8s linear infinite',
-              marginRight: '8px'
+              animation: 'spin 0.8s linear infinite'
             }}></div>
-            <span style={{ color: '#718096', fontSize: '14px' }}>Loading active trades…</span>
+            Updating prices…
           </div>
-        ) : activeTrades.length > 0 ? (
-          <React.Fragment>
-            {/* if we're currently fetching but already have rows, show a small updating note */}
-            {activeLoading && (
-              <div style={{ 
-                padding: '8px 12px',
-                background: '#f0f9ff',
-                border: '1px solid #bee3f8',
-                borderRadius: '4px',
-                fontSize: '12px',
-                color: '#2c5282',
-                marginBottom: '12px',
-                display: 'flex',
-                alignItems: 'center',
-                gap: '6px'
-              }}>
-                <div style={{
-                  display: 'inline-block',
-                  width: '12px',
-                  height: '12px',
-                  border: '2px solid #90cdf4',
-                  borderTopColor: '#2c5282',
-                  borderRadius: '50%',
-                  animation: 'spin 0.8s linear infinite'
-                }}></div>
-                Updating prices…
-              </div>
-            )}
-            <div style={{ overflowX: 'auto' }}>
-              <table style={{
-                width: '100%',
-                borderCollapse: 'collapse',
-                fontSize: '13px',
-                background: 'white',
-                borderRadius: '8px',
-              overflow: 'hidden'
-            }}>
+        )}
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{
+            width: '100%',
+            borderCollapse: 'collapse',
+            fontSize: '13px',
+            background: 'white',
+            borderRadius: '8px',
+            overflow: 'hidden'
+          }}>
               <thead>
                 <tr style={{ background: '#f7fafc', borderBottom: '2px solid #e2e8f0' }}>
                   <th style={{ padding: '10px', textAlign: 'left' }}>Symbol</th>
@@ -2772,14 +2889,14 @@ const AutoTradingDashboard = () => {
                   const entry = Number(trade.entry_price ?? trade.price ?? 0);
                   const current = Number(trade.current_price ?? entry);
                   const pnl = Number(trade.pnl ?? 0);
-                  const pnlPct = Number(trade.pnl_percentage ?? 0);
+                  const pnlPct = Number(trade.pnl_percentage ?? trade.profit_percentage ?? trade.pnl_percent ?? 0);
                   const action = trade.side || 'BUY';
                   const target = Number(trade.target ?? 0);
                   const stopLoss = Number(trade.stop_loss ?? 0);
                   const qty = Number(trade.quantity ?? 0);
                   const expected = entry > 0 && target > 0 ? Math.abs(target - entry) * qty : 0;
                   return (
-                    <tr key={trade.id} style={{ borderBottom: '1px solid #e2e8f0' }}>
+                    <tr key={`${trade.id ?? 'na'}-${trade.symbol ?? 'sym'}-${trade.entry_time ?? trade.timestamp ?? 'ts'}-${trade.side ?? trade.action ?? 'BUY'}-${trade.entry_price ?? trade.price ?? 0}`} style={{ borderBottom: '1px solid #e2e8f0' }}>
                       <td style={{ padding: '10px', fontWeight: '600' }}>{trade.symbol}</td>
                       <td style={{ padding: '10px' }}>
                         <span style={{
@@ -2849,16 +2966,16 @@ const AutoTradingDashboard = () => {
                     </tr>
                   );
                 })}
+                {activeTrades.length === 0 && (
+                  <tr>
+                    <td colSpan={12} style={{ padding: '24px', textAlign: 'center', color: '#718096' }}>
+                      {activeLoading ? 'Loading active trades...' : 'No active trades.'}
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
-          </React.Fragment>
-        ) : !activeLoading ? (
-          <div style={{ color: '#718096', textAlign: 'center', padding: '24px' }}>
-            No active trades.
-          </div>
-        ) : null
-        }
       </div>
 
       {/* Trade History */}
@@ -3003,7 +3120,7 @@ const AutoTradingDashboard = () => {
                   }
                   const action = trade.action || trade.side || 'BUY';
                   return (
-                    <tr key={idx} style={{ borderBottom: '1px solid #e2e8f0' }}>
+                    <tr key={`${trade.id ?? idx}-${trade.symbol ?? 'sym'}-${trade.entry_time ?? 'et'}-${trade.exit_time ?? 'xt'}`} style={{ borderBottom: '1px solid #e2e8f0' }}>
                       <td style={{ padding: '10px' }}>#{idx + 1}</td>
                       <td style={{ padding: '10px', fontWeight: '600' }}>{trade.symbol || trade.index || '—'}</td>
                       <td style={{ padding: '10px' }}>
@@ -3121,222 +3238,6 @@ const AutoTradingDashboard = () => {
           >
             📊 Analyze Market Now
           </button>
-        </div>
-      )}
-      
-
-      {activeTab === 'report' && (
-        <div style={{
-          background: 'white',
-          borderRadius: '12px',
-          padding: '20px',
-          border: '1px solid #e2e8f0'
-        }}>
-          <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', marginBottom: '16px' }}>
-            <div style={{ padding: '16px', background: '#1a202c', color: 'white', borderRadius: '10px', minWidth: '180px' }}>
-              <div style={{ fontSize: '12px', opacity: 0.8 }}>Today P&L</div>
-              <div style={{ fontSize: '26px', fontWeight: '700', color: (todayPnlFromSummary ?? sumPnl(tradesToday)) >= 0 ? '#c6f6d5' : '#fed7d7' }}>
-                ₹{(todayPnlFromSummary ?? sumPnl(tradesToday)).toLocaleString()}
-              </div>
-            </div>
-            <div style={{ padding: '16px', background: '#2b6cb0', color: 'white', borderRadius: '10px', minWidth: '180px' }}>
-              <div style={{ fontSize: '12px', opacity: 0.9 }}>Today Trades</div>
-              <div style={{ fontSize: '26px', fontWeight: '700' }}>{tradesToday.length}</div>
-            </div>
-            <div style={{ padding: '16px', background: '#2f855a', color: 'white', borderRadius: '10px', minWidth: '180px' }}>
-              <div style={{ fontSize: '12px', opacity: 0.9 }}>Today Win / Loss</div>
-              <div style={{ fontSize: '16px', fontWeight: '700' }}>{sumWins(tradesToday)} / {tradesToday.length - sumWins(tradesToday)}</div>
-            </div>
-            <div style={{ padding: '16px', background: '#4a5568', color: 'white', borderRadius: '10px', minWidth: '180px' }}>
-              <div style={{ fontSize: '12px', opacity: 0.9 }}>Overall P&L</div>
-              <div style={{ fontSize: '26px', fontWeight: '700', color: overallPnl >= 0 ? '#c6f6d5' : '#fed7d7' }}>
-                ₹{overallPnl.toLocaleString()}
-              </div>
-            </div>
-          </div>
-
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-            <h4 style={{ margin: 0, color: '#2d3748' }}>Trade Report (search & history)</h4>
-            <input
-              type="text"
-              placeholder="Search symbol / action / status"
-              value={historySearch}
-              onChange={(e) => setHistorySearch(e.target.value)}
-              style={{
-                padding: '10px 12px',
-                borderRadius: '8px',
-                border: '1px solid #cbd5e0',
-                minWidth: '240px'
-              }}
-            />
-          </div>
-
-          <div style={{ marginBottom: '12px' }}>
-            <h5 style={{ margin: '0 0 8px 0', color: '#2d3748' }}>Today Trades</h5>
-            <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
-                <thead style={{ background: '#f7fafc', borderBottom: '2px solid #e2e8f0' }}>
-                  <tr>
-                    <th style={{ padding: '8px', textAlign: 'left' }}>ID</th>
-                    <th style={{ padding: '8px', textAlign: 'left' }}>Symbol</th>
-                    <th style={{ padding: '8px', textAlign: 'left' }}>Action</th>
-                    <th style={{ padding: '8px', textAlign: 'right' }}>Entry</th>
-                    <th style={{ padding: '8px', textAlign: 'right' }}>Exit</th>
-                    <th style={{ padding: '8px', textAlign: 'right' }}>P&L</th>
-                    <th style={{ padding: '8px', textAlign: 'left' }}>Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {todayTableRows.map((t, idx) => {
-                    const entry = Number(t.entry_price || t.price || 0);
-                    const exit = t.exit_price != null ? Number(t.exit_price) : null;
-                    const pnl = Number(t.pnl ?? t.profit_loss ?? 0);
-                    const action = t.action || t.side || 'BUY';
-                    return (
-                      <tr key={idx} style={{ borderBottom: '1px solid #e2e8f0' }}>
-                        <td style={{ padding: '8px' }}>{t.id}</td>
-                        <td style={{ padding: '8px', fontWeight: '600' }}>{t.symbol || t.index || '—'}</td>
-                        <td style={{ padding: '8px' }}>
-                          <span style={{
-                            padding: '2px 6px',
-                            borderRadius: '3px',
-                            background: action === 'BUY' ? '#c6f6d5' : '#fed7d7',
-                            color: action === 'BUY' ? '#22543d' : '#742a2a',
-                            fontSize: '11px',
-                            fontWeight: 'bold'
-                          }}>
-                            {action}
-                          </span>
-                        </td>
-                        <td style={{ padding: '8px', textAlign: 'right' }}>₹{entry.toFixed(2)}</td>
-                        <td style={{ padding: '8px', textAlign: 'right' }}>₹{exit !== null ? exit.toFixed(2) : '-'}</td>
-                        <td style={{
-                          padding: '8px',
-                          textAlign: 'right',
-                          fontWeight: '700',
-                          color: pnl >= 0 ? '#48bb78' : '#f56565'
-                        }}>
-                          {pnl >= 0 ? '+' : ''}₹{pnl.toLocaleString()}
-                        </td>
-                        <td style={{
-                          padding: '8px',
-                          textAlign: 'right',
-                          fontWeight: '600',
-                          color: pnlPct >= 0 ? '#48bb78' : '#f56565'
-                        }}>
-                          {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%
-                        </td>
-                        <td style={{ padding: '8px' }}>
-                          <span style={{
-                            padding: '2px 6px',
-                            borderRadius: '3px',
-                            background: trade.status === 'CLOSED' ? '#bee3f8' : '#feebc8',
-                            color: trade.status === 'CLOSED' ? '#2c5282' : '#7c2d12',
-                            fontSize: '11px',
-                            fontWeight: 'bold'
-                          }}>
-                            {trade.status || 'CLOSED'}
-                          </span>
-                        </td>
-                        <td style={{ padding: '8px', fontSize: '11px', color: '#718096' }}>
-                          {trade.exit_time ? new Date(trade.exit_time).toLocaleString() : (trade.entry_time ? new Date(trade.entry_time).toLocaleString() : '-')}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-            {tradesToday.length === 0 && (
-              <div style={{ marginTop: '8px', fontSize: '12px', color: '#718096' }}>
-                Showing sample rows. Real trades will appear here once captured today.
-              </div>
-            )}
-          </div>
-
-          {filteredHistory.length === 0 ? (
-            <div style={{ padding: '24px', textAlign: 'center', color: '#718096', border: '1px dashed #e2e8f0', borderRadius: '10px' }}>
-              No trades found for the current filters.
-            </div>
-          ) : (
-            <div style={{ overflowX: 'auto', maxHeight: '480px', overflowY: 'auto' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
-                <thead style={{ position: 'sticky', top: 0, background: '#f7fafc', zIndex: 1 }}>
-                  <tr style={{ borderBottom: '2px solid #e2e8f0' }}>
-                    <th style={{ padding: '10px', textAlign: 'left' }}>ID</th>
-                    <th style={{ padding: '10px', textAlign: 'left' }}>Symbol</th>
-                    <th style={{ padding: '10px', textAlign: 'left' }}>Action</th>
-                    <th style={{ padding: '10px', textAlign: 'right' }}>Entry</th>
-                    <th style={{ padding: '10px', textAlign: 'right' }}>Exit</th>
-                    <th style={{ padding: '10px', textAlign: 'right' }}>P&L</th>
-                    <th style={{ padding: '10px', textAlign: 'right' }}>%</th>
-                    <th style={{ padding: '10px', textAlign: 'left' }}>Status</th>
-                    <th style={{ padding: '10px', textAlign: 'left' }}>Date</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredHistory.map((trade, idx) => {
-                    const entry = Number(trade.entry_price || trade.price || 0);
-                    const exit = trade.exit_price != null ? Number(trade.exit_price) : null;
-                    const pnl = Number(trade.profit_loss ?? trade.pnl ?? 0);
-                    const pnlPct = Number(trade.profit_percentage ?? trade.pnl_percent ?? 0);
-                    const action = trade.action || trade.side || 'BUY';
-                    return (
-                      <tr key={idx} style={{ borderBottom: '1px solid #e2e8f0' }}>
-                        <td style={{ padding: '10px' }}>#{trade.id}</td>
-                        <td style={{ padding: '10px', fontWeight: '600' }}>{trade.symbol || trade.index || '—'}</td>
-                        <td style={{ padding: '10px' }}>
-                          <span style={{
-                            padding: '2px 6px',
-                            borderRadius: '3px',
-                            background: action === 'BUY' ? '#c6f6d5' : '#fed7d7',
-                            color: action === 'BUY' ? '#22543d' : '#742a2a',
-                            fontSize: '11px',
-                            fontWeight: 'bold'
-                          }}>
-                            {action}
-                          </span>
-                        </td>
-                        <td style={{ padding: '10px', textAlign: 'right' }}>₹{entry.toFixed(2)}</td>
-                        <td style={{ padding: '10px', textAlign: 'right' }}>₹{exit !== null ? exit.toFixed(2) : '-'}</td>
-                        <td style={{
-                          padding: '10px',
-                          textAlign: 'right',
-                          fontWeight: '700',
-                          color: pnl >= 0 ? '#48bb78' : '#f56565'
-                        }}>
-                          {pnl >= 0 ? '+' : ''}₹{pnl.toLocaleString()}
-                        </td>
-                        <td style={{
-                          padding: '10px',
-                          textAlign: 'right',
-                          fontWeight: '600',
-                          color: pnlPct >= 0 ? '#48bb78' : '#f56565'
-                        }}>
-                          {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%
-                        </td>
-                        <td style={{ padding: '10px' }}>
-                          <span style={{
-                            padding: '2px 6px',
-                            borderRadius: '3px',
-                            background: trade.status === 'CLOSED' ? '#bee3f8' : '#feebc8',
-                            color: trade.status === 'CLOSED' ? '#2c5282' : '#7c2d12',
-                            fontSize: '11px',
-                            fontWeight: 'bold'
-                          }}>
-                            {trade.status || 'CLOSED'}
-                          </span>
-                        </td>
-                        <td style={{ padding: '10px', fontSize: '11px', color: '#718096' }}>
-                          {trade.exit_time ? new Date(trade.exit_time).toLocaleDateString() : (trade.entry_time ? new Date(trade.entry_time).toLocaleDateString() : '-')}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
         </div>
       )}
       
