@@ -2,10 +2,16 @@ import React, { useState, useEffect } from 'react';
 import config from '../config/api';
 
 // Helper function to format dates in IST timezone
+// Append 'Z' for timezone-naive strings so they parse as UTC instead of
+// being treated as local time (prevents 5:30‑hour misalignment in IST).
 const formatTimeIST = (dateString) => {
   if (!dateString) return '--';
   try {
-    const date = new Date(dateString);
+    let s = dateString;
+    if (!/[Zz]|[+-]\d{2}:?\d{2}/.test(s)) {
+      s = s + 'Z';
+    }
+    const date = new Date(s);
     return date.toLocaleString('en-IN', {
       timeZone: 'Asia/Kolkata',
       year: 'numeric',

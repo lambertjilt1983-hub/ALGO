@@ -6,7 +6,11 @@ import toast from 'react-hot-toast';
 const formatTimeIST = (dateString) => {
   if (!dateString) return '--';
   try {
-    const date = new Date(dateString);
+    let s = dateString;
+    if (!/[Zz]|[+-]\d{2}:?\d{2}/.test(s)) {
+      s = s + 'Z';
+    }
+    const date = new Date(s);
     return date.toLocaleString('en-IN', {
       timeZone: 'Asia/Kolkata',
       year: 'numeric',

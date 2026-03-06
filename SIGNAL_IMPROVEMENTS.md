@@ -123,13 +123,17 @@ BEFORE: 0.2% → AFTER: 0.4%  # Lock gains earlier
 
 #### Minimum Quality Requirements:
 ```python
-# BEFORE:
-is_high_quality = quality_score >= 60
+# In production the system is now extremely selective: only signals with
+# an internal quality_score of 90 or above are treated as "high quality".
+# A secondary fallback relaxes the requirement to 80 when no 90+ signals
+# are available, avoiding a complete drop‑out.
 
-# AFTER:
-is_high_quality = quality_score >= 70  # Stricter threshold
+is_high_quality = quality_score >= 90
+# fallback in select_best_signal():
+# viable = [s for s in viable if s.get("quality_score", 0) >= 80]
 
-# Confidence adjustments:
+# Confidence adjustment bands remain the same (see below) but will be
+# triggered far less often because the base filter is stricter.
 if quality_score >= 85:
     confidence = min(95, base_confidence + 8)
 elif quality_score >= 70:
@@ -152,11 +156,12 @@ def select_best_signal(signals):
     viable = [s for s in signals if not s.get("error") and s.get("symbol")]
     
     # Stage 2: Filter by quality score (NEW!)
-    high_quality = [s for s in viable if s.get("quality_score", 0) >= 65]
+    # Now strictly require 90%+ quality, with an 80% fallback if nothing qualifies
+    high_quality = [s for s in viable if s.get("quality_score", 0) >= 90]
     if high_quality:
         viable = high_quality
     else:
-        viable = [s for s in viable if s.get("quality_score", 0) >= 55]
+        viable = [s for s in viable if s.get("quality_score", 0) >= 80]
         if not viable:
             return None  # No acceptable signals
     

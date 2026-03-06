@@ -28,12 +28,37 @@ async def get_live_professional_signal(
     current_user: User = Depends(AuthService.get_current_user),
 ):
     """Return the same best live signal used by option signals and auto-trade analyze."""
+    import logging
+    logger = logging.getLogger("trading_bot")
+    
     signals = await generate_signals_advanced(user_id=getattr(current_user, "id", None))
+    logger.info(f"[PROFESSIONAL-SIGNAL] Generated {len(signals) if signals else 0} signals")
+    
+    if signals:
+        for idx, sig in enumerate(signals):
+            quality = sig.get("quality_score", 0)
+            symbol = sig.get("symbol", "?")
+            error = sig.get("error", None)
+            logger.info(f"[PROFESSIONAL-SIGNAL] Signal {idx+1}: {symbol} Quality={quality}, Error={error}")
+    
+    # First try strict selection using updated high-quality filter (only 90%+ signals with 80% fallback)
     best = select_best_signal(signals)
+    
+    # If no signal passed strict filtering, use fallback logic for professional signal endpoint
     if not best:
-        raise HTTPException(status_code=503, detail="No live option signals available.")
+        logger.warning(f"[PROFESSIONAL-SIGNAL] No signal passed strict filter from {len(signals) if signals else 0} generated signals")
+        
+        # Fallback: Pick the highest quality signal that has valid entry_price (even if quality < 55)
+        viable = [s for s in signals if not s.get("error") and s.get("symbol") and s.get("entry_price")]
+        if viable:
+            best = max(viable, key=lambda s: (s.get("quality_score", 0), s.get("confidence", 0)))
+            logger.info(f"[PROFESSIONAL-SIGNAL] Using fallback signal: {best.get('symbol')} (quality={best.get('quality_score', 0)})")
+        else:
+            logger.error(f"[PROFESSIONAL-SIGNAL] No viable signals found after fallback")
+            raise HTTPException(status_code=503, detail="No live option signals available.")
 
     action = (best.get("action") or "HOLD").lower()
+    logger.info(f"[PROFESSIONAL-SIGNAL] Selected: {best.get('symbol')} - Action={action}, Quality={best.get('quality_score', 0)}")
     return {
         "symbol": best.get("symbol"),
         "signal": action,

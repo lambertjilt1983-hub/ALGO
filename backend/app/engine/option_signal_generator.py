@@ -613,14 +613,14 @@ def select_best_signal(signals: List[Dict]) -> Dict | None:
     if not viable:
         return None
     
-    # CRITICAL: Filter out low-quality signals (quality_score < 65)
-    # This prevents most losing trades by avoiding weak/choppy setups
-    high_quality = [s for s in viable if s.get("quality_score", 0) >= 65]
+    # CRITICAL: Filter out low-quality signals (quality_score < 85)
+    # Prefer very strong setups, but allow good ones through too.
+    high_quality = [s for s in viable if s.get("quality_score", 0) >= 85]
     if high_quality:
-        viable = high_quality  # Prefer high-quality signals
+        viable = high_quality  # Prefer highest quality signals (85%+)
     else:
-        # If no high-quality signals, at least require quality_score >= 55
-        viable = [s for s in viable if s.get("quality_score", 0) >= 55]
+        # Fallback: if nothing meets 85% quality, accept 75%+ signals
+        viable = [s for s in viable if s.get("quality_score", 0) >= 75]
         if not viable:
             return None  # No acceptable quality signals
     

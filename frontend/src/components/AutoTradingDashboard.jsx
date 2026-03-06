@@ -87,10 +87,20 @@ const MARKET_HOLIDAYS = [
 const ALWAYS_FETCH_TRADES = true;
 
 // Helper function to format dates in IST timezone
+// Many backend datetime strings are UTC but emitted without a "Z" suffix.
+// Browsers interpret offset-less ISO strings as local time, which causes a
+// 5½‑hour shift on machines running IST. To avoid that we append a 'Z'
+// when no timezone information is present, forcing the value to be parsed
+// as UTC before converting to Asia/Kolkata.
 const formatTimeIST = (dateString) => {
   if (!dateString) return '--';
   try {
-    const date = new Date(dateString);
+    // append Z if string lacks any timezone indicator
+    let s = dateString;
+    if (!/[Zz]|[+-]\d{2}:?\d{2}/.test(s)) {
+      s = s + 'Z';
+    }
+    const date = new Date(s);
     return date.toLocaleString('en-IN', {
       timeZone: 'Asia/Kolkata',
       year: 'numeric',
@@ -138,7 +148,53 @@ const AutoTradingDashboard = () => {
   });
   const [signalsLoaded, setSignalsLoaded] = useState(false);
   const [wakeLockActive, setWakeLockActive] = useState(false);
+
+  // calculate whether market is open (used by many effects below)
+  const getIstDateParts = () => {
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+      weekday: 'short'
+    });
+    const parts = formatter.formatToParts(new Date());
+    const map = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+    return {
+      year: map.year,
+      month: map.month,
+      day: map.day,
+      hour: Number(map.hour),
+      minute: Number(map.minute),
+      weekday: map.weekday,
+      iso: `${map.year}-${map.month}-${map.day}`
+    };
+  };
+
+  const { hour: istHour, minute: istMinute, weekday: istWeekday, iso: istIso } = getIstDateParts();
+  const isWeekend = istWeekday === 'Sat' || istWeekday === 'Sun';
+  const isHoliday = MARKET_HOLIDAYS.includes(istIso);
+  const isBeforeOpen = istHour < MARKET_OPEN_HOUR || (istHour === MARKET_OPEN_HOUR && istMinute < MARKET_OPEN_MINUTE);
+  const isAfterClose = istHour > MARKET_CLOSE_HOUR || (istHour === MARKET_CLOSE_HOUR && istMinute > MARKET_CLOSE_MINUTE);
+  const localMarketOpen = !isWeekend && !isHoliday && !isBeforeOpen && !isAfterClose;
+  const localMarketReason = isWeekend
+    ? 'Weekend'
+    : isHoliday
+      ? 'Holiday'
+      : isBeforeOpen
+        ? 'Before market open'
+        : isAfterClose
+          ? 'After market close'
+          : 'Open';
+  const backendMarketOpen = typeof stats?.market_open === 'boolean' ? stats.market_open : null;
+  const backendMarketReason = stats?.market_reason || null;
+  const isMarketOpen = backendMarketOpen !== null ? backendMarketOpen : localMarketOpen;
+  const marketClosedReason = isMarketOpen ? null : (backendMarketReason || localMarketReason);
   const [qualityTrades, setQualityTrades] = useState([]); // Market scanner results
+  const [totalSignalsScanned, setTotalSignalsScanned] = useState(0); // Track total for messaging
   const [scannerLoading, setScannerLoading] = useState(false);
   const [scannerTab, setScannerTab] = useState('indices');
   const [lossLimit, setLossLimit] = useState(() => {
@@ -293,7 +349,7 @@ const AutoTradingDashboard = () => {
   // Market Quality Scanner - finds all 75%+ quality trades
   const scanMarketForQualityTrades = async () => {
     setScannerLoading(true);
-    console.log('🔍 Scanning entire market for quality trades (75%+)...');
+    console.log('🔍 Scanning entire market for top‑quality trades (90%+)...');
     
     try {
       // Fetch all signals from the market
@@ -320,13 +376,13 @@ const AutoTradingDashboard = () => {
           factors: quality.factors,
           rr,
           optimalRR,
-          recommendation: quality.quality >= 85 ? '⭐ EXCELLENT' : quality.quality >= 75 ? '✅ GOOD' : '❌ POOR'
+          recommendation: quality.quality >= 90 ? '⭐ EXCELLENT' : quality.quality >= 80 ? '✅ GOOD' : '❌ POOR'
         };
       });
       
-      // Filter only 50%+ quality trades and sort by quality descending (weighted scoring)
+      // Filter only 90%+ quality trades and sort by quality descending (weighted scoring)
       const qualityOnly = qualityScores
-        .filter(s => s.quality >= 50)
+        .filter(s => s.quality >= 90)
         .sort((a, b) => b.quality - a.quality);
 
       // Count today's executed trades (active + closed)
@@ -344,16 +400,15 @@ const AutoTradingDashboard = () => {
       const totalTradesToday = tradesToday.length + activeToday.length;
       
       console.log(`✅ Market Scan Complete: ${qualityOnly.length} quality trades found (${allSignals.length} total signals)`);
-      console.log(`📊 All Signal Scores:`, qualityScores.map(s => ({ symbol: s.symbol, quality: s.quality, confidence: s.factors?.confidenceScore })));
-      
-      // Log top 5 trades for debugging
-      qualityOnly.slice(0, 5).forEach((t, i) => {
-        console.log(`  #${i+1}: ${t.symbol} - Quality: ${t.quality}% (Confidence: ${t.factors?.confidenceScore?.toFixed(1)}, RR: ${t.factors?.rrScore?.toFixed(1)}, Win Rate: ${t.factors?.winRateScore?.toFixed(1)})`);
-      });
+      setTotalSignalsScanned(allSignals.length);
       setQualityTrades(qualityOnly);
+      if (qualityOnly.length === 0) {
+        setProfessionalSignal(null);
+      }
     } catch (err) {
       console.error('❌ Market scan failed:', err);
       setQualityTrades([]);
+      setProfessionalSignal(null);
     } finally {
       setScannerLoading(false);
     }
@@ -404,8 +459,15 @@ const AutoTradingDashboard = () => {
         })
       : active;
     
-    setActiveTrades(dedupedActive);
-    setTradeHistory(history);
+    // If screen wake lock is active we prefer to keep existing data
+    // visible even if fetch returns empty arrays (temporary glitch).
+    if (wakeLockActive) {
+      if (dedupedActive.length > 0) setActiveTrades(dedupedActive);
+      if (history.length > 0) setTradeHistory(history);
+    } else {
+      setActiveTrades(dedupedActive);
+      setTradeHistory(history);
+    }
     setReportSummary(perfData);
     setHasActiveTrade(active.length > 0);
 
@@ -457,18 +519,23 @@ const AutoTradingDashboard = () => {
       await performDataFetch();
     } catch (e) {
       // Silent error handling - graceful degradation
-      setActiveTrades([]);
-      setTradeHistory([]);
-      setReportSummary(null);
+      // When screen wake lock is active we don't want to clear the
+      // visible trades (would cause flicker) so only reset if not
+      // currently holding the wake lock.
+      if (!wakeLockActive) {
+        setActiveTrades([]);
+        setTradeHistory([]);
+        setReportSummary(null);
+      }
     }
   };
 
   // Background refresh WITHOUT loading state (prevents flickering)
   const refreshTradesQuietly = async () => {
     try {
-      // Throttle: Skip if fetched within last 3 seconds
+      // Throttle: Skip if fetched within last 1 second
       const now = Date.now();
-      if (refreshTradesQuietly.lastRun && (now - refreshTradesQuietly.lastRun) < 3000) {
+      if (refreshTradesQuietly.lastRun && (now - refreshTradesQuietly.lastRun) < 1000) {
         return; // Silent skip
       }
       refreshTradesQuietly.lastRun = now;
@@ -749,13 +816,13 @@ const AutoTradingDashboard = () => {
         return { ...signal, finalScore, scoringFactors, indexMomentum };
       });
 
-      // Step 8: EXECUTION FILTER - ONLY trade signals with 80%+ base confidence AND high final score
-      // This ensures we only ENTER quality trades, even though we DISPLAY more signals
+      // Step 8: EXECUTION FILTER - ONLY trade signals with 90%+ quality, 80%+ base confidence AND high final score
+      // This ensures we only ENTER exceptionally strong trades, even though we DISPLAY more signals
       const highQualitySignals = scoredSignals.filter(s => {
         const baseConfidence = s.confirmation_score ?? s.confidence ?? 0;
-        // Only allow if quality is 99 or above
+        // Only allow if quality is 90 or above
         const quality = s.quality ?? 0;
-        if (quality < 99) return false;
+        if (quality < 90) return false;
         // Must have high final score (100+) after all factors
         if (s.finalScore < 100) return false;
         // Must have strong momentum
@@ -764,8 +831,8 @@ const AutoTradingDashboard = () => {
       });
       
       if (highQualitySignals.length === 0) {
-        console.log('❌ No signals meet EXECUTION criteria (quality 99+, 100+ score, 75+ momentum)');
-        // No trade if no 99% quality signal, just wait
+        console.log('❌ No signals meet EXECUTION criteria (quality 90+, 100+ score, 75+ momentum)');
+        // No trade if no 90% quality signal, just wait
         return;
       }
 
@@ -924,7 +991,7 @@ const AutoTradingDashboard = () => {
   }, null);
 
   // Use quality trade if available, otherwise use best signal
-  const activeSignal = selectedSignal || bestQualityTrade || bestSignal;
+  const activeSignal = selectedSignal || bestQualityTrade || (qualityTrades.length > 0 ? bestSignal : null);
 
   const displayEntryPrice = activeSignal?.entry_price;
   const displayTarget = activeSignal?.target;
@@ -1410,7 +1477,9 @@ const AutoTradingDashboard = () => {
     activateWakeLock();
 
     const handleVisibilityRefresh = () => {
-      if (!document.hidden) {
+      if (!document.hidden && !wakeLockActive) {
+        // when wake lock active we are already keeping screen awake
+        // and skipping auto-refresh, so don't trigger another fetch
         fetchData();
         scanMarketForQualityTrades();
       }
@@ -1445,6 +1514,12 @@ const AutoTradingDashboard = () => {
     const dataRefreshInterval = setInterval(async () => {
       const prevCount = prevActiveTradesCount.current;
       
+      // If wake lock is active we intentionally skip refreshes to keep
+      // the currently visible trade history / active trade stable.
+      if (wakeLockActive) {
+        return;
+      }
+      
       // Always fetch trade data so it stays updated anytime
       if (document.hidden && !ALWAYS_FETCH_TRADES) {
         console.log('⏸️ Tab hidden - skipping data fetch');
@@ -1467,7 +1542,7 @@ const AutoTradingDashboard = () => {
       
       // Update ref for next iteration
       prevActiveTradesCount.current = activeTrades.length;
-    }, 5000); // 5 seconds for data refresh
+    }, 1000); // 1 second for real-time price updates
 
     return () => {
       clearTimeout(initialDataTimeout);
@@ -1488,6 +1563,13 @@ const AutoTradingDashboard = () => {
     setIsLiveMode(false);
   }, []);
 
+  // When wake lock is released, refresh trades so any skipped updates are applied
+  useEffect(() => {
+    if (!wakeLockActive) {
+      fetchData();
+    }
+  }, [wakeLockActive]);
+
   useEffect(() => {
     if (!autoTradingActive) {
       setIsLiveMode(false);
@@ -1496,24 +1578,49 @@ const AutoTradingDashboard = () => {
 
   // Detect when activeTrades changes from 1+ to 0
   useEffect(() => {
+    if (wakeLockActive) {
+      // Freeze exit detection while screen is held awake
+      prevActiveTradesCount.current = activeTrades.length;
+      return;
+    }
+
     const prevCount = prevActiveTradesCount.current;
     const currentCount = activeTrades.length;
     
     // Trade just exited (SL/Target hit)
     if (prevCount > 0 && currentCount === 0) {
-      console.log(`🚨 TRADE EXIT IMMEDIATE: ${prevCount} → ${currentCount} - Starting new trade cycle`);
+      console.log(`🚨 TRADE EXIT IMMEDIATE: ${prevCount} → ${currentCount}`);
       // Allow new paper trade on same symbol after a trade exit
       setLastPaperSignalSymbol(null);
       setLastPaperSignalAt(0);
+
       if (autoTradingActive) {
-        setTimeout(() => {
-          analyzeMarket();
-        }, 1500);
+        if (isMarketOpen) {
+          // normal behaviour during market hours
+          setTimeout(() => {
+            analyzeMarket();
+          }, 1500);
+        } else {
+          // market closed: wait 2 minutes then check signals again
+          console.log('⏸️ Market closed - delaying next trade check by 2 minutes');
+          setTimeout(async () => {
+            if (isMarketOpen) {
+              console.log('⏯️ Market opened after delay - running analysis now');
+              analyzeMarket();
+            } else {
+              console.log('⏸️ Still closed after delay - will retry in 2m');
+              // schedule another check
+              setTimeout(() => {
+                if (isMarketOpen) analyzeMarket();
+              }, 120000);
+            }
+          }, 120000);
+        }
       }
     }
     
     prevActiveTradesCount.current = currentCount;
-  }, [activeTrades.length, autoTradingActive]);
+  }, [activeTrades.length, autoTradingActive, wakeLockActive, isMarketOpen]);
 
   useEffect(() => {
     if (activeSignal?.entry_price) {
@@ -1575,51 +1682,6 @@ const AutoTradingDashboard = () => {
   const rangePnl = sumPnl(filteredHistory);
   const rangeWins = sumWins(filteredHistory);
   const todayTableRows = tradesToday;
-
-  const getIstDateParts = () => {
-    const formatter = new Intl.DateTimeFormat('en-US', {
-      timeZone: 'Asia/Kolkata',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-      weekday: 'short'
-    });
-    const parts = formatter.formatToParts(new Date());
-    const map = Object.fromEntries(parts.map((p) => [p.type, p.value]));
-    return {
-      year: map.year,
-      month: map.month,
-      day: map.day,
-      hour: Number(map.hour),
-      minute: Number(map.minute),
-      weekday: map.weekday,
-      iso: `${map.year}-${map.month}-${map.day}`
-    };
-  };
-
-  const { hour: istHour, minute: istMinute, weekday: istWeekday, iso: istIso } = getIstDateParts();
-  const isWeekend = istWeekday === 'Sat' || istWeekday === 'Sun';
-  const isHoliday = MARKET_HOLIDAYS.includes(istIso);
-  const isBeforeOpen = istHour < MARKET_OPEN_HOUR || (istHour === MARKET_OPEN_HOUR && istMinute < MARKET_OPEN_MINUTE);
-  const isAfterClose = istHour > MARKET_CLOSE_HOUR || (istHour === MARKET_CLOSE_HOUR && istMinute > MARKET_CLOSE_MINUTE);
-  const localMarketOpen = !isWeekend && !isHoliday && !isBeforeOpen && !isAfterClose;
-  const localMarketReason = isWeekend
-    ? 'Weekend'
-    : isHoliday
-      ? 'Holiday'
-      : isBeforeOpen
-        ? 'Before market open'
-        : isAfterClose
-          ? 'After market close'
-          : 'Open';
-
-  const backendMarketOpen = typeof stats?.market_open === 'boolean' ? stats.market_open : null;
-  const backendMarketReason = stats?.market_reason || null;
-  const isMarketOpen = backendMarketOpen !== null ? backendMarketOpen : localMarketOpen;
-  const marketClosedReason = isMarketOpen ? null : (backendMarketReason || localMarketReason);
 
   // --- Professional Signal Integration ---
   // ...existing code...
@@ -1867,7 +1929,7 @@ const AutoTradingDashboard = () => {
             fontSize: '18px',
             fontWeight: 'bold'
           }}>
-            🎯 All Quality Signals (NIFTY • BANKNIFTY • SENSEX • FINNIFTY - 75%+ Quality)
+            🎯 All Quality Signals from Market (90%+ Quality from *any* index)
           </h4>
           <button
             onClick={scanMarketForQualityTrades}
@@ -1939,14 +2001,23 @@ const AutoTradingDashboard = () => {
             </table>
           </div>
         ) : (
-          <p style={{
+          <div style={{
             margin: 0,
             color: '#92400e',
             textAlign: 'center',
             padding: '20px'
           }}>
-            {scannerLoading ? '🔄 Scanning all markets for quality signals...' : `📊 No ${scannerTab === 'indices' ? 'indices' : 'stock'} signals available right now. Refresh to scan.`}
-          </p>
+            {scannerLoading ? (
+              <p style={{ margin: '10px 0' }}>🔄 Scanning all markets for 90%+ quality signals...</p>
+            ) : qualityTrades.length === 0 && totalSignalsScanned > 0 ? (
+              <div>
+                <p style={{ margin: '10px 0', fontWeight: '600' }}>📊 No signals found with 90%+ quality</p>
+                <p style={{ margin: '5px 0', fontSize: '12px', color: '#92400e', opacity: 0.8 }}>Scanned {totalSignalsScanned} signals • Only top-tier setups qualify • Check back soon</p>
+              </div>
+            ) : (
+              <p style={{ margin: '10px 0' }}>📊 No signals available yet. Click Refresh to scan the market.</p>
+            )}
+          </div>
         )}
       </div>
 
@@ -2135,13 +2206,34 @@ const AutoTradingDashboard = () => {
                   ₹{displayCapitalRequired.toLocaleString()}
                 </span>
                 {(() => {
+                  // If activeSignal is from market scan (bestQualityTrade), use its pre-calculated quality
+                  if (activeSignal === bestQualityTrade && activeSignal?.quality !== undefined) {
+                    const preCalcQuality = activeSignal.quality;
+                    const { rr, optimalRR } = calculateOptimalRR(activeSignal, stats?.win_rate ? (stats.win_rate / 100) : 0.5);
+                    return (
+                      <span style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '8px',
+                        padding: '8px 12px',
+                        background: preCalcQuality >= 90 ? '#c6f6d5' : preCalcQuality >= 80 ? '#feebc8' : '#fed7d7',
+                        borderRadius: '6px',
+                        borderLeft: `4px solid ${preCalcQuality >= 90 ? '#22c55e' : preCalcQuality >= 80 ? '#f59e0b' : '#ef4444'}`
+                      }}>
+                        <strong>🤖 Quality:</strong>
+                        <span style={{ fontWeight: 'bold', fontSize: '13px' }}>{preCalcQuality}%</span>
+                        <span style={{ fontSize: '11px', opacity: 0.8 }}>• RR: {rr.toFixed(2)} (✓{optimalRR.toFixed(2)})</span>
+                      </span>
+                    );
+                  }
+                  // Otherwise recalculate for live signals
                   const winRate = stats?.win_rate ? (stats.win_rate / 100) : 0.5;
                   const quality = calculateTradeQuality(activeSignal, winRate);
                   const { rr, optimalRR } = calculateOptimalRR(activeSignal, winRate);
                   return (
-                    <span style={{ 
-                      display: 'flex', 
-                      alignItems: 'center', 
+                    <span style={{
+                      display: 'flex',
+                      alignItems: 'center',
                       gap: '8px',
                       padding: '8px 12px',
                       background: quality.quality >= 85 ? '#c6f6d5' : quality.quality >= 75 ? '#feebc8' : '#fed7d7',
