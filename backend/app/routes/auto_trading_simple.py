@@ -78,6 +78,7 @@ async def option_chain(
 
 MAX_TRADES = 10000  # allow more intraday trades when signals align
 SINGLE_ACTIVE_TRADE = True  # hard lock: only one live trade at a time
+EMERGENCY_STOP_MULTIPLIER = 0.9  # Trigger protective exits slightly before hard SL.
 TARGET_PCT = 0.6  # target move in percent (slightly above stop for RR >= 1)
 STOP_PCT = 0.4    # stop move in percent (tighter risk)
 CONFIRM_MOMENTUM_PCT = 0.1  # very loose confirmation so signals appear on small moves
@@ -99,6 +100,27 @@ risk_config = {
     "require_trend_confirmation": True,  # STRICT: Confirm trend before entry
     "min_win_rate_threshold": 0.70,  # Only trade if win rate > 70%
     "avoid_high_volatility": True,   # Skip trades in extremely volatile markets
+    "dynamic_loss_brake": True,      # Tighten entry rules as drawdown/loss streak rises
+    "loss_brake_drawdown_start": 0.35,  # Start tightening after 35% of daily loss limit
+    "loss_brake_drawdown_hard": 0.80,   # Hard brake near 80% of daily loss limit
+    "loss_brake_loss_streak_start": 1,  # Tighten after first consecutive losing trade
+    "loss_brake_loss_streak_hard": 3,   # Hard brake after 3 consecutive losses
+    "loss_brake_hard_block": True,      # Block new entries in hard-brake state
+    "loss_brake_qty_warn": 0.75,        # Reduce quantity to 75% in warning state
+    "loss_brake_qty_hard": 0.50,        # Reduce quantity to 50% in hard state
+    "capital_protection_mode": True,    # Enforce strict profile-based capital safeguards
+    "capital_daily_loss_pct": 0.01,     # Stop new entries after 1% daily drawdown on account balance
+    "capital_per_trade_risk_pct": 0.003,  # Per-trade max risk: 0.3% of balance
+    "capital_position_pct": 0.03,       # Max 3% of balance in a single new position
+    "capital_portfolio_pct": 0.06,      # Max 6% total live exposure
+    "capital_min_balance": 5000.0,      # Do not place live trades below this balance
+    "live_start_balance_only": True,    # For live mode, require balance availability as an additional prerequisite
+    "allow_simultaneous_live_trades": True,  # Permit concurrent live trades when setup is strong
+    "max_simultaneous_live_trades": 3,       # Hard cap for concurrent live trades
+    "simultaneous_min_quality": 82.0,        # Additional trade requires solid quality
+    "simultaneous_min_confidence": 72.0,     # Additional trade requires healthy confidence
+    "simultaneous_min_ai_edge": 40.0,        # Additional trade requires minimum positive AI edge
+    "simultaneous_require_different_root": True,  # Second trade must be on different underlying/root
 }
 
 trade_window = {
@@ -152,6 +174,71 @@ async def reset_state(authorization: Optional[str] = Header(None)):
 
 def _now() -> str:
     return ist_now().isoformat()
+
+
+def _live_protection_active() -> bool:
+    """Apply strict protections only when live trading is armed and not in demo mode."""
+    return bool(state.get("live_armed", True)) and not bool(state.get("is_demo_mode", False))
+
+
+def _has_live_balance_for_trade(balance: float, capital_required: float) -> bool:
+    """Live-mode start gate: allow trade when available balance can fund it."""
+    bal = max(0.0, float(balance or 0.0))
+    req = max(0.0, float(capital_required or 0.0))
+    in_use = max(0.0, float(_capital_in_use() or 0.0))
+    return req > 0 and (in_use + req) <= bal
+
+
+def _can_allow_additional_live_trade(candidate: Optional[Dict[str, Any]]) -> Tuple[bool, List[str]]:
+    """Allow concurrent live trade only for ultra-high-quality, diversified signals."""
+    open_trades = [t for t in active_trades if t.get("status") == "OPEN"]
+    if not open_trades:
+        return True, []
+
+    if not _live_protection_active():
+        return True, []
+
+    reasons: List[str] = []
+    if not bool(risk_config.get("allow_simultaneous_live_trades", False)):
+        reasons.append("single_trade_lock")
+        return False, reasons
+
+    max_concurrent = max(1, int(risk_config.get("max_simultaneous_live_trades") or 1))
+    if len(open_trades) >= max_concurrent:
+        reasons.append(f"max_simultaneous_reached({len(open_trades)}>={max_concurrent})")
+        return False, reasons
+
+    if not isinstance(candidate, dict):
+        reasons.append("missing_candidate_context")
+        return False, reasons
+
+    quality = float(candidate.get("quality_score") or candidate.get("quality") or 0.0)
+    confidence = float(candidate.get("confirmation_score") or candidate.get("confidence") or 0.0)
+    ai_edge = float(candidate.get("ai_edge_score") or 0.0)
+
+    q_min = float(risk_config.get("simultaneous_min_quality") or 82.0)
+    c_min = float(risk_config.get("simultaneous_min_confidence") or 72.0)
+    e_min = float(risk_config.get("simultaneous_min_ai_edge") or 40.0)
+
+    if quality < q_min:
+        reasons.append(f"quality<{q_min:.1f} ({quality:.1f})")
+    if confidence < c_min:
+        reasons.append(f"confidence<{c_min:.1f} ({confidence:.1f})")
+    if ai_edge < e_min:
+        reasons.append(f"ai_edge<{e_min:.1f} ({ai_edge:.1f})")
+
+    if bool(risk_config.get("simultaneous_require_different_root", True)):
+        cand_root = _symbol_root(str(candidate.get("symbol") or ""))
+        if cand_root:
+            open_roots = {
+                _symbol_root(str(t.get("symbol") or ""))
+                for t in open_trades
+                if _symbol_root(str(t.get("symbol") or ""))
+            }
+            if cand_root in open_roots:
+                reasons.append(f"same_root_blocked({cand_root})")
+
+    return len(reasons) == 0, reasons
 
 
 def _symbol_root(symbol: str | None) -> str | None:
@@ -245,7 +332,10 @@ def _compute_rr(entry_price: Any, target: Any, stop_loss: Any) -> float:
         return 0.0
 
 
-def _ai_entry_validation(signal: Dict[str, Any]) -> Tuple[bool, List[str], Dict[str, Any]]:
+def _ai_entry_validation(
+    signal: Dict[str, Any],
+    loss_brake: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, List[str], Dict[str, Any]]:
     """Server-side AI gate: quality + confidence + RR + trend/technical alignment."""
     reasons: List[str] = []
 
@@ -253,12 +343,22 @@ def _ai_entry_validation(signal: Dict[str, Any]) -> Tuple[bool, List[str], Dict[
     confidence = float(signal.get("confirmation_score") or signal.get("confidence") or 0)
     rr = _compute_rr(signal.get("entry_price"), signal.get("target"), signal.get("stop_loss"))
 
-    if quality < 70:
-        reasons.append(f"quality<{70} ({quality:.1f})")
-    if confidence < 70:
-        reasons.append(f"confidence<{70} ({confidence:.1f})")
-    if rr < 1.1:
-        reasons.append(f"rr<{1.1} ({rr:.2f})")
+    quality_min = 70.0
+    confidence_min = 70.0
+    rr_min = 1.1
+    if isinstance(loss_brake, dict) and loss_brake.get("enabled"):
+        quality_min += float(loss_brake.get("quality_boost") or 0)
+        confidence_min += float(loss_brake.get("confidence_boost") or 0)
+        rr_min += float(loss_brake.get("rr_boost") or 0)
+        if loss_brake.get("block_new_entries"):
+            reasons.append("loss_brake_hard_block")
+
+    if quality < quality_min:
+        reasons.append(f"quality<{quality_min:.1f} ({quality:.1f})")
+    if confidence < confidence_min:
+        reasons.append(f"confidence<{confidence_min:.1f} ({confidence:.1f})")
+    if rr < rr_min:
+        reasons.append(f"rr<{rr_min:.2f} ({rr:.2f})")
 
     option_type = str(signal.get("option_type") or "").upper()
     trend_direction = str(signal.get("trend_direction") or "").upper()
@@ -285,6 +385,12 @@ def _ai_entry_validation(signal: Dict[str, Any]) -> Tuple[bool, List[str], Dict[
             reasons.append(f"technical_mismatch(rsi={rsi:.1f},macd={macd_cross or 'na'})")
 
     advanced = evaluate_advanced_ai_signal(signal)
+    advanced["loss_brake"] = loss_brake or {"enabled": False, "stage": "OFF"}
+    advanced["thresholds"] = {
+        "quality_min": round(quality_min, 2),
+        "confidence_min": round(confidence_min, 2),
+        "rr_min": round(rr_min, 2),
+    }
     if not advanced.get("entry_valid", False):
         reasons.extend([f"advanced:{r}" for r in advanced.get("entry_reasons", [])])
 
@@ -417,6 +523,136 @@ def _entry_timing_risk_profile(now_dt: Optional[datetime] = None) -> Dict[str, A
     if event_volatile:
         return {"volatile": True, "window": "EVENT_WINDOW", "qty_multiplier": 0.8}
     return {"volatile": False, "window": "NORMAL", "qty_multiplier": 1.0}
+
+
+def _loss_brake_profile() -> Dict[str, Any]:
+    """Adaptive risk brake using intraday drawdown and loss streak."""
+    if not risk_config.get("dynamic_loss_brake", False):
+        return {
+            "enabled": False,
+            "stage": "OFF",
+            "drawdown_ratio": 0.0,
+            "consecutive_losses": int(state.get("consecutive_losses") or 0),
+            "quality_boost": 0,
+            "confidence_boost": 0,
+            "rr_boost": 0.0,
+            "qty_multiplier": 1.0,
+            "block_new_entries": False,
+        }
+
+    max_daily_loss = float(risk_config.get("max_daily_loss") or 0.0)
+    daily_loss = float(state.get("daily_loss") or 0.0)
+    consecutive_losses = int(state.get("consecutive_losses") or 0)
+    drawdown_ratio = (daily_loss / max_daily_loss) if max_daily_loss > 0 else 0.0
+
+    drawdown_start = float(risk_config.get("loss_brake_drawdown_start") or 0.35)
+    drawdown_hard = float(risk_config.get("loss_brake_drawdown_hard") or 0.80)
+    streak_start = int(risk_config.get("loss_brake_loss_streak_start") or 1)
+    streak_hard = int(risk_config.get("loss_brake_loss_streak_hard") or 3)
+
+    warn = (drawdown_ratio >= drawdown_start) or (consecutive_losses >= streak_start)
+    hard = (drawdown_ratio >= drawdown_hard) or (consecutive_losses >= streak_hard)
+
+    if hard:
+        stage = "HARD"
+        quality_boost = 8
+        confidence_boost = 8
+        rr_boost = 0.25
+        qty_multiplier = float(risk_config.get("loss_brake_qty_hard") or 0.50)
+        block_new_entries = bool(risk_config.get("loss_brake_hard_block", True))
+    elif warn:
+        stage = "WARN"
+        quality_boost = 4
+        confidence_boost = 4
+        rr_boost = 0.15
+        qty_multiplier = float(risk_config.get("loss_brake_qty_warn") or 0.75)
+        block_new_entries = False
+    else:
+        stage = "NORMAL"
+        quality_boost = 0
+        confidence_boost = 0
+        rr_boost = 0.0
+        qty_multiplier = 1.0
+        block_new_entries = False
+
+    return {
+        "enabled": True,
+        "stage": stage,
+        "drawdown_ratio": round(drawdown_ratio, 4),
+        "consecutive_losses": consecutive_losses,
+        "quality_boost": quality_boost,
+        "confidence_boost": confidence_boost,
+        "rr_boost": rr_boost,
+        "qty_multiplier": max(0.1, min(1.0, qty_multiplier)),
+        "block_new_entries": block_new_entries,
+    }
+
+
+def _capital_protection_profile(balance: float) -> Dict[str, Any]:
+    """Build strict capital-guard limits from current account balance."""
+    bal = max(0.0, float(balance or 0.0))
+    enabled = bool(risk_config.get("capital_protection_mode", True))
+
+    daily_loss_pct = float(risk_config.get("capital_daily_loss_pct") or 0.01)
+    per_trade_risk_pct = float(risk_config.get("capital_per_trade_risk_pct") or 0.003)
+    position_pct = float(risk_config.get("capital_position_pct") or 0.03)
+    portfolio_pct = float(risk_config.get("capital_portfolio_pct") or 0.06)
+    min_balance = float(risk_config.get("capital_min_balance") or 0.0)
+
+    daily_loss_cap = min(float(risk_config.get("max_daily_loss") or 0.0), bal * daily_loss_pct) if bal > 0 else 0.0
+    per_trade_loss_cap = min(float(risk_config.get("max_per_trade_loss") or 0.0), bal * per_trade_risk_pct) if bal > 0 else 0.0
+
+    return {
+        "enabled": enabled,
+        "profile": "CAPITAL_SHIELD_100",
+        "balance": round(bal, 2),
+        "min_balance": round(min_balance, 2),
+        "daily_loss_cap": round(max(0.0, daily_loss_cap), 2),
+        "per_trade_loss_cap": round(max(0.0, per_trade_loss_cap), 2),
+        "max_position_cap": round(max(0.0, bal * position_pct), 2),
+        "max_portfolio_cap": round(max(0.0, bal * portfolio_pct), 2),
+        "daily_loss_pct": daily_loss_pct,
+        "per_trade_risk_pct": per_trade_risk_pct,
+        "position_pct": position_pct,
+        "portfolio_pct": portfolio_pct,
+    }
+
+
+def _capital_guard_reasons(
+    profile: Dict[str, Any],
+    capital_required: float,
+    potential_loss: float,
+    capital_in_use: float,
+) -> List[str]:
+    """Return blocking reasons for new trade entry under strict capital protection."""
+    reasons: List[str] = []
+    if not profile.get("enabled"):
+        return reasons
+
+    balance = float(profile.get("balance") or 0.0)
+    min_balance = float(profile.get("min_balance") or 0.0)
+    if balance < min_balance:
+        reasons.append(f"balance_below_min({balance:.2f}<{min_balance:.2f})")
+
+    daily_loss_cap = float(profile.get("daily_loss_cap") or 0.0)
+    day_loss = float(state.get("daily_loss") or 0.0)
+    if daily_loss_cap > 0 and day_loss >= daily_loss_cap:
+        reasons.append(f"daily_loss_cap_reached({day_loss:.2f}>={daily_loss_cap:.2f})")
+
+    per_trade_loss_cap = float(profile.get("per_trade_loss_cap") or 0.0)
+    if per_trade_loss_cap > 0 and potential_loss > per_trade_loss_cap:
+        reasons.append(f"per_trade_risk_exceeded({potential_loss:.2f}>{per_trade_loss_cap:.2f})")
+
+    max_position_cap = float(profile.get("max_position_cap") or 0.0)
+    if max_position_cap > 0 and capital_required > max_position_cap:
+        reasons.append(f"position_cap_exceeded({capital_required:.2f}>{max_position_cap:.2f})")
+
+    max_portfolio_cap = float(profile.get("max_portfolio_cap") or 0.0)
+    total_after = float(capital_in_use or 0.0) + float(capital_required or 0.0)
+    if max_portfolio_cap > 0 and total_after > max_portfolio_cap:
+        reasons.append(f"portfolio_cap_exceeded({total_after:.2f}>{max_portfolio_cap:.2f})")
+
+    return reasons
 
 
 def _apply_qty_multiplier(base_qty: int, lot_step: int, multiplier: float) -> int:
@@ -741,6 +977,9 @@ def _maybe_update_trail(trade: Dict[str, Any], new_price: float) -> None:
             trade["stop_loss"] = min(trade.get("stop_loss", entry_price + buffer), entry_price - buffer)
             trade["breakeven_applied"] = True
 
+    # Strong one-way trailing: BUY stop can only move up; SELL stop can only move down.
+    prev_trail_stop = float(trade.get("trail_stop") or trail_stop)
+
     if side == "BUY":
         if not trail_active and new_price >= trail_start:
             trade["trail_active"] = True
@@ -752,6 +991,8 @@ def _maybe_update_trail(trade: Dict[str, Any], new_price: float) -> None:
                 # Do not set trail below known support
                 if support:
                     trail_stop = max(trail_stop, support)
+                # One-way lock: never loosen BUY trail.
+                trail_stop = max(float(trail_stop), prev_trail_stop)
                 trade["trail_start"] = trail_start
                 trade["trail_stop"] = trail_stop
     else:
@@ -765,6 +1006,8 @@ def _maybe_update_trail(trade: Dict[str, Any], new_price: float) -> None:
                 # Do not set trail above known resistance
                 if resistance:
                     trail_stop = min(trail_stop, resistance)
+                # One-way lock: never loosen SELL trail.
+                trail_stop = min(float(trail_stop), prev_trail_stop)
                 trade["trail_start"] = trail_start
                 trade["trail_stop"] = trail_stop
 
@@ -1361,10 +1604,23 @@ async def analyze(
     recommendations = []
     blocked_recommendations = []
     ai_rejected_recommendations = []
+    protection_active = _live_protection_active()
+    live_balance_only_mode = protection_active and bool(risk_config.get("live_start_balance_only", False))
     risk_profile = _entry_timing_risk_profile()
+    loss_brake = _loss_brake_profile() if protection_active else {
+        "enabled": False,
+        "stage": "PAPER",
+        "drawdown_ratio": 0.0,
+        "consecutive_losses": int(state.get("consecutive_losses") or 0),
+        "quality_boost": 0,
+        "confidence_boost": 0,
+        "rr_boost": 0.0,
+        "qty_multiplier": 1.0,
+        "block_new_entries": False,
+    }
     for sig in signals:
         blocked, remaining_seconds, _ = _cooldown_info(sig.get("symbol"), sig.get("action"))
-        ai_ok, ai_reasons, ai_diag = _ai_entry_validation(sig)
+        ai_ok, ai_reasons, ai_diag = _ai_entry_validation(sig, loss_brake=loss_brake)
         if blocked:
             blocked_recommendations.append({
                 "symbol": sig.get("symbol"),
@@ -1382,7 +1638,10 @@ async def analyze(
             })
         base_qty = int(sig.get("quantity") or 1)
         lot_step = int(sig.get("quantity") or 1)
-        adjusted_qty = _apply_qty_multiplier(base_qty, lot_step, float(risk_profile.get("qty_multiplier") or 1.0))
+        timing_multiplier = float(risk_profile.get("qty_multiplier") or 1.0)
+        loss_brake_multiplier = float(loss_brake.get("qty_multiplier") or 1.0)
+        combined_qty_multiplier = max(0.1, min(1.0, timing_multiplier * loss_brake_multiplier))
+        adjusted_qty = _apply_qty_multiplier(base_qty, lot_step, combined_qty_multiplier)
         capital_required = round(float(sig["entry_price"]) * adjusted_qty, 2)
 
         recommendations.append({
@@ -1442,6 +1701,8 @@ async def analyze(
             "wick_trap": ai_diag.get("wick_trap"),
             "timing_risk_profile": risk_profile,
             "qty_reduced_for_timing": adjusted_qty < base_qty,
+            "qty_reduced_for_loss_brake": loss_brake_multiplier < 0.999,
+            "loss_brake_profile": loss_brake,
             "start_trade_allowed": ai_diag.get("start_trade_allowed"),
             "start_trade_decision": ai_diag.get("start_trade_decision"),
         })
@@ -1483,6 +1744,8 @@ async def analyze(
                         "wick_trap": r.get("wick_trap"),
                         "timing_risk_profile": r.get("timing_risk_profile"),
                         "qty_reduced_for_timing": r.get("qty_reduced_for_timing"),
+                        "qty_reduced_for_loss_brake": r.get("qty_reduced_for_loss_brake"),
+                        "loss_brake_profile": r.get("loss_brake_profile"),
                         "base_quantity": r.get("base_quantity"),
                         "quantity": r.get("quantity"),
                         "start_trade_allowed": r.get("start_trade_allowed"),
@@ -1502,19 +1765,61 @@ async def analyze(
         print(f"[LOGGING ERROR] Could not log recommendation: {e}")
 
     capital_in_use = _capital_in_use()
-    remaining_cap = balance * risk_config.get("max_portfolio_pct", 1.0) - capital_in_use
+    capital_profile = _capital_protection_profile(balance)
+    if not protection_active:
+        capital_profile["enabled"] = False
+        capital_profile["profile"] = "PAPER_MODE_BYPASS"
+        capital_profile["max_position_cap"] = round(float(balance or 0.0), 2)
+        capital_profile["max_portfolio_cap"] = round(float(balance or 0.0), 2)
+    if protection_active:
+        effective_portfolio_cap = min(
+            balance * risk_config.get("max_portfolio_pct", 1.0),
+            float(capital_profile.get("max_portfolio_cap") or (balance * risk_config.get("max_portfolio_pct", 1.0))),
+        )
+    else:
+        effective_portfolio_cap = float(balance or 0.0)
+    remaining_cap = effective_portfolio_cap - capital_in_use
     # Determine if there is enough money for the recommended trade
     required_capital = recommendation["capital_required"] if recommendation else 0
+    recommendation_potential_loss = 0.0
+    if recommendation:
+        recommendation_potential_loss = abs(
+            (float(recommendation.get("entry_price") or 0.0) - float(recommendation.get("stop_loss") or 0.0))
+            * float(recommendation.get("quantity") or 0.0)
+        )
+    capital_guard_reasons = _capital_guard_reasons(
+        capital_profile,
+        capital_required=float(required_capital or 0.0),
+        potential_loss=float(recommendation_potential_loss),
+        capital_in_use=float(capital_in_use or 0.0),
+    ) if recommendation else []
     can_trade = (
         len(active_trades) < MAX_TRADES and remaining_cap >= required_capital and required_capital > 0
     )
-    if SINGLE_ACTIVE_TRADE and any(t.get("status") == "OPEN" for t in active_trades):
+    min_live_balance = float(risk_config.get("capital_min_balance") or 0.0)
+    if live_balance_only_mode:
+        if float(balance or 0.0) < min_live_balance:
+            can_trade = False
+            capital_guard_reasons = [
+                *capital_guard_reasons,
+                f"balance_below_min({float(balance or 0.0):.2f}<{min_live_balance:.2f})",
+            ]
+        else:
+            can_trade = len(active_trades) < MAX_TRADES and _has_live_balance_for_trade(balance, required_capital)
+    if capital_guard_reasons:
         can_trade = False
+    if protection_active and loss_brake.get("block_new_entries"):
+        can_trade = False
+    simultaneous_reasons: List[str] = []
+    if any(t.get("status") == "OPEN" for t in active_trades):
+        simultaneous_ok, simultaneous_reasons = _can_allow_additional_live_trade(recommendation)
+        if SINGLE_ACTIVE_TRADE and not simultaneous_ok:
+            can_trade = False
 
 
     # Optionally auto-trigger trade execution for each recommendation
     auto_trade_result = None
-    if can_trade and recommendation and recommendation.get("start_trade_allowed"):
+    if protection_active and can_trade and recommendation and recommendation.get("start_trade_allowed"):
         try:
             from fastapi import Request
             auto_trade_result = await execute(
@@ -1522,6 +1827,12 @@ async def analyze(
                 side=recommendation["action"],
                 quantity=recommendation["quantity"],
                 price=recommendation["entry_price"],
+                balance=balance,
+                quality_score=recommendation.get("quality_score"),
+                confirmation_score=recommendation.get("confirmation_score") or recommendation.get("confidence"),
+                option_type=recommendation.get("option_type"),
+                trend_direction=recommendation.get("trend_direction"),
+                ai_edge_score=recommendation.get("ai_edge_score"),
                 authorization=authorization
             )
             if auto_trade_result is not None:
@@ -1541,7 +1852,11 @@ async def analyze(
                 "potential_profit": round((recommendation["target"] - recommendation["entry_price"]) * recommendation["quantity"], 2),
                 "potential_loss": round((recommendation["entry_price"] - recommendation["stop_loss"]) * recommendation["quantity"], 2),
                 "message": "Trade not auto-started (capital, availability, or start-trade gate). Simulated only.",
-                "demo_mode": True
+                "demo_mode": True,
+                "loss_brake": loss_brake,
+                "capital_protection": capital_profile,
+                "capital_guard_reasons": capital_guard_reasons,
+                "simultaneous_reasons": simultaneous_reasons,
             }
 
 
@@ -1555,12 +1870,19 @@ async def analyze(
         "live_price": recommendation["entry_price"] if recommendation else None,
         "is_demo_mode": state["is_demo_mode"],
         "mode": "DEMO" if state["is_demo_mode"] else "LIVE",
+        "live_armed": state.get("live_armed", True),
+        "protection_active": protection_active,
+        "live_start_rule": "BALANCE_ONLY" if live_balance_only_mode else "PROTECTED",
         "data_source": data_source,
         "can_trade": can_trade,
         "available_sides": available_sides,
         "remaining_capital": round(max(0.0, remaining_cap), 2),
         "capital_in_use": round(capital_in_use, 2),
-        "portfolio_cap": round(balance * risk_config.get("max_portfolio_pct", 1.0), 2),
+        "portfolio_cap": round(effective_portfolio_cap, 2),
+        "capital_protection": capital_profile,
+        "capital_guard_reasons": capital_guard_reasons,
+        "simultaneous_reasons": simultaneous_reasons,
+        "loss_brake_profile": loss_brake,
         "timestamp": _now(),
         "auto_trade_result": auto_trade_result,
         "blocked_recommendations": blocked_recommendations,
@@ -1609,6 +1931,7 @@ async def execute(
     broker_id: int = 1,
     quality_score: Optional[float] = None,
     confirmation_score: Optional[float] = None,
+    ai_edge_score: Optional[float] = None,
     option_type: Optional[str] = None,
     trend_direction: Optional[str] = None,
     trend_strength: Optional[str] = None,
@@ -1630,6 +1953,17 @@ async def execute(
     mode = "LIVE"
 
     auto_demo = bool(state.get("is_demo_mode"))
+    live_balance_only_mode = _live_protection_active() and bool(risk_config.get("live_start_balance_only", False)) and (not auto_demo)
+    loss_brake = _loss_brake_profile()
+    if loss_brake.get("block_new_entries") and not auto_demo:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "New trades blocked by dynamic loss brake.",
+                "loss_brake": loss_brake,
+            },
+        )
+
     trade = TradeRequest(
         symbol=symbol,
         price=price,
@@ -1651,12 +1985,13 @@ async def execute(
         "stop_loss": stop_loss,
         "quality_score": quality_score,
         "confirmation_score": confirmation_score,
+        "ai_edge_score": ai_edge_score,
         "option_type": option_type,
         "trend_direction": trend_direction,
         "trend_strength": trend_strength,
     }
-    if any(v is not None for v in [quality_score, confirmation_score, option_type, trend_direction]):
-        ai_ok, ai_reasons, _ = _ai_entry_validation(ai_context)
+    if (not auto_demo) and any(v is not None for v in [quality_score, confirmation_score, option_type, trend_direction]):
+        ai_ok, ai_reasons, _ = _ai_entry_validation(ai_context, loss_brake=loss_brake)
         if not ai_ok:
             raise HTTPException(
                 status_code=403,
@@ -1665,6 +2000,17 @@ async def execute(
                     "reasons": ai_reasons,
                 },
             )
+
+    max_consecutive_losses = int(risk_config.get("max_consecutive_losses") or 0)
+    if max_consecutive_losses > 0 and int(state.get("consecutive_losses") or 0) >= max_consecutive_losses and not auto_demo:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Trading blocked due to consecutive loss limit.",
+                "consecutive_losses": int(state.get("consecutive_losses") or 0),
+                "max_consecutive_losses": max_consecutive_losses,
+            },
+        )
 
     option_kind = _option_kind(trade.symbol)
 
@@ -1717,6 +2063,47 @@ async def execute(
             status_code=403,
             detail=f"Potential loss ₹{potential_loss:.2f} exceeds limit ₹{max_loss_allowed}. Reduce qty or tighten stop."
         )
+
+    capital_required = round(float(trade.price or 0.0) * float(qty or 0), 2)
+    live_balance_value = float(trade.balance or balance or 0.0)
+    min_live_balance = float(risk_config.get("capital_min_balance") or 0.0)
+    if live_balance_only_mode and live_balance_value < min_live_balance:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Live balance below minimum required for trading.",
+                "min_balance": round(min_live_balance, 2),
+                "balance": round(live_balance_value, 2),
+            },
+        )
+
+    if live_balance_only_mode and not _has_live_balance_for_trade(live_balance_value, capital_required):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Insufficient available balance for live trade.",
+                "required": capital_required,
+                "balance": round(live_balance_value, 2),
+                "capital_in_use": round(float(_capital_in_use() or 0.0), 2),
+            },
+        )
+
+    capital_profile = _capital_protection_profile(float(trade.balance or balance or 0.0))
+    guard_reasons = _capital_guard_reasons(
+        capital_profile,
+        capital_required=capital_required,
+        potential_loss=float(potential_loss or 0.0),
+        capital_in_use=float(_capital_in_use() or 0.0),
+    )
+    if guard_reasons and not auto_demo:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Trade blocked by strict capital protection profile.",
+                "reasons": guard_reasons,
+                "capital_protection": capital_profile,
+            },
+        )
     
     # ═══════════════════════════════════════════════════════════════
 
@@ -1736,9 +2123,17 @@ async def execute(
         if len(active_trades) >= MAX_TRADES and not auto_demo:
             raise HTTPException(status_code=429, detail="Max active trades reached")
 
-        existing = next((t for t in active_trades if t.get("status") == "OPEN"), None)
-        if existing:
-            raise HTTPException(status_code=429, detail="Another trade is already open")
+        existing_open = [t for t in active_trades if t.get("status") == "OPEN"]
+        if existing_open and (not auto_demo):
+            simultaneous_ok, simultaneous_reasons = _can_allow_additional_live_trade(ai_context)
+            if SINGLE_ACTIVE_TRADE and not simultaneous_ok:
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "message": "Concurrent live trade blocked by quality/diversification gate.",
+                        "reasons": simultaneous_reasons,
+                    },
+                )
 
         blocked, wait_seconds, cooldown_key = _cooldown_info(trade.symbol, trade.side)
         if blocked and not auto_demo:
@@ -1805,10 +2200,12 @@ async def execute(
             "success": True,
             "is_demo_mode": auto_demo,
             "message": f"{mode} trade accepted for {trade.symbol} at {trade.price}",
+            "live_start_rule": "BALANCE_ONLY" if live_balance_only_mode else "PROTECTED",
             "timestamp": _now(),
             "broker_response": broker_response,
             "stop_loss": derived_stop,
             "target": derived_target,
+            "capital_protection": capital_profile,
         }
 
 
@@ -1886,6 +2283,8 @@ async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
         live_update_state["last_duration"] = time.time() - start
 
     updated_count = 0
+    closed_count = 0
+    to_close: List[Dict[str, Any]] = []
     missing_symbols: List[str] = []
     for quote_symbol, trades in trade_symbol_map.items():
         data = quotes.get(quote_symbol) or {}
@@ -1899,6 +2298,20 @@ async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
             trade["current_price"] = new_price
             _maybe_update_trail(trade, new_price)
             updated_count += 1
+            exit_reason = _should_exit_by_currency(trade, new_price)
+            if exit_reason:
+                trade["status"] = exit_reason
+                trade["exit_reason"] = exit_reason
+                _close_trade(trade, new_price)
+                to_close.append(trade)
+                closed_count += 1
+                continue
+            if _stop_hit(trade, new_price):
+                trade["status"] = "SL_HIT"
+                trade["exit_reason"] = "SL_HIT"
+                _close_trade(trade, new_price)
+                to_close.append(trade)
+                closed_count += 1
 
     if missing_symbols:
         try:
@@ -1919,6 +2332,23 @@ async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
                 trade["current_price"] = new_price
                 _maybe_update_trail(trade, new_price)
                 updated_count += 1
+                exit_reason = _should_exit_by_currency(trade, new_price)
+                if exit_reason:
+                    trade["status"] = exit_reason
+                    trade["exit_reason"] = exit_reason
+                    _close_trade(trade, new_price)
+                    to_close.append(trade)
+                    closed_count += 1
+                    continue
+                if _stop_hit(trade, new_price):
+                    trade["status"] = "SL_HIT"
+                    trade["exit_reason"] = "SL_HIT"
+                    _close_trade(trade, new_price)
+                    to_close.append(trade)
+                    closed_count += 1
+
+    if to_close:
+        active_trades[:] = [t for t in active_trades if t.get("status") == "OPEN"]
 
     if live_update_state["last_duration"] > 2.5:
         live_update_state["failure_count"] += 1
@@ -1931,10 +2361,51 @@ async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
         "success": True,
         "is_demo_mode": state["is_demo_mode"],
         "updated_count": updated_count,
+        "closed_count": closed_count,
         "message": f"Updated prices for {updated_count} open trade(s)",
         "timestamp": _now(),
         "backoff_until": live_update_state["backoff_until"],
         "last_duration": live_update_state["last_duration"],
+    }
+
+
+@router.post("/trades/close")
+async def close_live_trade(payload: CloseTradeRequest, authorization: Optional[str] = Header(None)):
+    target_trade = None
+
+    if payload.trade_id is not None:
+        for trade in active_trades:
+            if trade.get("status") == "OPEN" and trade.get("id") == payload.trade_id:
+                target_trade = trade
+                break
+
+    if target_trade is None and payload.symbol:
+        for trade in reversed(active_trades):
+            if trade.get("status") == "OPEN" and trade.get("symbol") == payload.symbol:
+                target_trade = trade
+                break
+
+    if target_trade is None:
+        raise HTTPException(status_code=404, detail="Open trade not found")
+
+    exit_price = float(
+        target_trade.get("current_price")
+        or target_trade.get("entry_price")
+        or target_trade.get("price")
+        or 0.0
+    )
+    target_trade["status"] = "MANUAL_CLOSE"
+    target_trade["exit_reason"] = "MANUAL_CLOSE"
+    _close_trade(target_trade, exit_price)
+
+    active_trades[:] = [t for t in active_trades if t.get("status") == "OPEN"]
+
+    return {
+        "success": True,
+        "message": "Trade closed manually",
+        "closed_trade": normalize_active_trade_metrics(target_trade),
+        "active_count": len(active_trades),
+        "history_count": len(history),
     }
 
 
@@ -1950,6 +2421,7 @@ async def update_trade_price(symbol: str, price: float, authorization: Optional[
             updated += 1
             exit_reason = _should_exit_by_currency(trade, price)
             if exit_reason:
+                trade["status"] = exit_reason
                 trade["exit_reason"] = exit_reason
                 _close_trade(trade, price)
                 to_close.append(trade)

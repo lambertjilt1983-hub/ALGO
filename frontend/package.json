@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "start": "npx serve -s dist -l $PORT"
+    "start": "npx serve -s dist -l $PORT",
+    "test": "vitest run"
   },
   "dependencies": {
   "autoprefixer": "^10.4.23",
@@ -26,7 +27,8 @@
   "@types/react": "^18.2.0",
   "@types/react-dom": "^18.2.0",
   "@vitejs/plugin-react": "^4.2.0",
-  "vite": "^5.0.0"
+  "vite": "^5.0.0",
+  "vitest": "^2.1.9"
 }
 
   
