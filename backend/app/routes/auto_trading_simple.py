@@ -54,6 +54,7 @@ from app.engine.auto_trading_engine import AutoTradingEngine
 from app.engine.zerodha_broker import ZerodhaBroker
 from app.engine.simple_momentum_strategy import SimpleMomentumStrategy
 from app.core.market_hours import ist_now, is_market_open, market_status
+from app.routes.trade_metrics import normalize_active_trade_metrics
 
 
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
@@ -1622,12 +1623,8 @@ async def execute(
 @router.get("/trades/active")
 async def get_active_trades(authorization: Optional[str] = Header(None)):
     print(f"[API /trades/active] Returning {len(active_trades)} active trades from Zerodha")
-    trades = active_trades
-    for trade in trades:
-        entry_price = float(trade.get("entry_price") or trade.get("price") or 0.0)
-        current_price = float(trade.get("current_price") or entry_price)
-        qty = float(trade.get("quantity") or 0)
-        trade["unrealized_pnl"] = (current_price - entry_price) * qty
+    trades = [normalize_active_trade_metrics(trade) for trade in active_trades]
+    active_trades[:] = trades
     return {"trades": trades, "is_demo_mode": False, "count": len(trades)}
 
 

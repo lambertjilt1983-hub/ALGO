@@ -58,6 +58,7 @@ const MIN_TRADE_QUALITY_SCORE = 0.50; // Minimum 50% quality threshold with weig
 const DEFAULT_SCANNER_MIN_QUALITY = 70; // Balanced default so scanner is not empty in normal sessions
 const SCANNER_MIN_REFRESH_MS = 8000; // Prevent rapid manual refresh jitter
 const SCANNER_STABILITY_WINDOW_MS = 120000; // Keep continuity over recent scans
+const EMPTY_ACTIVE_POLLS_TO_CLEAR = 2; // Anti-flicker: clear rows only after consecutive confirmed empty polls
 
 // === MARKET HOURS (IST) ===
 const MARKET_OPEN_HOUR = 9;
@@ -345,7 +346,8 @@ const AutoTradingDashboard = () => {
     return `${symbol}|${side}|${entry}|${ts}|${id}`;
   };
 
-  const resolveStableActiveTrades = (incomingTrades) => {
+  const resolveStableActiveTrades = (incomingTrades, options = {}) => {
+    const { canTrustEmpty = true } = options;
     const incoming = Array.isArray(incomingTrades) ? incomingTrades : [];
     const prev = activeTradesRef.current || [];
 
@@ -353,8 +355,14 @@ const AutoTradingDashboard = () => {
       if (!hasLoadedActiveTradesRef.current) {
         return [];
       }
+      if (!canTrustEmpty) {
+        return prev;
+      }
       emptyActivePollsRef.current += 1;
-      // Never clear previously loaded rows due to empty poll responses.
+      // Clear only after consecutive confirmed empty responses to avoid one-off flicker.
+      if (emptyActivePollsRef.current >= EMPTY_ACTIVE_POLLS_TO_CLEAR) {
+        return [];
+      }
       return prev;
     }
 
@@ -744,14 +752,17 @@ const AutoTradingDashboard = () => {
 
     const paperActive = Array.isArray(paperActiveData.trades) ? paperActiveData.trades : [];
     const liveActive = Array.isArray(liveActiveData.trades) ? liveActiveData.trades : [];
-    // Prefer live trades if present; otherwise fall back to paper trades.
-    const active = liveActive.length > 0 ? liveActive : paperActive;
+    const activeCandidates = [...liveActive, ...paperActive];
     const history = historyData.trades || [];
     const backendStatus = statusData.status || statusData;
 
+    const canTrustActiveEmpty = isLiveMode
+      ? !!liveActiveRes?.ok
+      : (!!liveActiveRes?.ok && !!paperActiveRes?.ok);
+
     // Deduplicate active trades by symbol, action, entry_price, and entry_time
-    const dedupedActive = Array.isArray(active)
-      ? active.filter((trade, idx, arr) => {
+    const dedupedActive = Array.isArray(activeCandidates)
+      ? activeCandidates.filter((trade, idx, arr) => {
           return (
             arr.findIndex(t =>
               t.symbol === trade.symbol &&
@@ -761,9 +772,9 @@ const AutoTradingDashboard = () => {
             ) === idx
           );
         })
-      : active;
+      : activeCandidates;
     
-    const resolvedActiveTrades = resolveStableActiveTrades(dedupedActive);
+    const resolvedActiveTrades = resolveStableActiveTrades(dedupedActive, { canTrustEmpty: canTrustActiveEmpty });
     const resolvedHistory = resolveStableTradeHistory(history);
 
     // Ignore stale responses from slower previous polls.
@@ -2959,12 +2970,20 @@ const AutoTradingDashboard = () => {
                 {activeTrades.map((trade) => {
                   const entry = Number(trade.entry_price ?? trade.price ?? 0);
                   const current = Number(trade.current_price ?? entry);
-                  const pnl = Number(trade.pnl ?? 0);
-                  const pnlPct = Number(trade.pnl_percentage ?? 0);
-                  const action = trade.side || 'BUY';
+                  const action = String(trade.side || trade.action || 'BUY').toUpperCase();
+                  const qty = Number(trade.quantity ?? 0);
+                  const computedPnl = entry > 0 && qty > 0
+                    ? (action === 'BUY' ? (current - entry) * qty : (entry - current) * qty)
+                    : 0;
+                  const pnl = Number(trade.pnl ?? trade.profit_loss ?? trade.unrealized_pnl ?? computedPnl);
+                  const pnlPct = Number(
+                    trade.pnl_percentage
+                    ?? trade.profit_percentage
+                    ?? trade.pnl_percent
+                    ?? (entry > 0 && qty > 0 ? (computedPnl / (entry * qty)) * 100 : 0)
+                  );
                   const target = Number(trade.target ?? 0);
                   const stopLoss = Number(trade.stop_loss ?? 0);
-                  const qty = Number(trade.quantity ?? 0);
                   const expected = entry > 0 && target > 0 ? Math.abs(target - entry) * qty : 0;
                   return (
                     <tr key={getTradeRowKey(trade)} style={{ borderBottom: '1px solid #e2e8f0' }}>
