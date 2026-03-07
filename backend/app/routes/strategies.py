@@ -30,8 +30,26 @@ async def get_live_professional_signal(
     """Return the same best live signal used by option signals and auto-trade analyze."""
     import logging
     logger = logging.getLogger("trading_bot")
-    
-    signals = await generate_signals_advanced(user_id=getattr(current_user, "id", None))
+
+    def _hold_fallback(message: str):
+        return {
+            "symbol": None,
+            "signal": "hold",
+            "entry_price": None,
+            "stop_loss": None,
+            "target": None,
+            "index": None,
+            "option_type": None,
+            "error": message,
+            "source": "professional_signal_fallback",
+        }
+
+    try:
+        signals = await generate_signals_advanced(user_id=getattr(current_user, "id", None))
+    except Exception as e:
+        logger.error(f"[PROFESSIONAL-SIGNAL] Signal generation failed: {e}")
+        return _hold_fallback("Live professional signal temporarily unavailable.")
+
     logger.info(f"[PROFESSIONAL-SIGNAL] Generated {len(signals) if signals else 0} signals")
     
     if signals:
@@ -55,7 +73,7 @@ async def get_live_professional_signal(
             logger.info(f"[PROFESSIONAL-SIGNAL] Using fallback signal: {best.get('symbol')} (quality={best.get('quality_score', 0)})")
         else:
             logger.error(f"[PROFESSIONAL-SIGNAL] No viable signals found after fallback")
-            raise HTTPException(status_code=503, detail="No live option signals available.")
+            return _hold_fallback("No live option signals available.")
 
     action = (best.get("action") or "HOLD").lower()
     logger.info(f"[PROFESSIONAL-SIGNAL] Selected: {best.get('symbol')} - Action={action}, Quality={best.get('quality_score', 0)}")

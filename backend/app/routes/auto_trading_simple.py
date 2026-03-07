@@ -55,6 +55,7 @@ from app.engine.zerodha_broker import ZerodhaBroker
 from app.engine.simple_momentum_strategy import SimpleMomentumStrategy
 from app.core.market_hours import ist_now, is_market_open, market_status
 from app.routes.trade_metrics import normalize_active_trade_metrics
+from app.routes.signal_scoring import evaluate_advanced_ai_signal
 
 
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
@@ -244,7 +245,7 @@ def _compute_rr(entry_price: Any, target: Any, stop_loss: Any) -> float:
         return 0.0
 
 
-def _ai_entry_validation(signal: Dict[str, Any]) -> Tuple[bool, List[str]]:
+def _ai_entry_validation(signal: Dict[str, Any]) -> Tuple[bool, List[str], Dict[str, Any]]:
     """Server-side AI gate: quality + confidence + RR + trend/technical alignment."""
     reasons: List[str] = []
 
@@ -283,7 +284,11 @@ def _ai_entry_validation(signal: Dict[str, Any]) -> Tuple[bool, List[str]]:
         if not tech_ok:
             reasons.append(f"technical_mismatch(rsi={rsi:.1f},macd={macd_cross or 'na'})")
 
-    return len(reasons) == 0, reasons
+    advanced = evaluate_advanced_ai_signal(signal)
+    if not advanced.get("entry_valid", False):
+        reasons.extend([f"advanced:{r}" for r in advanced.get("entry_reasons", [])])
+
+    return len(reasons) == 0, reasons, advanced
 
 
 def _best_signal_by_quality(signals: List[Dict]) -> Optional[Dict]:
@@ -393,6 +398,37 @@ def _within_trade_window() -> bool:
     start = dt_time(start_h, start_m)
     end = dt_time(end_h, end_m)
     return is_market_open(start, end)
+
+
+def _entry_timing_risk_profile(now_dt: Optional[datetime] = None) -> Dict[str, Any]:
+    """Return quantity multiplier during volatile windows (open/close/event)."""
+    dt = now_dt or ist_now()
+    t = dt.time()
+
+    # High-noise windows: opening minutes, pre-close, and a midday event-risk window.
+    open_volatile = dt_time(9, 15) <= t <= dt_time(9, 35)
+    close_volatile = dt_time(14, 55) <= t <= dt_time(15, 30)
+    event_volatile = dt_time(12, 25) <= t <= dt_time(12, 35)
+
+    if open_volatile:
+        return {"volatile": True, "window": "OPENING", "qty_multiplier": 0.7}
+    if close_volatile:
+        return {"volatile": True, "window": "PRE_CLOSE", "qty_multiplier": 0.7}
+    if event_volatile:
+        return {"volatile": True, "window": "EVENT_WINDOW", "qty_multiplier": 0.8}
+    return {"volatile": False, "window": "NORMAL", "qty_multiplier": 1.0}
+
+
+def _apply_qty_multiplier(base_qty: int, lot_step: int, multiplier: float) -> int:
+    if base_qty <= 0:
+        return base_qty
+    if multiplier >= 0.999:
+        return base_qty
+    step = max(1, lot_step)
+    # Keep at least one lot and preserve lot-step divisibility.
+    reduced = max(step, int(base_qty * multiplier))
+    reduced = (reduced // step) * step
+    return max(step, reduced)
 
 
 def _analyze_trend_strength(symbol: str) -> Dict[str, float]:
@@ -590,6 +626,54 @@ def _detect_market_regime(symbol: str) -> Dict[str, any]:
         return {"regime": "ERROR", "score": 0.0, "tradeable": False}
 
 
+def _extract_underlying_symbol(raw_symbol: Optional[str]) -> str:
+    symbol = str(raw_symbol or "").upper()
+    if not symbol:
+        return "NIFTY"
+    aliases = ["BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "NIFTY"]
+    for name in aliases:
+        if name in symbol:
+            return name
+    # Handle "NIFTY INDEX" style labels.
+    if " INDEX" in symbol:
+        return symbol.replace(" INDEX", "").strip()
+    return symbol.split()[0]
+
+
+def _yahoo_ticker_for_underlying(underlying: str) -> str:
+    mapping = {
+        "NIFTY": "^NSEI",
+        "BANKNIFTY": "^NSEBANK",
+        "FINNIFTY": "NIFTY_FIN_SERVICE.NS",
+        "SENSEX": "^BSESN",
+        "MIDCPNIFTY": "NIFTY_MID_SELECT.NS",
+    }
+    return mapping.get(underlying, "^NSEI")
+
+
+def _fetch_recent_candles(underlying: str, candle_count: int = 5) -> List[Dict[str, float]]:
+    try:
+        import yfinance as yf
+
+        ticker = yf.Ticker(_yahoo_ticker_for_underlying(underlying))
+        df = ticker.history(period="2d", interval="5m")
+        if df.empty:
+            return []
+
+        rows = []
+        for _, row in df.tail(max(3, candle_count)).iterrows():
+            rows.append({
+                "open": float(row.get("Open") or 0),
+                "high": float(row.get("High") or 0),
+                "low": float(row.get("Low") or 0),
+                "close": float(row.get("Close") or 0),
+            })
+        return rows
+    except Exception as e:
+        print(f"[CANDLE FETCH ERROR] {underlying}: {e}")
+        return []
+
+
 @router.post("/toggle")
 async def toggle(enabled: bool = True, authorization: Optional[str] = Header(None)):
     # Auto-trading is always enabled; respond with enabled state for UI compatibility.
@@ -600,14 +684,16 @@ def _init_trailing_fields(entry_price: float, side: str) -> Dict[str, float | bo
     # Precompute trailing stop anchor to avoid repeated math and simplify updates.
     buffer = trail_config["buffer_pct"] * entry_price / 100
     if side == "BUY":
-        start = entry_price * (1 - trail_config["trigger_pct"] / 100)
+        # Activate trail only after favorable move above entry.
+        start = entry_price * (1 + trail_config["trigger_pct"] / 100)
         return {
             "trail_active": False,
             "trail_start": start,
             "trail_stop": start - buffer,
             "trail_step": trail_config["step_pct"] * entry_price / 100,
         }
-    start = entry_price * (1 + trail_config["trigger_pct"] / 100)
+    # For SELL, favorable move is below entry.
+    start = entry_price * (1 - trail_config["trigger_pct"] / 100)
     return {
         "trail_active": False,
         "trail_start": start,
@@ -629,6 +715,20 @@ def _maybe_update_trail(trade: Dict[str, Any], new_price: float) -> None:
     trail_step = trade.get("trail_step")
     if None in (side, trail_start, trail_stop, trail_step, entry_price):
         return
+
+    # Self-heal legacy anchors from older logic so existing open trades trail correctly.
+    if side == "BUY" and trail_start < entry_price:
+        repaired = _init_trailing_fields(float(entry_price), side)
+        trade.update(repaired)
+        trail_start = trade.get("trail_start")
+        trail_stop = trade.get("trail_stop")
+        trail_step = trade.get("trail_step")
+    elif side != "BUY" and trail_start > entry_price:
+        repaired = _init_trailing_fields(float(entry_price), side)
+        trade.update(repaired)
+        trail_start = trade.get("trail_start")
+        trail_stop = trade.get("trail_stop")
+        trail_step = trade.get("trail_step")
 
     # Breakeven: once price moves in favor by BREAKEVEN_TRIGGER_PCT, lift stop to entry +/- tiny buffer
     buffer = trail_config["buffer_pct"] * entry_price / 100
@@ -1239,13 +1339,32 @@ async def analyze(
                     print(f"[DEBUG] {symbol} {opt_type} strikes: {[o['strike'] for o in opt_list]}")
     signals = extended_signals
 
+    # Enrich each signal with underlying regime and last 3-5 candles for fake breakout detection.
+    context_cache: Dict[str, Dict[str, Any]] = {}
+    for sig in signals:
+        underlying = _extract_underlying_symbol(sig.get("symbol") or sig.get("index"))
+        cached = context_cache.get(underlying)
+        if not cached:
+            regime = _detect_market_regime(underlying)
+            candles = _fetch_recent_candles(underlying, candle_count=5)
+            cached = {
+                "market_regime": str(regime.get("regime") or "UNKNOWN"),
+                "market_regime_score": float(regime.get("score") or 0.0),
+                "recent_candles": candles,
+            }
+            context_cache[underlying] = cached
+        sig["market_regime"] = cached["market_regime"]
+        sig["market_regime_score"] = cached["market_regime_score"]
+        sig["recent_candles"] = cached["recent_candles"]
+
     # Build recommendations for all signals (including CE/PE ATM options)
     recommendations = []
     blocked_recommendations = []
     ai_rejected_recommendations = []
+    risk_profile = _entry_timing_risk_profile()
     for sig in signals:
         blocked, remaining_seconds, _ = _cooldown_info(sig.get("symbol"), sig.get("action"))
-        ai_ok, ai_reasons = _ai_entry_validation(sig)
+        ai_ok, ai_reasons, ai_diag = _ai_entry_validation(sig)
         if blocked:
             blocked_recommendations.append({
                 "symbol": sig.get("symbol"),
@@ -1259,7 +1378,13 @@ async def analyze(
                 "side": (sig.get("action") or "BUY").upper(),
                 "reason": "AI_QUALITY_GATE",
                 "details": ai_reasons,
+                "advanced": ai_diag,
             })
+        base_qty = int(sig.get("quantity") or 1)
+        lot_step = int(sig.get("quantity") or 1)
+        adjusted_qty = _apply_qty_multiplier(base_qty, lot_step, float(risk_profile.get("qty_multiplier") or 1.0))
+        capital_required = round(float(sig["entry_price"]) * adjusted_qty, 2)
+
         recommendations.append({
             "action": sig["action"],
             "symbol": sig["symbol"],
@@ -1270,15 +1395,16 @@ async def analyze(
             "entry_price": sig["entry_price"],
             "stop_loss": sig["stop_loss"],
             "target": sig["target"],
-            "quantity": sig["quantity"],
-            "capital_required": sig["capital_required"],
-            "potential_profit": round((sig["target"] - sig["entry_price"]) * sig["quantity"], 2),
-            "risk": round((sig["entry_price"] - sig["stop_loss"]) * sig["quantity"], 2),
+            "quantity": adjusted_qty,
+            "base_quantity": base_qty,
+            "capital_required": capital_required,
+            "potential_profit": round((sig["target"] - sig["entry_price"]) * adjusted_qty, 2),
+            "risk": round((sig["entry_price"] - sig["stop_loss"]) * adjusted_qty, 2),
             "expiry": sig.get("expiry"),
             "expiry_date": sig.get("expiry_date"),
             "underlying_price": sig.get("underlying_price"),
             "target_points": sig.get("target_points"),
-            "roi_percentage": round(((sig["target"] - sig["entry_price"]) * sig["quantity"] / sig["capital_required"]) * 100, 2) if sig["capital_required"] else 0.0,
+            "roi_percentage": round(((sig["target"] - sig["entry_price"]) * adjusted_qty / capital_required) * 100, 2) if capital_required else 0.0,
             "trail": {
                 "enabled": trail_config["enabled"],
                 "trigger_pct": trail_config["trigger_pct"],
@@ -1295,10 +1421,40 @@ async def analyze(
             "cooldown_wait_seconds": round(remaining_seconds, 1) if blocked else 0,
             "ai_valid": ai_ok,
             "ai_reasons": ai_reasons,
+            "trend_confirmed": ai_diag.get("trend_confirmed"),
+            "momentum_confirmed": ai_diag.get("momentum_confirmed"),
+            "breakout_confirmed": ai_diag.get("breakout_confirmed"),
+            "regime_score": ai_diag.get("regime_score"),
+            "momentum_score": ai_diag.get("momentum_score"),
+            "breakout_score": ai_diag.get("breakout_score"),
+            "fake_move_risk": ai_diag.get("fake_move_risk"),
+            "sudden_news_risk": ai_diag.get("sudden_news_risk"),
+            "liquidity_spike_risk": ai_diag.get("liquidity_spike_risk"),
+            "premium_distortion_risk": ai_diag.get("premium_distortion_risk"),
+            "ai_edge_score": ai_diag.get("ai_edge_score"),
+            "rr_score": ai_diag.get("rr_score"),
+            "market_regime": ai_diag.get("market_regime") or sig.get("market_regime"),
+            "market_regime_score": sig.get("market_regime_score"),
+            "thresholds": ai_diag.get("thresholds"),
+            "close_back_in_range": ai_diag.get("close_back_in_range"),
+            "fake_breakout_by_candle": ai_diag.get("fake_breakout_by_candle"),
+            "breakout_hold_confirmed": ai_diag.get("breakout_hold_confirmed"),
+            "wick_trap": ai_diag.get("wick_trap"),
+            "timing_risk_profile": risk_profile,
+            "qty_reduced_for_timing": adjusted_qty < base_qty,
+            "start_trade_allowed": ai_diag.get("start_trade_allowed"),
+            "start_trade_decision": ai_diag.get("start_trade_decision"),
         })
     # Prefer the best AI-valid signal that is not blocked by SL cooldown.
     ai_candidates = [r for r in recommendations if (not r.get("blocked_by_cooldown")) and r.get("ai_valid")]
-    ai_candidates.sort(key=lambda r: (float(r.get("quality_score") or 0), float(r.get("confirmation_score") or r.get("confidence") or 0)), reverse=True)
+    ai_candidates.sort(
+        key=lambda r: (
+            float(r.get("ai_edge_score") or 0),
+            float(r.get("quality_score") or 0),
+            float(r.get("confirmation_score") or r.get("confidence") or 0),
+        ),
+        reverse=True,
+    )
     recommendation = ai_candidates[0] if ai_candidates else None
     # Log/store all recommendations to a file (append as JSON lines)
     try:
@@ -1307,7 +1463,33 @@ async def analyze(
         with log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps({
                 "timestamp": _now(),
+                "scoring_version": 2,
                 "recommendations": recommendations,
+                "recommendation_scores": [
+                    {
+                        "symbol": r.get("symbol"),
+                        "ai_edge_score": r.get("ai_edge_score"),
+                        "fake_move_risk": r.get("fake_move_risk"),
+                        "sudden_news_risk": r.get("sudden_news_risk"),
+                        "liquidity_spike_risk": r.get("liquidity_spike_risk"),
+                        "premium_distortion_risk": r.get("premium_distortion_risk"),
+                        "momentum_score": r.get("momentum_score"),
+                        "breakout_score": r.get("breakout_score"),
+                        "market_regime": r.get("market_regime"),
+                        "thresholds": r.get("thresholds"),
+                        "close_back_in_range": r.get("close_back_in_range"),
+                        "fake_breakout_by_candle": r.get("fake_breakout_by_candle"),
+                        "breakout_hold_confirmed": r.get("breakout_hold_confirmed"),
+                        "wick_trap": r.get("wick_trap"),
+                        "timing_risk_profile": r.get("timing_risk_profile"),
+                        "qty_reduced_for_timing": r.get("qty_reduced_for_timing"),
+                        "base_quantity": r.get("base_quantity"),
+                        "quantity": r.get("quantity"),
+                        "start_trade_allowed": r.get("start_trade_allowed"),
+                        "start_trade_decision": r.get("start_trade_decision"),
+                    }
+                    for r in recommendations
+                ],
                 "signals": signals,
                 "request": {
                     "symbols": selected_symbols,
@@ -1332,7 +1514,7 @@ async def analyze(
 
     # Optionally auto-trigger trade execution for each recommendation
     auto_trade_result = None
-    if can_trade and recommendation:
+    if can_trade and recommendation and recommendation.get("start_trade_allowed"):
         try:
             from fastapi import Request
             auto_trade_result = await execute(
@@ -1358,7 +1540,7 @@ async def analyze(
                 "capital_required": recommendation["capital_required"],
                 "potential_profit": round((recommendation["target"] - recommendation["entry_price"]) * recommendation["quantity"], 2),
                 "potential_loss": round((recommendation["entry_price"] - recommendation["stop_loss"]) * recommendation["quantity"], 2),
-                "message": "Not enough capital to execute trade. Simulated only.",
+                "message": "Trade not auto-started (capital, availability, or start-trade gate). Simulated only.",
                 "demo_mode": True
             }
 
@@ -1474,7 +1656,7 @@ async def execute(
         "trend_strength": trend_strength,
     }
     if any(v is not None for v in [quality_score, confirmation_score, option_type, trend_direction]):
-        ai_ok, ai_reasons = _ai_entry_validation(ai_context)
+        ai_ok, ai_reasons, _ = _ai_entry_validation(ai_context)
         if not ai_ok:
             raise HTTPException(
                 status_code=403,
@@ -1495,9 +1677,19 @@ async def execute(
     if option_kind:
         stop_move = trade.price * (STOP_PCT_OPTIONS / 100)
         if trade.side.upper() == "SELL":
-            derived_stop = round(trade.price + stop_move, 2)
+            computed_stop = round(trade.price + stop_move, 2)
+            # Keep strict SL: never widen risk if client provided a tighter protective stop.
+            if trade.stop_loss is not None and trade.stop_loss > trade.price:
+                derived_stop = round(min(computed_stop, float(trade.stop_loss)), 2)
+            else:
+                derived_stop = computed_stop
         else:
-            derived_stop = round(trade.price - stop_move, 2)
+            computed_stop = round(trade.price - stop_move, 2)
+            # Keep strict SL: never widen risk if client provided a tighter protective stop.
+            if trade.stop_loss is not None and trade.stop_loss < trade.price:
+                derived_stop = round(max(computed_stop, float(trade.stop_loss)), 2)
+            else:
+                derived_stop = computed_stop
     elif derived_stop is None:
         if trade.side.upper() == "BUY":
             derived_stop = round(trade.price * (1 - pct), 2)
@@ -1705,15 +1897,7 @@ async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
         live_price_cache[quote_symbol] = new_price
         for trade in trades:
             trade["current_price"] = new_price
-            if _option_kind(trade.get("symbol")):
-                entry = float(trade.get("price") or 0)
-                if entry > 0:
-                    profit_points = new_price - entry
-                    if profit_points >= TRAIL_START_POINTS:
-                        trail_stop = new_price - TRAIL_GAP_POINTS
-                        current_sl = trade.get("stop_loss")
-                        if current_sl is None or trail_stop > current_sl:
-                            trade["stop_loss"] = round(trail_stop, 2)
+            _maybe_update_trail(trade, new_price)
             updated_count += 1
 
     if missing_symbols:
@@ -1733,15 +1917,7 @@ async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
             live_price_cache[quote_symbol] = new_price
             for trade in trade_symbol_map.get(quote_symbol, []):
                 trade["current_price"] = new_price
-                if _option_kind(trade.get("symbol")):
-                    entry = float(trade.get("price") or 0)
-                    if entry > 0:
-                        profit_points = new_price - entry
-                        if profit_points >= TRAIL_START_POINTS:
-                            trail_stop = new_price - TRAIL_GAP_POINTS
-                            current_sl = trade.get("stop_loss")
-                            if current_sl is None or trail_stop > current_sl:
-                                trade["stop_loss"] = round(trail_stop, 2)
+                _maybe_update_trail(trade, new_price)
                 updated_count += 1
 
     if live_update_state["last_duration"] > 2.5:

@@ -30,7 +30,7 @@ async def get_intraday_option_signals_advanced(
                 include_fno_universe=include_fno_universe,
                 max_symbols=max_symbols,
             ),
-            timeout=25.0
+            timeout=40.0
         )
         return {"signals": signals}
     except asyncio.TimeoutError:

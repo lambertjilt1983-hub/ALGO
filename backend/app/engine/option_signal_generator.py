@@ -97,7 +97,12 @@ def _build_kite(api_key: str, access_token: str) -> KiteConnect:
     return kite
 
 
-def _validate_signal_quality(signal: dict, kite: KiteConnect, quote_data: dict) -> dict:
+def _validate_signal_quality(
+    signal: dict,
+    kite: KiteConnect,
+    quote_data: dict,
+    enable_technical: bool = True,
+) -> dict:
     """
     Enhanced signal quality validation with technical indicators:
     - Volume: High/rising vs Low/stagnant
@@ -119,93 +124,93 @@ def _validate_signal_quality(signal: dict, kite: KiteConnect, quote_data: dict) 
         volume = quote_data.get("volume", 0)
         avg_volume = quote_data.get("average_price", 0)  # Approximate
         
-        # Try to get historical data for technical indicators
-        try:
-            # Get underlying index symbol
-            index_symbol = signal.get("index", "NIFTY")
-            symbol_map = {
-                "BANKNIFTY": "NSE:NIFTY BANK",
-                "NIFTY": "NSE:NIFTY 50",
-                "SENSEX": "BSE:SENSEX",
-                "FINNIFTY": "NSE:NIFTY FIN SERVICE"
-            }
-            underlying_symbol = symbol_map.get(index_symbol, "NSE:NIFTY 50")
-            
-            # Get historical data (last 100 candles for indicators)
-            from datetime import datetime, timedelta
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=30)
-            
-            historical = kite.historical_data(
-                instrument_token=kite.ltp(underlying_symbol)[underlying_symbol]["instrument_token"],
-                from_date=start_date,
-                to_date=end_date,
-                interval="5minute"
-            )
-            
-            if historical and len(historical) > 20:
-                prices = [candle["close"] for candle in historical]
-                highs = [candle["high"] for candle in historical]
-                lows = [candle["low"] for candle in historical]
-                volumes = [candle["volume"] for candle in historical]
-                
-                # Calculate comprehensive technical indicators
-                tech_analysis = calculate_comprehensive_signals(prices, highs, lows, volumes)
-                
-                # Store technical indicators in signal
-                signal["technical_indicators"] = {
-                    "rsi": tech_analysis.get("rsi", 50),
-                    "macd": tech_analysis.get("macd", {}),
-                    "bollinger": tech_analysis.get("bollinger_bands", {}),
-                    "volatility": tech_analysis.get("volatility", 0),
-                    "recommendation": tech_analysis.get("recommendation", "HOLD")
+        # Try to get historical data for technical indicators.
+        # For wide market scans, callers can disable this expensive pass.
+        if enable_technical:
+            try:
+                # Get underlying index symbol
+                index_symbol = signal.get("index", "NIFTY")
+                symbol_map = {
+                    "BANKNIFTY": "NSE:NIFTY BANK",
+                    "NIFTY": "NSE:NIFTY 50",
+                    "SENSEX": "BSE:SENSEX",
+                    "FINNIFTY": "NSE:NIFTY FIN SERVICE"
                 }
-                
-                # Enhanced scoring with technical indicators
-                # Factor 1: RSI (0-20 points)
-                rsi = tech_analysis.get("rsi", 50)
-                if 30 <= rsi <= 70:
-                    quality_score += 20
-                    quality_factors.append(f"✓ RSI healthy ({rsi:.1f})")
-                elif rsi < 30:
-                    quality_score += 15
-                    quality_factors.append(f"~ RSI oversold ({rsi:.1f})")
-                elif rsi > 70:
-                    quality_factors.append(f"⚠️ RSI overbought ({rsi:.1f})")
-                
-                # Factor 2: MACD (0-20 points)
-                macd = tech_analysis.get("macd", {})
-                if macd.get("crossover") == "bullish":
-                    quality_score += 20
-                    quality_factors.append("✓ MACD bullish crossover")
-                elif macd.get("histogram", 0) > 0:
-                    quality_score += 10
-                    quality_factors.append("~ MACD positive")
-                
-                # Factor 3: Bollinger Bands (0-20 points)
-                bb = tech_analysis.get("bollinger_bands", {})
-                bb_position = bb.get("position", 0.5)
-                if bb_position < 0.3:
-                    quality_score += 20
-                    quality_factors.append("✓ At lower BB (reversal)")
-                elif 0.4 <= bb_position <= 0.6:
-                    quality_score += 10
-                    quality_factors.append("~ Mid-range BB")
-                
-                # Factor 4: Overall Technical Recommendation (0-20 points)
-                recommendation = tech_analysis.get("recommendation", "HOLD")
-                if recommendation in ["STRONG BUY", "BUY"]:
-                    quality_score += 20
-                    quality_factors.append(f"✓ Tech signal: {recommendation}")
-                elif recommendation == "HOLD":
-                    quality_score += 10
-                    quality_factors.append(f"~ Tech signal: {recommendation}")
-                
-        except Exception as tech_error:
-            # Fallback to basic analysis if technical indicators fail
-            # Silently fall back to basic analysis if technical indicators fail
-            pass
-            pass
+                underlying_symbol = symbol_map.get(index_symbol, "NSE:NIFTY 50")
+
+                # Get historical data (last 100 candles for indicators)
+                from datetime import datetime, timedelta
+                end_date = datetime.now()
+                start_date = end_date - timedelta(days=30)
+
+                historical = kite.historical_data(
+                    instrument_token=kite.ltp(underlying_symbol)[underlying_symbol]["instrument_token"],
+                    from_date=start_date,
+                    to_date=end_date,
+                    interval="5minute"
+                )
+
+                if historical and len(historical) > 20:
+                    prices = [candle["close"] for candle in historical]
+                    highs = [candle["high"] for candle in historical]
+                    lows = [candle["low"] for candle in historical]
+                    volumes = [candle["volume"] for candle in historical]
+
+                    # Calculate comprehensive technical indicators
+                    tech_analysis = calculate_comprehensive_signals(prices, highs, lows, volumes)
+
+                    # Store technical indicators in signal
+                    signal["technical_indicators"] = {
+                        "rsi": tech_analysis.get("rsi", 50),
+                        "macd": tech_analysis.get("macd", {}),
+                        "bollinger": tech_analysis.get("bollinger_bands", {}),
+                        "volatility": tech_analysis.get("volatility", 0),
+                        "recommendation": tech_analysis.get("recommendation", "HOLD")
+                    }
+
+                    # Enhanced scoring with technical indicators
+                    # Factor 1: RSI (0-20 points)
+                    rsi = tech_analysis.get("rsi", 50)
+                    if 30 <= rsi <= 70:
+                        quality_score += 20
+                        quality_factors.append(f"✓ RSI healthy ({rsi:.1f})")
+                    elif rsi < 30:
+                        quality_score += 15
+                        quality_factors.append(f"~ RSI oversold ({rsi:.1f})")
+                    elif rsi > 70:
+                        quality_factors.append(f"⚠️ RSI overbought ({rsi:.1f})")
+
+                    # Factor 2: MACD (0-20 points)
+                    macd = tech_analysis.get("macd", {})
+                    if macd.get("crossover") == "bullish":
+                        quality_score += 20
+                        quality_factors.append("✓ MACD bullish crossover")
+                    elif macd.get("histogram", 0) > 0:
+                        quality_score += 10
+                        quality_factors.append("~ MACD positive")
+
+                    # Factor 3: Bollinger Bands (0-20 points)
+                    bb = tech_analysis.get("bollinger_bands", {})
+                    bb_position = bb.get("position", 0.5)
+                    if bb_position < 0.3:
+                        quality_score += 20
+                        quality_factors.append("✓ At lower BB (reversal)")
+                    elif 0.4 <= bb_position <= 0.6:
+                        quality_score += 10
+                        quality_factors.append("~ Mid-range BB")
+
+                    # Factor 4: Overall Technical Recommendation (0-20 points)
+                    recommendation = tech_analysis.get("recommendation", "HOLD")
+                    if recommendation in ["STRONG BUY", "BUY"]:
+                        quality_score += 20
+                        quality_factors.append(f"✓ Tech signal: {recommendation}")
+                    elif recommendation == "HOLD":
+                        quality_score += 10
+                        quality_factors.append(f"~ Tech signal: {recommendation}")
+
+            except Exception:
+                # Fallback to basic analysis if technical indicators fail
+                pass
         
         # Basic factors (when technical indicators unavailable)
         # Factor 1: Volume Analysis (0-25 points)
@@ -311,7 +316,7 @@ def fetch_banknifty_option_chain(kite: KiteConnect, instruments: list[dict]):
         "risk_note": "Live data",
         "entry_price": ce_quote,
         "target": ce_quote + 25,
-        "stop_loss": ce_quote - 20,
+        "stop_loss": _safe_buy_stop(ce_quote, ce_quote - 20),
         "confidence": 85,
         "strategy": "ATM Option",
         "action": "BUY",
@@ -329,6 +334,7 @@ def fetch_index_option_chain(
     instruments_bfo: list[dict] | None = None,
     instruments_all: list[dict] | None = None,
     bfo_error_reason: str | None = None,
+    enable_technical: bool = True,
 ):
     # Map index_name to correct Zerodha symbol for quote
     symbol_map = {
@@ -473,7 +479,7 @@ def fetch_index_option_chain(
             "risk_note": "Live data",
             "entry_price": ce_quote,
             "target": ce_quote + 25,
-            "stop_loss": ce_quote - 20,
+            "stop_loss": _safe_buy_stop(ce_quote, ce_quote - 20),
             "confidence": 85 if trend_bullish else 75,
             "strategy": "ATM Option CE",
             "action": "BUY",
@@ -499,7 +505,7 @@ def fetch_index_option_chain(
             "risk_note": "Live data",
             "entry_price": pe_quote,
             "target": pe_quote + 25,
-            "stop_loss": pe_quote - 20,
+            "stop_loss": _safe_buy_stop(pe_quote, pe_quote - 20),
             "confidence": 85 if not trend_bullish else 75,
             "strategy": "ATM Option PE",
             "action": "BUY",
@@ -516,13 +522,22 @@ def fetch_index_option_chain(
         }
         
         # Validate signal quality for both CE and PE
-        ce_signal = _validate_signal_quality(ce_signal, kite, quote_data)
-        pe_signal = _validate_signal_quality(pe_signal, kite, quote_data)
+        ce_signal = _validate_signal_quality(
+            ce_signal,
+            kite,
+            quote_data,
+            enable_technical=enable_technical,
+        )
+        pe_signal = _validate_signal_quality(
+            pe_signal,
+            kite,
+            quote_data,
+            enable_technical=enable_technical,
+        )
         
         # Directional enhancement:
-        # - Uptrend: prefer CE only
-        # - Downtrend: prefer PE only
-        # This reduces CE/PE noise and aligns entries with market direction.
+        # - Strong trend: return only aligned side.
+        # - Moderate/weak trend: include both sides so scanner does not look one-sided.
         preferred = ce_signal if trend_bullish else pe_signal
         counter = pe_signal if trend_bullish else ce_signal
         preferred["trend_logic"] = "directional_primary"
@@ -533,7 +548,24 @@ def fetch_index_option_chain(
             "confidence": counter.get("confidence"),
             "trend_aligned": counter.get("trend_aligned"),
         }
-        return [preferred]
+
+        if abs_change >= 1.0:
+            # Strong directional day: one-sided output is intentional.
+            preferred["market_bias"] = "STRONG_TREND_ONE_SIDE"
+            return [preferred]
+
+        if abs_change >= 0.4:
+            # Moderate trend: keep primary first, include cautious counter setup.
+            counter["confidence"] = max(60, float(counter.get("confidence", 0) or 0))
+            preferred["market_bias"] = "MODERATE_TREND_BOTH_SIDES"
+            counter["market_bias"] = "MODERATE_TREND_BOTH_SIDES"
+            return [preferred, counter]
+
+        # Weak/ranging trend: return both CE/PE to avoid false one-direction bias.
+        preferred["market_bias"] = "WEAK_TREND_BOTH_SIDES"
+        counter["market_bias"] = "WEAK_TREND_BOTH_SIDES"
+        counter["confidence"] = max(65, float(counter.get("confidence", 0) or 0))
+        return [preferred, counter]
     except Exception as e:
         return {"index": index_name, "error": str(e)}
 
@@ -589,8 +621,40 @@ def _build_fno_stock_universe(instruments_nfo: List[Dict], max_symbols: int = 12
             continue
         counts[name] = counts.get(name, 0) + 1
 
-    ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+    # Deterministic ranking: option-depth first, then symbol name as tie-breaker.
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
     return [sym for sym, _ in ranked[:max_symbols]]
+
+
+def _build_scan_symbol_universe(
+    include_nifty50: bool,
+    include_fno_universe: bool,
+    max_symbols: int,
+    instruments_nfo: List[Dict],
+) -> List[str]:
+    """Return indices + bounded stock universe for breadth scans."""
+    indices = ["BANKNIFTY", "NIFTY", "SENSEX", "FINNIFTY"]
+    stock_budget = max(0, min(int(max_symbols or 120), 300))
+
+    stock_candidates: List[str] = []
+    if include_nifty50:
+        stock_candidates.extend(NIFTY_50_SYMBOLS)
+    if include_fno_universe:
+        stock_candidates.extend(_build_fno_stock_universe(instruments_nfo, max_symbols=stock_budget))
+
+    # De-duplicate stock candidates, then enforce overall stock budget.
+    seen = set()
+    bounded_stocks: List[str] = []
+    for sym in stock_candidates:
+        normalized = str(sym or "").strip().upper()
+        if not normalized or normalized in seen or normalized in indices:
+            continue
+        seen.add(normalized)
+        bounded_stocks.append(normalized)
+        if len(bounded_stocks) >= stock_budget:
+            break
+
+    return indices + bounded_stocks
 
 def generate_signals(
     user_id: int | None = None,
@@ -655,11 +719,12 @@ def generate_signals(
         if symbols:
             selected = [s.strip().upper() for s in symbols if isinstance(s, str) and s.strip()]
         else:
-            selected = indices.copy()
-            if include_nifty50:
-                selected.extend(NIFTY_50_SYMBOLS)
-            if include_fno_universe:
-                selected.extend(_build_fno_stock_universe(instruments_nfo, max_symbols=max_symbols))
+            selected = _build_scan_symbol_universe(
+                include_nifty50=include_nifty50,
+                include_fno_universe=include_fno_universe,
+                max_symbols=max_symbols,
+                instruments_nfo=instruments_nfo,
+            )
         # de-duplicate while preserving order
         seen = set()
         selected_symbols = []
@@ -669,6 +734,7 @@ def generate_signals(
                 seen.add(sym)
         signals = []
         for idx in selected_symbols:
+            use_deep_technical = idx in indices and len(selected_symbols) <= 20
             result = fetch_index_option_chain(
                 idx,
                 kite,
@@ -676,6 +742,7 @@ def generate_signals(
                 instruments_bfo,
                 instruments_all,
                 bfo_error_reason,
+                enable_technical=use_deep_technical,
             )
             # flatten list of signals
             if isinstance(result, list):
@@ -735,6 +802,17 @@ def _clamp(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(max_value, value))
 
 
+def _safe_buy_stop(entry: float, desired_stop: float, floor: float = 0.05) -> float:
+    """Ensure BUY stop-loss stays positive and below entry."""
+    entry = float(entry or 0)
+    if entry <= 0:
+        return floor
+    candidate = float(desired_stop or 0)
+    if candidate <= floor or candidate >= entry:
+        candidate = max(floor, entry * 0.15)
+    return round(min(candidate, entry - floor), 2)
+
+
 def _trend_strength_bonus(strength: str | None) -> float:
     if strength == "Strong":
         return 0.20
@@ -790,13 +868,15 @@ def _apply_confirmation(signal: Dict, sentiment: Dict, trend_row: Dict | None, m
     scale = _clamp((1 + trend_bonus + sentiment_bonus) * mode_scale, 0.6, 1.9)
     target_points = round(base_target_points * scale, 2)
     stop_points = round(max(10, target_points * 0.8), 2)
+    if entry > 0:
+        stop_points = min(stop_points, max(1.0, entry * 0.85))
 
     if signal.get("action") == "SELL":
         signal["target"] = round(entry - target_points, 2)
         signal["stop_loss"] = round(entry + stop_points, 2)
     else:
         signal["target"] = round(entry + target_points, 2)
-        signal["stop_loss"] = round(entry - stop_points, 2)
+        signal["stop_loss"] = _safe_buy_stop(entry, entry - stop_points)
 
     base_conf = float(signal.get("confidence", 0) or 0)
     confirmation_score = _clamp(base_conf + (trend_bonus + sentiment_bonus) * 100, 45, 98)
