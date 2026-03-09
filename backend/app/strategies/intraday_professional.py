@@ -118,18 +118,24 @@ def backtest(df, capital=100000):
     trades = []
     position = None
     entry_price = 0
+    peak_price = None
+    trough_price = None
     risk_per_trade = capital * 0.02
     for i, row in df.iterrows():
         if row['Signal'] == 'LONG' and position is None:
             position = 'LONG'
             entry_price = row['close']
             stop_loss = row['Supertrend']
-            target = entry_price + 2 * (entry_price - stop_loss)
+            # Reduce nominal target by 10 points to be conservative
+            target = entry_price + 2 * (entry_price - stop_loss) - 10
+            peak_price = entry_price
         elif row['Signal'] == 'SHORT' and position is None:
             position = 'SHORT'
             entry_price = row['close']
             stop_loss = row['Supertrend']
-            target = entry_price - 2 * (stop_loss - entry_price)
+            # Reduce nominal target magnitude by 10 points for shorts as well
+            target = entry_price - 2 * (stop_loss - entry_price) + 10
+            trough_price = entry_price
         elif row['Signal'] == 'EXIT LONG' and position == 'LONG':
             pnl = row['close'] - entry_price
             trades.append(pnl)
@@ -138,6 +144,67 @@ def backtest(df, capital=100000):
             pnl = entry_price - row['close']
             trades.append(pnl)
             position = None
+        # Monitor active positions for SL/TARGET hits and early exits when price reverses
+        if position == 'LONG':
+            price = row['close']
+            # update peak
+            if peak_price is None:
+                peak_price = price
+            peak_price = max(peak_price, price)
+            # if price drops 10 points from peak, exit to lock profit
+            if price < peak_price - 10:
+                pnl = price - entry_price
+                trades.append(pnl)
+                position = None
+                peak_price = None
+                trough_price = None
+                continue
+            # stop loss
+            if price <= stop_loss:
+                pnl = price - entry_price
+                trades.append(pnl)
+                position = None
+                peak_price = None
+                trough_price = None
+                continue
+            # target hit
+            if price >= target:
+                pnl = price - entry_price
+                trades.append(pnl)
+                position = None
+                peak_price = None
+                trough_price = None
+                continue
+        elif position == 'SHORT':
+            price = row['close']
+            # update trough
+            if trough_price is None:
+                trough_price = price
+            trough_price = min(trough_price, price)
+            # if price rises 10 points from trough, exit to lock profit for short
+            if price > trough_price + 10:
+                pnl = entry_price - price
+                trades.append(pnl)
+                position = None
+                peak_price = None
+                trough_price = None
+                continue
+            # stop loss
+            if price >= stop_loss:
+                pnl = entry_price - price
+                trades.append(pnl)
+                position = None
+                peak_price = None
+                trough_price = None
+                continue
+            # target hit
+            if price <= target:
+                pnl = entry_price - price
+                trades.append(pnl)
+                position = None
+                peak_price = None
+                trough_price = None
+                continue
     # Calculate metrics
     returns = np.array(trades)
     win_rate = np.mean(returns > 0) if len(returns) > 0 else 0

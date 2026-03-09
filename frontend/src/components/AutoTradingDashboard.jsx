@@ -223,6 +223,10 @@ const AutoTradingDashboard = () => {
   const [scannerLastError, setScannerLastError] = useState(null);
   const [scannerTab, setScannerTab] = useState('all');
   const [autoScanActive, setAutoScanActive] = useState(false); // Track auto-refresh status
+  // Allows user to request continuous scanning even when auto-trading isn't enabled
+  const [scannerUserOverride, setScannerUserOverride] = useState(false);
+  // Track when the last market scan completed (for UI timing)
+  const [scannerLastRunAt, setScannerLastRunAt] = useState(null);
   const [lastSuccessfulSyncAt, setLastSuccessfulSyncAt] = useState(null);
   const [isUsingStaleData, setIsUsingStaleData] = useState(false);
   const [scannerMinQuality, setScannerMinQuality] = useState(() => {
@@ -756,35 +760,39 @@ const AutoTradingDashboard = () => {
   }, []);
 
   // Market Quality Scanner - finds all 75%+ quality trades
-  const scanMarketForQualityTrades = async (minQuality = scannerMinQuality) => {
+  const scanMarketForQualityTrades = async (minQuality = scannerMinQuality, bypassCache = false) => {
     const parsedMinQuality = Number(minQuality);
     const safeMinQuality = Number.isFinite(parsedMinQuality) ? parsedMinQuality : Number(scannerMinQuality);
     const nowMs = Date.now();
     const lastSnapshot = scannerSnapshotRef.current;
-    if (
-      nowMs - lastSnapshot.at < SCANNER_MIN_REFRESH_MS
-      && Number(lastSnapshot.minQuality) === Number(safeMinQuality)
-      && Array.isArray(lastSnapshot.trades)
-      && lastSnapshot.trades.length > 0
-    ) {
-      // Reuse recent snapshot to avoid "every second it changes" jitter.
-      setQualityTrades(lastSnapshot.trades);
-      setTotalSignalsScanned(lastSnapshot.total || 0);
-      setScannerLastError(null);
-      return;
-    }
+    
+    // Skip cache checks when bypassCache=true (e.g., when auto-trading needs real-time updates)
+    if (!bypassCache) {
+      if (
+        nowMs - lastSnapshot.at < SCANNER_MIN_REFRESH_MS
+        && Number(lastSnapshot.minQuality) === Number(safeMinQuality)
+        && Array.isArray(lastSnapshot.trades)
+        && lastSnapshot.trades.length > 0
+      ) {
+        // Reuse recent snapshot to avoid "every second it changes" jitter.
+        setQualityTrades(lastSnapshot.trades);
+        setTotalSignalsScanned(lastSnapshot.total || 0);
+        setScannerLastError(null);
+        return;
+      }
 
-    // Sticky window: avoid churn on frequent refreshes when market hasn't changed much.
-    if (
-      nowMs - lastSnapshot.at < SCANNER_STICKY_MS
-      && Number(lastSnapshot.minQuality) === Number(safeMinQuality)
-      && Array.isArray(lastSnapshot.trades)
-      && lastSnapshot.trades.length > 0
-    ) {
-      setQualityTrades(lastSnapshot.trades);
-      setTotalSignalsScanned(lastSnapshot.total || 0);
-      setScannerLastError(null);
-      return;
+      // Sticky window: avoid churn on frequent refreshes when market hasn't changed much.
+      if (
+        nowMs - lastSnapshot.at < SCANNER_STICKY_MS
+        && Number(lastSnapshot.minQuality) === Number(safeMinQuality)
+        && Array.isArray(lastSnapshot.trades)
+        && lastSnapshot.trades.length > 0
+      ) {
+        setQualityTrades(lastSnapshot.trades);
+        setTotalSignalsScanned(lastSnapshot.total || 0);
+        setScannerLastError(null);
+        return;
+      }
     }
 
     setScannerLoading(true);
@@ -795,8 +803,13 @@ const AutoTradingDashboard = () => {
       // Fetch all signals from market with bounded full-universe first, then safe fallback.
       const modeParam = encodeURIComponent((confirmationMode || 'balanced').toLowerCase());
       const requestsToTry = [
+        // Smaller FNO batch first - lower load, better chance to return stocks quickly
+        `${OPTION_SIGNALS_API}?mode=${modeParam}&include_nifty50=true&include_fno_universe=true&max_symbols=12`,
+        // Broad scan (tries to include FNO universe - may timeout on heavy load)
         `${OPTION_SIGNALS_API}?mode=${modeParam}&include_nifty50=true&include_fno_universe=true&max_symbols=40`,
+        // Nifty-only fallback (indices)
         `${OPTION_SIGNALS_API}?mode=${modeParam}&include_nifty50=true`,
+        // Generic fallback - whatever the API returns
         `${OPTION_SIGNALS_API}?mode=${modeParam}`,
       ];
 
@@ -1076,6 +1089,11 @@ const AutoTradingDashboard = () => {
         total: allSignals.length,
       };
       scannerLastRunAtRef.current = nowMs;
+      try {
+        setScannerLastRunAt(new Date(nowMs));
+      } catch (e) {
+        // ignore if unmounted
+      }
       if (qualityOnly.length === 0) {
         setProfessionalSignal(null);
       }
@@ -1702,8 +1720,26 @@ const AutoTradingDashboard = () => {
   useEffect(() => {
     const fetchOptionSignals = async () => {
       try {
-        const res = await fetch(`${OPTION_SIGNALS_API}?mode=${encodeURIComponent(confirmationMode)}&include_nifty50=true`);
-        const data = await res.json();
+        // Try broader universes with a smaller FNO batch first to improve stock coverage
+        const modeParam = encodeURIComponent(confirmationMode);
+        const urls = [
+          `${OPTION_SIGNALS_API}?mode=${modeParam}&include_nifty50=true&include_fno_universe=true&max_symbols=12`,
+          `${OPTION_SIGNALS_API}?mode=${modeParam}&include_nifty50=true&include_fno_universe=true&max_symbols=40`,
+          `${OPTION_SIGNALS_API}?mode=${modeParam}&include_nifty50=true`,
+          `${OPTION_SIGNALS_API}?mode=${modeParam}`,
+        ];
+        let data = null;
+        for (const u of urls) {
+          try {
+            const res = await fetch(u);
+            if (!res.ok) continue;
+            data = await res.json();
+            if (Array.isArray(data?.signals) && data.signals.length > 0) break;
+          } catch (e) {
+            // try next url
+          }
+        }
+        data = data || { signals: [] };
         
         // Check if API returned an error or detail message
         if (data.detail || data.error) {
@@ -1727,11 +1763,25 @@ const AutoTradingDashboard = () => {
 
   const fetchLatestOptionSignals = async () => {
     try {
-      const res = await fetch(`${OPTION_SIGNALS_API}?mode=${encodeURIComponent(confirmationMode)}&include_nifty50=true`);
-      const data = await res.json();
-      if (Array.isArray(data.signals) && data.signals.length > 0) {
-        setOptionSignals(data.signals);
-        return data.signals;
+      const modeParam = encodeURIComponent(confirmationMode);
+      const urls = [
+        `${OPTION_SIGNALS_API}?mode=${modeParam}&include_nifty50=true&include_fno_universe=true&max_symbols=12`,
+        `${OPTION_SIGNALS_API}?mode=${modeParam}&include_nifty50=true&include_fno_universe=true&max_symbols=40`,
+        `${OPTION_SIGNALS_API}?mode=${modeParam}&include_nifty50=true`,
+        `${OPTION_SIGNALS_API}?mode=${modeParam}`,
+      ];
+      for (const u of urls) {
+        try {
+          const res = await fetch(u);
+          if (!res.ok) continue;
+          const data = await res.json();
+          if (Array.isArray(data.signals) && data.signals.length > 0) {
+            setOptionSignals(data.signals);
+            return data.signals;
+          }
+        } catch (e) {
+          // try next
+        }
       }
     } catch (e) {
       console.error('❌ Failed to refresh option signals:', e);
@@ -2087,33 +2137,54 @@ const AutoTradingDashboard = () => {
   // Auto-refresh quality trades scanner every 1 second while:
   // - Market is open
   // - No trades are currently active
+  // - Either auto-trading is enabled OR user requested continuous scanning
   // Stop refreshing once a trade is active to avoid constant rescanning
+  const scannerPrevShouldRunRef = React.useRef(null);
+  const scannerIntervalRef = React.useRef(null);
+
   useEffect(() => {
-    // Don't start scanner refresh if market is closed or trade already active
+    // Compute whether any active trade is currently open (derived from array contents)
     const hasActiveTrade = activeTrades.some((t) => {
       const status = String(t?.status || '').toUpperCase();
       return status === 'OPEN' || (status !== 'CLOSED' && status !== 'CANCELLED' && status !== 'SL_HIT');
     });
 
-    if (!isMarketOpen || !autoTradingActive || hasActiveTrade) {
+    const shouldRunScanner = isMarketOpen && (autoTradingActive || scannerUserOverride) && !hasActiveTrade;
+
+    // Only act when desired run-state changes to avoid churn from frequent state updates
+    if (scannerPrevShouldRunRef.current === shouldRunScanner) {
+      return;
+    }
+    scannerPrevShouldRunRef.current = shouldRunScanner;
+
+    if (!shouldRunScanner) {
+      // Stop scanner
+      if (scannerIntervalRef.current) {
+        clearInterval(scannerIntervalRef.current);
+        scannerIntervalRef.current = null;
+      }
       setAutoScanActive(false);
-      return; // Stop refreshing if trade is active or market closed
+      console.log('⏹️ Stopped market scanner (trade active, market closed or user stopped)');
+      return;
     }
 
+    // Start scanner
     setAutoScanActive(true);
-    console.log('🔄 Starting continuous market scanner (auto-refresh every 1 second)...');
-
-    // Auto-refresh every 1 second when no trade is active
-    const scanInterval = setInterval(() => {
-      scanMarketForQualityTrades(scannerMinQuality);
+    console.log('🔄 Starting continuous market scanner (auto-refresh every 1 second with fresh data)...');
+    scannerIntervalRef.current = setInterval(() => {
+      scanMarketForQualityTrades(scannerMinQuality, true).catch(() => {});
     }, 1000);
 
     return () => {
-      clearInterval(scanInterval);
+      if (scannerIntervalRef.current) {
+        clearInterval(scannerIntervalRef.current);
+        scannerIntervalRef.current = null;
+      }
       setAutoScanActive(false);
-      console.log('⏹️ Stopped market scanner (trade now active or market closed)');
+      scannerPrevShouldRunRef.current = null;
+      console.log('⏹️ Stopped market scanner (cleanup)');
     };
-  }, [isMarketOpen, autoTradingActive, activeTrades, scannerMinQuality]);
+  }, [isMarketOpen, autoTradingActive, activeTrades.length, scannerMinQuality, scannerUserOverride]);
 
   // Auto-start rule:
   // - Start Trade YES + auto-trading enabled => execute eligible LIVE candidates.
@@ -3079,9 +3150,20 @@ const AutoTradingDashboard = () => {
           }}>
             {autoScanActive ? '🔄 Scanning...' : '🎯 All Quality Signals from Market'} ({scannerMinQuality}%+ Quality across indices and stocks)
           </h4>
+          <div style={{ fontSize: '12px', color: '#92400e', opacity: 0.9 }}>
+            {scannerLastRunAt ? `Last scan: ${scannerLastRunAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}` : ''}
+          </div>
           <button
-            onClick={() => scanMarketForQualityTrades(scannerMinQuality)}
-            disabled={scannerLoading || autoScanActive}
+            onClick={() => {
+              // Toggle user-requested continuous scanning. If enabling, perform an immediate fresh scan.
+              if (scannerUserOverride || autoScanActive) {
+                setScannerUserOverride(false);
+              } else {
+                setScannerUserOverride(true);
+                scanMarketForQualityTrades(scannerMinQuality, true).catch(() => {});
+              }
+            }}
+            disabled={scannerLoading && !(scannerUserOverride || autoScanActive)}
             style={{
               padding: '10px 20px',
               background: (scannerLoading || autoScanActive) ? '#cbd5e0' : '#f59e0b',
@@ -3092,7 +3174,7 @@ const AutoTradingDashboard = () => {
               fontWeight: '600',
               cursor: (scannerLoading || autoScanActive) ? 'wait' : 'pointer'
             }}>
-            {autoScanActive ? '⏹️ Auto-Scanning' : (scannerLoading ? '🔄 Scanning...' : '🔄 Refresh')}
+            {(autoScanActive || scannerUserOverride) ? '⏹️ Auto-Scanning' : (scannerLoading ? '🔄 Scanning...' : '🔄 Refresh')}
           </button>
         </div>
 
@@ -3107,7 +3189,7 @@ const AutoTradingDashboard = () => {
               key={`q-${q}`}
               onClick={() => {
                 setScannerMinQuality(q);
-                scanMarketForQualityTrades(q);
+                scanMarketForQualityTrades(q, true);
               }}
               style={{
                 padding: '6px 12px',

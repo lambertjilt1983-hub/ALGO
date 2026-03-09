@@ -806,10 +806,25 @@ def generate_signals(
         # Actual signal generation
         kite = _get_kite(user_id=user_id)
         if not kite:
-            return [
-                {"index": idx, "error": "Zerodha credentials missing or invalid"}
-                for idx in ["BANKNIFTY", "NIFTY", "SENSEX", "FINNIFTY"]
-            ]
+            # If credentials are missing, still build the requested symbol universe
+            # so frontend can classify indices vs stocks and display informative
+            # error rows per-symbol (previous behavior only returned 4 index errors).
+            selected = _build_scan_symbol_universe(
+                include_nifty50=include_nifty50,
+                include_fno_universe=include_fno_universe,
+                max_symbols=max_symbols,
+                instruments_nfo=[],
+            )
+            indices = ["BANKNIFTY", "NIFTY", "SENSEX", "FINNIFTY"]
+            msg = "Zerodha credentials missing or invalid"
+            results = []
+            for sym in selected:
+                results.append({
+                    "index": sym,
+                    "signal_type": "index" if sym in indices else "stock",
+                    "error": msg,
+                })
+            return results
 
         try:
             instruments_nfo = kite.instruments("NFO")
