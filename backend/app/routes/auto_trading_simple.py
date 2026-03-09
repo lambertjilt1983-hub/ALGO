@@ -394,6 +394,11 @@ def _ai_entry_validation(
     if not advanced.get("entry_valid", False):
         reasons.extend([f"advanced:{r}" for r in advanced.get("entry_reasons", [])])
 
+    # Premium movement check
+    market_regime = signal.get("market_regime")
+    if market_regime == "LOW_VOLATILITY":
+        reasons.append("premium_movement_slow")
+
     return len(reasons) == 0, reasons, advanced
 
 
@@ -1644,6 +1649,16 @@ async def analyze(
         adjusted_qty = _apply_qty_multiplier(base_qty, lot_step, combined_qty_multiplier)
         capital_required = round(float(sig["entry_price"]) * adjusted_qty, 2)
 
+        market_regime = ai_diag.get("market_regime") or sig.get("market_regime")
+        premium_movement_ok = True
+        premium_movement_detail = "Normal movement - OK"
+        if market_regime == "HIGH_VOLATILITY":
+            premium_movement_ok = True
+            premium_movement_detail = "Fast moving - OK"
+        elif market_regime == "LOW_VOLATILITY":
+            premium_movement_ok = False
+            premium_movement_detail = "Slow moving - Avoid"
+
         recommendations.append({
             "action": sig["action"],
             "symbol": sig["symbol"],
@@ -1705,6 +1720,8 @@ async def analyze(
             "loss_brake_profile": loss_brake,
             "start_trade_allowed": ai_diag.get("start_trade_allowed"),
             "start_trade_decision": ai_diag.get("start_trade_decision"),
+            "premium_movement_ok": premium_movement_ok,
+            "premium_movement_detail": premium_movement_detail,
         })
     # Prefer the best AI-valid signal that is not blocked by SL cooldown.
     ai_candidates = [r for r in recommendations if (not r.get("blocked_by_cooldown")) and r.get("ai_valid")]

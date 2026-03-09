@@ -134,7 +134,56 @@ def _validate_signal_quality(
                     "BANKNIFTY": "NSE:NIFTY BANK",
                     "NIFTY": "NSE:NIFTY 50",
                     "SENSEX": "BSE:SENSEX",
-                    "FINNIFTY": "NSE:NIFTY FIN SERVICE"
+                    "FINNIFTY": "NSE:NIFTY FIN SERVICE",
+                    # NIFTY 50 Stocks - map to their NSE symbols
+                    "ADANIENT": "NSE:ADANIENT",
+                    "ADANIPORTS": "NSE:ADANIPORTS",
+                    "APOLLOHOSP": "NSE:APOLLOHOSP",
+                    "ASIANPAINT": "NSE:ASIANPAINT",
+                    "AXISBANK": "NSE:AXISBANK",
+                    "BAJAJ-AUTO": "NSE:BAJAJAUTOLD",
+                    "BAJFINANCE": "NSE:BAJFINANCE",
+                    "BAJAJFINSV": "NSE:BAJAJFINSV",
+                    "BEL": "NSE:BEL",
+                    "BPCL": "NSE:BPCL",
+                    "BHARTIARTL": "NSE:BHARTIARTL",
+                    "BRITANNIA": "NSE:BRITANNIA",
+                    "CIPLA": "NSE:CIPLA",
+                    "COALINDIA": "NSE:COALINDIA",
+                    "DRREDDY": "NSE:DRREDDY",
+                    "EICHERMOT": "NSE:EICHERMOT",
+                    "GRASIM": "NSE:GRASIM",
+                    "HCLTECH": "NSE:HCLTECH",
+                    "HDFCBANK": "NSE:HDFCBANK",
+                    "HDFCLIFE": "NSE:HDFCLIFE",
+                    "HEROMOTOCO": "NSE:HEROMOTOCO",
+                    "HINDALCO": "NSE:HINDALCO",
+                    "HINDUNILVR": "NSE:HINDUNILVR",
+                    "ICICIBANK": "NSE:ICICIBANK",
+                    "INDUSINDBK": "NSE:INDUSINDBK",
+                    "INFY": "NSE:INFY",
+                    "ITC": "NSE:ITC",
+                    "JSWSTEEL": "NSE:JSWSTEEL",
+                    "KOTAKBANK": "NSE:KOTAKBANK",
+                    "LT": "NSE:LT",
+                    "M&M": "NSE:MM",
+                    "MARUTI": "NSE:MARUTI",
+                    "NESTLEIND": "NSE:NESTLEIND",
+                    "NTPC": "NSE:NTPC",
+                    "ONGC": "NSE:ONGC",
+                    "POWERGRID": "NSE:POWERGRID",
+                    "RELIANCE": "NSE:RELIANCE",
+                    "SBIN": "NSE:SBIN",
+                    "SBILIFE": "NSE:SBILIFE",
+                    "SHRIRAMFIN": "NSE:SHRIRAMFIN",
+                    "SUNPHARMA": "NSE:SUNPHARMA",
+                    "TATAMOTORS": "NSE:TATAMOTORS",
+                    "TATASTEEL": "NSE:TATASTEEL",
+                    "TCS": "NSE:TCS",
+                    "TECHM": "NSE:TECHM",
+                    "TITAN": "NSE:TITAN",
+                    "ULTRACEMCO": "NSE:ULTRACEMCO",
+                    "WIPRO": "NSE:WIPRO",
                 }
                 underlying_symbol = symbol_map.get(index_symbol, "NSE:NIFTY 50")
 
@@ -336,26 +385,90 @@ def fetch_index_option_chain(
     bfo_error_reason: str | None = None,
     enable_technical: bool = True,
 ):
-    # Map index_name to correct Zerodha symbol for quote
+    # Map index/stock name to correct Zerodha symbol for quote
+    # Includes both indices and NIFTY 50 stocks
     symbol_map = {
+        # Indices
         "BANKNIFTY": "NSE:NIFTY BANK",
         "NIFTY": "NSE:NIFTY 50",
         "SENSEX": "BSE:SENSEX",
-        "FINNIFTY": "NSE:NIFTY FIN SERVICE"
+        "FINNIFTY": "NSE:NIFTY FIN SERVICE",
+        # NIFTY 50 Stocks (for option chain support)
+        "ADANIENT": "NSE:ADANIENT",
+        "ADANIPORTS": "NSE:ADANIPORTS",
+        "APOLLOHOSP": "NSE:APOLLOHOSP",
+        "ASIANPAINT": "NSE:ASIANPAINT",
+        "AXISBANK": "NSE:AXISBANK",
+        "BAJAJ-AUTO": "NSE:BAJAJAUTOLD",
+        "BAJFINANCE": "NSE:BAJFINANCE",
+        "BAJAJFINSV": "NSE:BAJAJFINSV",
+        "BEL": "NSE:BEL",
+        "BPCL": "NSE:BPCL",
+        "BHARTIARTL": "NSE:BHARTIARTL",
+        "BRITANNIA": "NSE:BRITANNIA",
+        "CIPLA": "NSE:CIPLA",
+        "COALINDIA": "NSE:COALINDIA",
+        "DRREDDY": "NSE:DRREDDY",
+        "EICHERMOT": "NSE:EICHERMOT",
+        "GRASIM": "NSE:GRASIM",
+        "HCLTECH": "NSE:HCLTECH",
+        "HDFCBANK": "NSE:HDFCBANK",
+        "HDFCLIFE": "NSE:HDFCLIFE",
+        "HEROMOTOCO": "NSE:HEROMOTOCO",
+        "HINDALCO": "NSE:HINDALCO",
+        "HINDUNILVR": "NSE:HINDUNILVR",
+        "ICICIBANK": "NSE:ICICIBANK",
+        "INDUSINDBK": "NSE:INDUSINDBK",
+        "INFY": "NSE:INFY",
+        "ITC": "NSE:ITC",
+        "JSWSTEEL": "NSE:JSWSTEEL",
+        "KOTAKBANK": "NSE:KOTAKBANK",
+        "LT": "NSE:LT",
+        "M&M": "NSE:MM",
+        "MARUTI": "NSE:MARUTI",
+        "NESTLEIND": "NSE:NESTLEIND",
+        "NTPC": "NSE:NTPC",
+        "ONGC": "NSE:ONGC",
+        "POWERGRID": "NSE:POWERGRID",
+        "RELIANCE": "NSE:RELIANCE",
+        "SBIN": "NSE:SBIN",
+        "SBILIFE": "NSE:SBILIFE",
+        "SHRIRAMFIN": "NSE:SHRIRAMFIN",
+        "SUNPHARMA": "NSE:SUNPHARMA",
+        "TATAMOTORS": "NSE:TATAMOTORS",
+        "TATASTEEL": "NSE:TATASTEEL",
+        "TCS": "NSE:TCS",
+        "TECHM": "NSE:TECHM",
+        "TITAN": "NSE:TITAN",
+        "ULTRACEMCO": "NSE:ULTRACEMCO",
+        "WIPRO": "NSE:WIPRO",
     }
     try:
         if index_name == "SENSEX":
             instruments = instruments_bfo or []
             segment = "BFO-OPT"
             name = "SENSEX"
+            is_stock = False
             if not instruments:
                 return {"index": index_name, "error": "BFO instruments unavailable for SENSEX."}
         else:
             instruments = instruments_nfo
             segment = "NFO-OPT"
             name = index_name
+            # Check if this is a stock symbol (in NIFTY 50) vs an index
+            is_stock = index_name in NIFTY_50_SYMBOLS
 
-        options = [i for i in instruments if i["name"] == name and i["segment"] == segment]
+        # For indices: match by name. For stocks: match by tradingsymbol prefix
+        if is_stock:
+            # Stock symbols: look for tradingsymbols that start with the stock symbol
+            options = [
+                i for i in instruments 
+                if i.get("tradingsymbol", "").startswith(index_name) 
+                and i["segment"] == segment
+            ]
+        else:
+            # Index symbols: match by name
+            options = [i for i in instruments if i["name"] == name and i["segment"] == segment]
         if index_name == "SENSEX" and not options:
             # Fallback: some BFO instruments may not use name="SENSEX"
             options = [
@@ -385,14 +498,16 @@ def fetch_index_option_chain(
                 }
             bfo_count = len(instruments_bfo or []) if index_name == "SENSEX" else None
             all_count = len(instruments_all or []) if index_name == "SENSEX" else None
+            symbol_type = "stock" if is_stock else "index"
             return {
                 "index": index_name,
-                "error": "No options available for this index. Ensure BFO options are enabled in Kite.",
+                "error": f"No option chain data available for {symbol_type} {index_name}. Check that this {symbol_type} has listed options.",
                 "debug": {
                     "bfo_instruments": bfo_count,
                     "all_instruments": all_count,
                     "segment": segment,
-                } if index_name == "SENSEX" else None,
+                    "is_stock": is_stock,
+                } if index_name == "SENSEX" else {"is_stock": is_stock},
             }
         quote_symbol = symbol_map.get(index_name, f"NSE:{index_name}")
         try:
@@ -438,17 +553,18 @@ def fetch_index_option_chain(
         
         # Get lot size from instrument data
         ce_instrument = next((i for i in options if i["tradingsymbol"] == ce_symbol), None)
-        lot_size = ce_instrument.get("lot_size", 15) if ce_instrument else 15
+        lot_size = ce_instrument.get("lot_size", 1) if ce_instrument else 1
         
-        # Index-specific lot sizes (fallback if not in instrument data)
+        # Index-specific and stock-specific lot sizes (fallback if not in instrument data)
         lot_size_map = {
             "BANKNIFTY": 30,
             "NIFTY": 50,
             "FINNIFTY": 40,
-            "SENSEX": 10
+            "SENSEX": 10,
+            # Stock symbols default to 1 (lot_size will be from instrument data)
         }
-        if lot_size == 15:  # If we got default, use index-specific
-            lot_size = lot_size_map.get(index_name, 15)
+        if lot_size == 1 and index_name in lot_size_map:  # Only override for indices with special lot sizes
+            lot_size = lot_size_map.get(index_name, 1)
         
         # Determine trend direction robustly using open->last move.
         # Prefer OHLC open when available, then fallback to legacy open_price.
@@ -469,8 +585,10 @@ def fetch_index_option_chain(
             trend_strength = "WEAK"
         
         # Return BOTH CE and PE signals
+        signal_type = "stock" if is_stock else "index"
         ce_signal = {
             "index": index_name,
+            "signal_type": signal_type,  # NEW: Mark whether this is stock or index
             "strike": atm_strike,
             "ce_signal": f"CE LTP: {ce_quote}",
             "pe_signal": f"PE LTP: {pe_quote}",
@@ -481,7 +599,7 @@ def fetch_index_option_chain(
             "target": ce_quote + 25,
             "stop_loss": _safe_buy_stop(ce_quote, ce_quote - 20),
             "confidence": 85 if trend_bullish else 75,
-            "strategy": "ATM Option CE",
+            "strategy": f"ATM Option CE ({'Stock' if is_stock else 'Index'})",
             "action": "BUY",
             "symbol": ce_symbol,
             "quantity": lot_size,
@@ -497,6 +615,7 @@ def fetch_index_option_chain(
         
         pe_signal = {
             "index": index_name,
+            "signal_type": signal_type,  # NEW: Mark whether this is stock or index
             "strike": atm_strike,
             "ce_signal": f"CE LTP: {ce_quote}",
             "pe_signal": f"PE LTP: {pe_quote}",
@@ -507,7 +626,7 @@ def fetch_index_option_chain(
             "target": pe_quote + 25,
             "stop_loss": _safe_buy_stop(pe_quote, pe_quote - 20),
             "confidence": 85 if not trend_bullish else 75,
-            "strategy": "ATM Option PE",
+            "strategy": f"ATM Option PE ({'Stock' if is_stock else 'Index'})",
             "action": "BUY",
             "symbol": pe_symbol,
             "quantity": lot_size,
@@ -762,40 +881,135 @@ def select_best_signal(signals: List[Dict]) -> Dict | None:
     """
     Select the best signal based on quality score, confidence, and filters.
     Now with stricter filtering to avoid low-quality signals that lead to losses.
+    
+    Filtering stages:
+    1. Remove error signals and incomplete signals (missing symbol/entry_price)
+    2. Quality filter: prefer 85%+, fallback to 75%+
+    3. Risk:Reward filter: require 1.3:1 or better (with fallback if needed)
+    4. Rank by quality score, tiebreak by confidence
+    
+    Returns:
+        Selected signal dict with all fields preserved, or None if no viable signal
     """
-    # Filter out error signals and signals without required data
-    viable = [s for s in signals if not s.get("error") and s.get("symbol") and s.get("entry_price")]
-    if not viable:
+    import logging
+    logger = logging.getLogger("trading_bot")
+    
+    # Handle None or empty input
+    if not signals:
         return None
     
-    # CRITICAL: Filter out low-quality signals (quality_score < 85)
-    # Prefer very strong setups, but allow good ones through too.
-    high_quality = [s for s in viable if s.get("quality_score", 0) >= 85]
-    if high_quality:
-        viable = high_quality  # Prefer highest quality signals (85%+)
-    else:
-        # Fallback: if nothing meets 85% quality, accept 75%+ signals
-        viable = [s for s in viable if s.get("quality_score", 0) >= 75]
-        if not viable:
-            return None  # No acceptable quality signals
+    # Stage 1: Filter out error signals and signals without required data
+    viable = []
+    for s in signals:
+        # Skip error signals
+        if not isinstance(s, dict) or s.get("error"):
+            continue
+        
+        # Require symbol
+        symbol = s.get("symbol")
+        if not symbol or not isinstance(symbol, str) or not symbol.strip():
+            continue
+        
+        # Require entry_price and ensure it's positive
+        try:
+            entry_price = float(s.get("entry_price") or 0)
+            if entry_price <= 0:
+                continue
+        except (ValueError, TypeError):
+            continue
+        
+        viable.append(s)
     
-    # Filter out signals with unfavorable risk:reward ratio (< 1.3:1)
+    if not viable:
+        logger.debug(f"[SELECT-BEST-SIGNAL] No viable signals found (0 signals passed basic validation)")
+        return None
+    
+    logger.debug(f"[SELECT-BEST-SIGNAL] {len(viable)} viable signals after basic validation")
+    
+    # Helper to safely convert to float
+    def safe_float(value):
+        """Safely convert any value to float, return 0 if fails."""
+        try:
+            return float(value or 0)
+        except (ValueError, TypeError):
+            return 0
+    
+    # Stage 2: Filter by quality score (two-tier)
+    high_quality = [
+        s for s in viable 
+        if safe_float(s.get("quality_score", 0)) >= 85
+    ]
+    
+    if high_quality:
+        viable = high_quality
+        logger.debug(f"[SELECT-BEST-SIGNAL] {len(viable)} signals with quality >= 85 (strict)")
+    else:
+        # Fallback: accept 75%+ signals
+        viable = [
+            s for s in viable 
+            if safe_float(s.get("quality_score", 0)) >= 75
+        ]
+        if viable:
+            logger.debug(f"[SELECT-BEST-SIGNAL] Using fallback: {len(viable)} signals with quality >= 75")
+        else:
+            logger.debug(f"[SELECT-BEST-SIGNAL] No signals passed quality filter (85+ or 75+)")
+            return None
+    
+    # Stage 3: Filter by risk:reward ratio (with fallback)
     def get_risk_reward(s):
-        entry = float(s.get("entry_price", 0) or 0)
-        target = float(s.get("target", 0) or 0)
-        sl = float(s.get("stop_loss", 0) or 0)
-        if entry and target and sl:
+        """Calculate risk:reward ratio safely."""
+        try:
+            entry = safe_float(s.get("entry_price", 0))
+            target = safe_float(s.get("target", 0))
+            sl = safe_float(s.get("stop_loss", 0))
+            
+            if not (entry and target and sl):
+                return 0
+            
             profit = abs(target - entry)
             risk = abs(entry - sl)
-            return profit / risk if risk > 0 else 0
-        return 0
+            
+            # Avoid division by zero
+            if risk <= 0:
+                return 0
+            
+            rr = profit / risk
+            return rr
+        except (ValueError, TypeError):
+            return 0
     
+    # Try strict RR filter first
     good_rr = [s for s in viable if get_risk_reward(s) >= 1.3]
+    
     if good_rr:
         viable = good_rr
+        logger.debug(f"[SELECT-BEST-SIGNAL] {len(viable)} signals with RR >= 1.3:1")
+    else:
+        # Fallback is conditional: only use if we still have signals
+        # Don't lower the RR threshold, just keep viable as is
+        if not viable:
+            logger.debug(f"[SELECT-BEST-SIGNAL] No signals passed RR filter (1.3:1)")
+            return None
+        logger.debug(f"[SELECT-BEST-SIGNAL] {len(viable)} signals (RR filter relaxed after quality filtering)")
     
-    # Select best by quality score (tie-break by confidence)
-    return max(viable, key=lambda s: (s.get("quality_score", 0), s.get("confidence", 0)))
+    # Stage 4: Select best by quality score, tiebreak by confidence
+    best = max(
+        viable,
+        key=lambda s: (
+            safe_float(s.get("quality_score") or 0),
+            safe_float(s.get("confidence") or s.get("confirmation_score") or 0)
+        )
+    )
+    
+    rr_value = get_risk_reward(best)
+    logger.info(
+        f"[SELECT-BEST-SIGNAL] Selected: {best.get('symbol')} "
+        f"(Q: {safe_float(best.get('quality_score', 0))}, "
+        f"C: {safe_float(best.get('confidence', best.get('confirmation_score', 0)))}, "
+        f"RR: {rr_value:.2f}:1)"
+    )
+    
+    return best
 
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:

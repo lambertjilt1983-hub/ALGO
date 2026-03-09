@@ -222,6 +222,7 @@ const AutoTradingDashboard = () => {
   const [scannerLoading, setScannerLoading] = useState(false);
   const [scannerLastError, setScannerLastError] = useState(null);
   const [scannerTab, setScannerTab] = useState('all');
+  const [autoScanActive, setAutoScanActive] = useState(false); // Track auto-refresh status
   const [lastSuccessfulSyncAt, setLastSuccessfulSyncAt] = useState(null);
   const [isUsingStaleData, setIsUsingStaleData] = useState(false);
   const [scannerMinQuality, setScannerMinQuality] = useState(() => {
@@ -581,6 +582,11 @@ const AutoTradingDashboard = () => {
   const INDEX_SYMBOLS = new Set(['NIFTY', 'BANKNIFTY', 'SENSEX', 'FINNIFTY']);
 
   const getSignalGroup = (signal) => {
+    // Check new signal_type field from backend (preferred)
+    if (signal?.signal_type) {
+      return signal.signal_type === 'stock' ? 'stocks' : 'indices';
+    }
+    // Fallback to name-based heuristics if signal_type not present
     const indexName = String(signal?.index || '').toUpperCase();
     if (INDEX_SYMBOLS.has(indexName)) return 'indices';
     const symbol = String(signal?.symbol || '').toUpperCase();
@@ -1914,6 +1920,11 @@ const AutoTradingDashboard = () => {
         : (recommendationReadiness?.reasons?.[0] || 'Start Trade decision is NO')
     },
     {
+      label: 'Premium Movement',
+      pass: activeSignalUi?.premium_movement_ok ?? true,
+      detail: activeSignalUi?.premium_movement_detail ?? 'Checking...'
+    },
+    {
       label: 'Min Live Balance',
       pass: !isLiveMode || (hasLiveBalance && liveBalanceValue >= MIN_LIVE_BALANCE_REQUIRED),
       detail: !isLiveMode
@@ -2072,6 +2083,37 @@ const AutoTradingDashboard = () => {
       localStorage.removeItem('selectedSignalSymbol');
     }
   }, [selectedSignalSymbol]);
+
+  // Auto-refresh quality trades scanner every 1 second while:
+  // - Market is open
+  // - No trades are currently active
+  // Stop refreshing once a trade is active to avoid constant rescanning
+  useEffect(() => {
+    // Don't start scanner refresh if market is closed or trade already active
+    const hasActiveTrade = activeTrades.some((t) => {
+      const status = String(t?.status || '').toUpperCase();
+      return status === 'OPEN' || (status !== 'CLOSED' && status !== 'CANCELLED' && status !== 'SL_HIT');
+    });
+
+    if (!isMarketOpen || !autoTradingActive || hasActiveTrade) {
+      setAutoScanActive(false);
+      return; // Stop refreshing if trade is active or market closed
+    }
+
+    setAutoScanActive(true);
+    console.log('🔄 Starting continuous market scanner (auto-refresh every 1 second)...');
+
+    // Auto-refresh every 1 second when no trade is active
+    const scanInterval = setInterval(() => {
+      scanMarketForQualityTrades(scannerMinQuality);
+    }, 1000);
+
+    return () => {
+      clearInterval(scanInterval);
+      setAutoScanActive(false);
+      console.log('⏹️ Stopped market scanner (trade now active or market closed)');
+    };
+  }, [isMarketOpen, autoTradingActive, activeTrades, scannerMinQuality]);
 
   // Auto-start rule:
   // - Start Trade YES + auto-trading enabled => execute eligible LIVE candidates.
@@ -3035,22 +3077,22 @@ const AutoTradingDashboard = () => {
             fontSize: '18px',
             fontWeight: 'bold'
           }}>
-            🎯 All Quality Signals from Market ({scannerMinQuality}%+ Quality across indices and stocks)
+            {autoScanActive ? '🔄 Scanning...' : '🎯 All Quality Signals from Market'} ({scannerMinQuality}%+ Quality across indices and stocks)
           </h4>
           <button
             onClick={() => scanMarketForQualityTrades(scannerMinQuality)}
-            disabled={scannerLoading}
+            disabled={scannerLoading || autoScanActive}
             style={{
               padding: '10px 20px',
-              background: scannerLoading ? '#cbd5e0' : '#f59e0b',
+              background: (scannerLoading || autoScanActive) ? '#cbd5e0' : '#f59e0b',
               color: 'white',
               border: 'none',
               borderRadius: '6px',
               fontSize: '14px',
               fontWeight: '600',
-              cursor: scannerLoading ? 'wait' : 'pointer'
+              cursor: (scannerLoading || autoScanActive) ? 'wait' : 'pointer'
             }}>
-            {scannerLoading ? '🔄 Scanning...' : '🔄 Refresh'}
+            {autoScanActive ? '⏹️ Auto-Scanning' : (scannerLoading ? '🔄 Scanning...' : '🔄 Refresh')}
           </button>
         </div>
 
@@ -3195,7 +3237,9 @@ const AutoTradingDashboard = () => {
             textAlign: 'center',
             padding: '20px'
           }}>
-            {scannerLoading ? (
+            {autoScanActive ? (
+              <p style={{ margin: '10px 0' }}>🔄 <strong>Auto-scanning every 1 second...</strong> Searching for {scannerMinQuality}%+ quality signals.</p>
+            ) : scannerLoading ? (
               <p style={{ margin: '10px 0' }}>🔄 Scanning all markets for {scannerMinQuality}%+ quality signals...</p>
             ) : scannerLastError ? (
               <div>
