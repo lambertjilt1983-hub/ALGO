@@ -79,6 +79,51 @@ def _paper_sl_cooldown_info(db: Session, symbol: str, side: str, minutes: int = 
     return False, 0, None
 
 
+def _yahoo_ticker_for_underlying(underlying: str) -> str:
+    mapping = {
+        "NIFTY": "^NSEI",
+        "BANKNIFTY": "^NSEBANK",
+        "FINNIFTY": "NIFTY_FIN_SERVICE.NS",
+        "SENSEX": "^BSESN",
+        "MIDCPNIFTY": "NIFTY_MID_SELECT.NS",
+    }
+    return mapping.get(underlying, "^NSEI")
+
+
+def _fetch_recent_candles(underlying: str, candle_count: int = 3):
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker(_yahoo_ticker_for_underlying(underlying))
+        df = ticker.history(period="2d", interval="5m")
+        if df.empty:
+            return []
+        rows = []
+        for _, row in df.tail(max(3, candle_count)).iterrows():
+            rows.append({
+                "open": float(row.get("Open") or 0),
+                "high": float(row.get("High") or 0),
+                "low": float(row.get("Low") or 0),
+                "close": float(row.get("Close") or 0),
+            })
+        return rows
+    except Exception:
+        return []
+
+
+def _require_multi_tick_confirmation(underlying: str, entry_price: float, side: str, required_ticks: int = 3) -> bool:
+    try:
+        candles = _fetch_recent_candles(underlying, candle_count=required_ticks)
+        if not candles or len(candles) < required_ticks:
+            return False
+        closes = [float(c.get('close', 0)) for c in candles[-required_ticks:]]
+        if side.upper() == 'BUY':
+            return all(c >= entry_price for c in closes)
+        else:
+            return all(c <= entry_price for c in closes)
+    except Exception:
+        return False
+
+
 class PaperTradeCreate(BaseModel):
     symbol: str
     index_name: Optional[str] = None
@@ -90,6 +135,7 @@ class PaperTradeCreate(BaseModel):
     target: Optional[float] = None
     strategy: str = "professional"
     signal_data: Optional[dict] = None
+    bypass_confirmation: Optional[bool] = False
 
 
 class PaperTradeUpdate(BaseModel):
@@ -129,6 +175,25 @@ def create_paper_trade(trade: PaperTradeCreate, db: Session = Depends(get_db)):
             "success": False,
             "message": f"Cannot create new trade. {active_count} active trade(s) already exist.",
             "active_trades": active_count
+        }
+
+    # Server-side multi-tick confirmation guard (mirror live behavior)
+    # Server-side multi-tick confirmation guard (mirror live behavior)
+    try:
+        underlying = _symbol_root(trade.symbol)
+        if not getattr(trade, 'bypass_confirmation', False):
+            confirmed = _require_multi_tick_confirmation(underlying, trade.entry_price, trade.side, required_ticks=3)
+        else:
+            confirmed = True
+    except Exception:
+        confirmed = False
+
+    if not confirmed:
+        return {
+            "success": False,
+            "message": "Paper trade blocked: failed multi-tick confirmation (server guard).",
+            "underlying": underlying,
+            "required_ticks": 3,
         }
 
     

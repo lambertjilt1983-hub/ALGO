@@ -150,6 +150,24 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
                             print(
                                 f"✅ BREAKEVEN set at {trade.stop_loss} after 50% target reached (Profit: +{profit_points:.1f}pts)"
                             )
+                        # Lock-in 20 points profit: once profit >= 20, move SL to entry+20
+                        if profit_points >= 20:
+                            locked_sl = round(trade.entry_price + 20, 2)
+                            if trade.stop_loss < locked_sl:
+                                trade.stop_loss = locked_sl
+                                print(f"🔒 LOCKED PROFIT: SL moved to {trade.stop_loss} (Profit: +{profit_points:.1f}pts)")
+                            # If price starts dropping from last seen price, exit immediately to lock profit
+                            if (trade.current_price is not None) and (new_price < trade.current_price):
+                                trade.status = "SL_HIT"
+                                trade.exit_price = new_price
+                                trade.exit_time = datetime.utcnow()
+                                trade.pnl = (trade.exit_price - trade.entry_price) * trade.quantity
+                                trade.pnl_percentage = (trade.pnl / (trade.entry_price * trade.quantity)) * 100
+                                closed_count += 1
+                                print(f"❌ PROFIT-LOCK EXIT: Trade {trade.id} closed at {trade.exit_price} (Profit: ₹{trade.pnl:.2f})")
+                                trade.current_price = new_price
+                                updated_count += 1
+                                continue
                         if target_reached:
                             trade.status = "TARGET_HIT"
                             trade.exit_price = trade.target
@@ -180,6 +198,24 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
                             print(
                                 f"✅ BREAKEVEN set at {trade.stop_loss} after 50% target reached (Profit: +{profit_points:.1f}pts)"
                             )
+                        # Lock-in 20 points profit for shorts: once profit >= 20, move SL to entry-20
+                        if profit_points >= 20:
+                            locked_sl = round(trade.entry_price - 20, 2)
+                            if trade.stop_loss > locked_sl:
+                                trade.stop_loss = locked_sl
+                                print(f"🔒 LOCKED PROFIT: SL moved to {trade.stop_loss} (Profit: +{profit_points:.1f}pts)")
+                            # If price starts rising from last seen price, exit immediately to lock profit
+                            if (trade.current_price is not None) and (new_price > trade.current_price):
+                                trade.status = "SL_HIT"
+                                trade.exit_price = new_price
+                                trade.exit_time = datetime.utcnow()
+                                trade.pnl = (trade.entry_price - trade.exit_price) * trade.quantity
+                                trade.pnl_percentage = (trade.pnl / (trade.entry_price * trade.quantity)) * 100
+                                closed_count += 1
+                                print(f"❌ PROFIT-LOCK EXIT: Trade {trade.id} closed at {trade.exit_price} (Profit: ₹{trade.pnl:.2f})")
+                                trade.current_price = new_price
+                                updated_count += 1
+                                continue
                         if target_reached:
                             trade.status = "TARGET_HIT"
                             trade.exit_price = trade.target

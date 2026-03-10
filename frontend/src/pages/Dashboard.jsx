@@ -108,11 +108,26 @@ export default function Dashboard() {
 
   useEffect(() => {
     // Auto-trade for signals with confidence > 80 if no active trade
-    if (!activeTrade && signals.length > 0) {
-      const highConf = signals.filter(s => s.confidence > 80);
-      if (highConf.length > 0) {
-        const sig = highConf[0];
-        axios.post('/autotrade/execute', {
+    const tryAutoExecute = async () => {
+      if (activeTrade || signals.length === 0) return;
+      const highConf = signals.filter((s) => s.confidence > 80);
+      if (highConf.length === 0) return;
+      const sig = highConf[0];
+      try {
+        // Verify server-side autotrade status before executing
+        const statusResp = await axios.get('/autotrade/status');
+        const status = statusResp.data || {};
+        if (!status.enabled) {
+          console.warn('Autotrade disabled on server; skipping execute');
+          return;
+        }
+        // Only auto-execute in demo mode by default to avoid accidental live orders
+        if (!status.is_demo_mode) {
+          console.warn('Autotrade live mode not armed; skipping execute');
+          return;
+        }
+
+        await axios.post('/autotrade/execute', {
           symbol: sig.symbol,
           price: sig.entry_price,
           quantity: sig.quantity,
@@ -120,13 +135,16 @@ export default function Dashboard() {
           stop_loss: sig.stop_loss,
           target: sig.target,
           expiry: sig.expiry_date || sig.expiry,
-        }).then(() => {
-          toast.success(`Auto-trade executed for ${sig.symbol}`);
-        }).catch(() => {
-          toast.error('Auto-trade failed');
+          force_demo: true,
         });
+        toast.success(`Auto-trade (demo) executed for ${sig.symbol}`);
+      } catch (err) {
+        console.error('Auto-trade attempt failed', err);
+        toast.error(err.response?.data?.detail || 'Auto-trade failed');
       }
-    }
+    };
+
+    tryAutoExecute();
   }, [signals, activeTrade]);
 
   const chartData = [

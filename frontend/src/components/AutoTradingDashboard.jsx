@@ -70,6 +70,8 @@ const SCANNER_MIN_REFRESH_MS = 8000; // Prevent rapid manual refresh jitter
 const SCANNER_STABILITY_WINDOW_MS = 120000; // Keep continuity over recent scans
 const SCANNER_STICKY_MS = 45000; // Keep selected scanner rows stable for brief period unless quality threshold changes
 const EMPTY_ACTIVE_POLLS_TO_CLEAR = 2; // Anti-flicker: clear rows only after consecutive confirmed empty polls
+// Frontend mirror of backend concurrent trade limit
+const MAX_CONCURRENT_TRADES = 3;
 
 // === MARKET HOURS (IST) ===
 const MARKET_OPEN_HOUR = 9;
@@ -164,6 +166,8 @@ const AutoTradingDashboard = () => {
   });
   const [signalsLoaded, setSignalsLoaded] = useState(false);
   const [wakeLockActive, setWakeLockActive] = useState(false);
+  const [cooldownEndsAt, setCooldownEndsAt] = useState(null);
+  const [cooldownRemainingMs, setCooldownRemainingMs] = useState(0);
   const [lastProfessionalVisibleSignal, setLastProfessionalVisibleSignal] = useState(null);
   const [lastAiRecommendationSignal, setLastAiRecommendationSignal] = useState(null);
   const [aiGateRejections, setAiGateRejections] = useState([]);
@@ -222,7 +226,7 @@ const AutoTradingDashboard = () => {
   const [scannerLoading, setScannerLoading] = useState(false);
   const [scannerLastError, setScannerLastError] = useState(null);
   const [scannerTab, setScannerTab] = useState('all');
-  const [autoScanActive, setAutoScanActive] = useState(false); // Track auto-refresh status
+  const [autoScanActive, setAutoScanActive] = useState(true); // Track auto-refresh status (auto-enable for immediate scans)
   // Allows user to request continuous scanning even when auto-trading isn't enabled
   const [scannerUserOverride, setScannerUserOverride] = useState(false);
   // Track when the last market scan completed (for UI timing)
@@ -648,6 +652,29 @@ const AutoTradingDashboard = () => {
   const tradeHistoryRef = React.useRef([]);
   const hasLoadedTradeHistoryRef = React.useRef(false);
   const emptyHistoryPollsRef = React.useRef(0);
+  const cooldownTimerRef = React.useRef(null);
+
+  // Update visible cooldown countdown (ms) every second while cooldown is active
+  useEffect(() => {
+    let intervalId = null;
+    if (cooldownEndsAt) {
+      intervalId = setInterval(() => {
+        const rem = Number(cooldownEndsAt) - Date.now();
+        if (rem <= 0) {
+          setCooldownRemainingMs(0);
+          setCooldownEndsAt(null);
+          if (intervalId) clearInterval(intervalId);
+          return;
+        }
+        setCooldownRemainingMs(rem);
+      }, 1000);
+    } else {
+      setCooldownRemainingMs(0);
+    }
+    return () => {
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [cooldownEndsAt]);
   const [showActiveTradesTable] = useState(DEFAULT_TABLE_VISIBILITY.showActiveTradesTable);
   const [showTradeHistoryTable] = useState(DEFAULT_TABLE_VISIBILITY.showTradeHistoryTable);
   const dataFetchSeqRef = React.useRef(0);
@@ -726,6 +753,23 @@ const AutoTradingDashboard = () => {
     if (typeof window === 'undefined') return;
     localStorage.setItem('scannerMinQuality', String(scannerMinQuality));
   }, [scannerMinQuality]);
+
+  // When active trades drop to zero, trigger an immediate fresh scanner pass
+  useEffect(() => {
+    try {
+      const prev = prevActiveTradesCount.current || 0;
+      const curr = (activeTrades || []).length || 0;
+      if (prev > 0 && curr === 0 && isMarketOpen) {
+        if (!scannerLoading) {
+          console.log('🔁 No active trades detected — auto-refreshing market signals');
+          scanMarketForQualityTrades(scannerMinQuality, true).catch((e) => console.error('Scanner refresh failed', e));
+        }
+      }
+      prevActiveTradesCount.current = curr;
+    } catch (e) {
+      console.error('Error in active-trade watcher', e);
+    }
+  }, [activeTrades.length, isMarketOpen, scannerMinQuality]);
 
 
   // --- Professional Signal Integration ---
@@ -1080,12 +1124,15 @@ const AutoTradingDashboard = () => {
       const totalTradesToday = tradesToday.length + activeToday.length;
       
       console.log(`✅ Market Scan Complete: ${qualityOnly.length} quality trades found (${allSignals.length} total signals, threshold ${minQuality}%+)`);
+      // Enrich signals once and store enriched snapshot to avoid recomputing
+      // differences between renders which can flip Start/WAIT rapidly.
+      const enrichedQualityOnly = qualityOnly.map((s) => enrichSignalWithAiMetrics(s));
       setTotalSignalsScanned(allSignals.length);
-      setQualityTrades(qualityOnly);
+      setQualityTrades(enrichedQualityOnly);
       scannerSnapshotRef.current = {
         at: nowMs,
         minQuality: safeMinQuality,
-        trades: qualityOnly,
+        trades: enrichedQualityOnly,
         total: allSignals.length,
       };
       scannerLastRunAtRef.current = nowMs;
@@ -1106,6 +1153,38 @@ const AutoTradingDashboard = () => {
       setScannerLoading(false);
     }
   };
+
+  // Auto-scan effect: when signals load, run a bypassed scan immediately and then every 5s
+  useEffect(() => {
+    if (!signalsLoaded) return;
+    if (!autoScanActive && !scannerUserOverride) return;
+    if (!isMarketOpen) return; // avoid scanning when market closed
+
+    let cancelled = false;
+    const runOnce = async () => {
+      try {
+        const lastAt = scannerSnapshotRef.current?.at || scannerLastRunAtRef.current || 0;
+        if (Date.now() - lastAt < SCANNER_MIN_REFRESH_MS) return; // respect min refresh interval
+        await scanMarketForQualityTrades(scannerMinQuality, true);
+      } catch (e) {
+        // ignore
+      }
+    };
+
+    // Immediate first run
+    runOnce();
+
+    const intervalId = setInterval(() => {
+      // avoid overlapping runs
+      if (scannerLoading) return;
+      runOnce();
+    }, 5000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(intervalId);
+    };
+  }, [signalsLoaded, autoScanActive, scannerUserOverride, scannerMinQuality, isMarketOpen]);
 
   // Core data fetch logic (extracted for reuse)
   const performDataFetch = async () => {
@@ -1271,6 +1350,14 @@ const AutoTradingDashboard = () => {
   const syncBadgeLabel = lastSuccessfulSyncAt
     ? `Last successful sync: ${lastSuccessfulSyncAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`
     : 'Waiting for first successful sync...';
+
+  const formatCooldownLabel = (ms) => {
+    if (!Number.isFinite(ms) || ms <= 0) return '';
+    const total = Math.max(0, Math.floor(ms / 1000));
+    const mins = Math.floor(total / 60);
+    const secs = total % 60;
+    return `${mins}m ${secs}s`;
+  };
 
   // Enhanced analyzeMarket - AI-powered momentum detection and real-time market analysis
   const analyzeMarket = async () => {
@@ -1451,15 +1538,27 @@ const AutoTradingDashboard = () => {
         if (reward / risk < 1.2) return false;
         
         // Price sanity check
-        if (s.entry_price > 250) return false; // Reduced max to avoid expensive options
-        if (s.entry_price < 15) return false;  // Increased min to avoid far OTM
+        // Relaxed: allow higher entry prices (stocks and index options can be expensive).
+        // Previously signals with entry_price > 250 were dropped which filtered many stock/index option rows.
+        if (s.entry_price < 15) return false;  // Keep minimum to avoid far OTM
         
         // CRITICAL: Momentum alignment check
         const indexMomentum = momentumAnalysis[s.index];
-        if (!indexMomentum || indexMomentum.score < 50) return false; // Require momentum
-        
+        // If we have index momentum data, require it to be strong enough.
+        if (indexMomentum && indexMomentum.score < 50) return false;
+
+        // If index momentum is missing (common for stock-level signals), fall back to technical indicator checks
+        // to avoid excluding valid stock signals when index-level data isn't available.
+        if (!indexMomentum) {
+          const tech = s.technical_indicators || {};
+          const rsi = Number(tech.rsi ?? 50);
+          const macdCross = String(tech.macd?.crossover || '').toLowerCase();
+          const techBullish = (rsi >= 40 && rsi <= 75) && (macdCross === 'bullish' || macdCross === '');
+          if (!techBullish) return false;
+        }
+
         const signalBullish = s.action === 'BUY' && s.option_type === 'CE';
-        const momentumBullish = indexMomentum.direction.includes('BULLISH');
+        const momentumBullish = indexMomentum ? indexMomentum.direction.includes('BULLISH') : null;
         const trendDirection = String(s.trend_direction || '').toUpperCase();
         const trendAligned = trendDirection
           ? ((trendDirection.includes('UP') && s.option_type === 'CE') || (trendDirection.includes('DOWN') && s.option_type === 'PE'))
@@ -1760,6 +1859,15 @@ const AutoTradingDashboard = () => {
     };
     fetchOptionSignals();
   }, [confirmationMode]);
+
+  // Run an initial scanner pass once option signals are loaded so the UI
+  // shows market-quality rows without requiring a manual Refresh click.
+  useEffect(() => {
+    if (!signalsLoaded) return;
+    // Fire-and-forget fresh scan (bypass cache) to populate qualityTrades
+    scanMarketForQualityTrades(scannerMinQuality, true).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [signalsLoaded]);
 
   const fetchLatestOptionSignals = async () => {
     try {
@@ -2149,7 +2257,9 @@ const AutoTradingDashboard = () => {
       return status === 'OPEN' || (status !== 'CLOSED' && status !== 'CANCELLED' && status !== 'SL_HIT');
     });
 
-    const shouldRunScanner = isMarketOpen && (autoTradingActive || scannerUserOverride) && !hasActiveTrade;
+    // Keep scanning while UI shows WAIT. Stop scanning once `Start Trade` becomes YES
+    const startTradeYes = !!(recommendationReadiness && recommendationReadiness.pass === true);
+    const shouldRunScanner = isMarketOpen && (autoTradingActive || scannerUserOverride) && !hasActiveTrade && !startTradeYes;
 
     // Only act when desired run-state changes to avoid churn from frequent state updates
     if (scannerPrevShouldRunRef.current === shouldRunScanner) {
@@ -2164,7 +2274,11 @@ const AutoTradingDashboard = () => {
         scannerIntervalRef.current = null;
       }
       setAutoScanActive(false);
-      console.log('⏹️ Stopped market scanner (trade active, market closed or user stopped)');
+      if (startTradeYes) {
+        console.log('⏹️ Stopped market scanner (Start Trade = YES)');
+      } else {
+        console.log('⏹️ Stopped market scanner (trade active, market closed or user stopped)');
+      }
       return;
     }
 
@@ -2184,7 +2298,7 @@ const AutoTradingDashboard = () => {
       scannerPrevShouldRunRef.current = null;
       console.log('⏹️ Stopped market scanner (cleanup)');
     };
-  }, [isMarketOpen, autoTradingActive, activeTrades.length, scannerMinQuality, scannerUserOverride]);
+  }, [isMarketOpen, autoTradingActive, activeTrades.length, scannerMinQuality, scannerUserOverride, recommendationReadiness]);
 
   // Auto-start rule:
   // - Start Trade YES + auto-trading enabled => execute eligible LIVE candidates.
@@ -2226,13 +2340,37 @@ const AutoTradingDashboard = () => {
 
     if (!executableCandidates.length) return;
 
-    // Try a small batch each cycle; backend remains the source of truth for final risk/concurrency caps.
-    const batchCandidates = executableCandidates.slice(0, 4);
-    autoBatchExecutingRef.current = true;
+    // Try a small batch each cycle; respect client-side concurrency cap (frontend mirror)
+    const openCount = (activeTrades || []).filter((t) => String(t?.status || '').toUpperCase() === 'OPEN').length;
+    const availableSlots = Math.max(0, MAX_CONCURRENT_TRADES - openCount);
+    if (availableSlots <= 0) return;
 
+    // helper: symbol root (e.g., BANKNIFTY26MAR... -> BANKNIFTY)
+    const symbolRoot = (s) => {
+      if (!s) return '';
+      const m = String(s || '').toUpperCase().match(/^([A-Z]+)/);
+      return m ? m[1] : String(s || '').toUpperCase();
+    };
+
+    // Exclude candidates that share root with an already-open trade, and dedupe by root.
+    const openRoots = new Set((activeTrades || []).map((t) => symbolRoot(t?.symbol)));
+    const chosen = [];
+    const seenRoots = new Set();
+    for (const c of executableCandidates) {
+      const root = symbolRoot(c?.symbol);
+      if (!root) continue;
+      if (openRoots.has(root)) continue; // avoid retrying same root while open
+      if (seenRoots.has(root)) continue; // don't start two trades on same root in same batch
+      seenRoots.add(root);
+      chosen.push(c);
+      if (chosen.length >= availableSlots) break;
+    }
+    if (!chosen.length) return;
+
+    autoBatchExecutingRef.current = true;
     (async () => {
-      console.log(`🚀 AUTO START: ${batchCandidates.length} Start Trade YES candidate(s) queued`);
-      for (const candidate of batchCandidates) {
+      console.log(`🚀 AUTO START: ${chosen.length} Start Trade YES candidate(s) queued (slots=${availableSlots}, open=${openCount})`);
+      for (const candidate of chosen) {
         await executeAutoTrade(candidate);
       }
       await fetchData();
@@ -2247,7 +2385,7 @@ const AutoTradingDashboard = () => {
 
   // Implement auto trade execution using bestSignal
   const executeAutoTrade = async (signal, options = {}) => {
-    const { manualStart = false } = options || {};
+    const { manualStart = false, skipPreScan = false } = options || {};
     if (!signal || executingRef.current) return;
     
     // ONLY execute real trades when user explicitly starts auto-trading (LIVE mode)
@@ -2258,7 +2396,21 @@ const AutoTradingDashboard = () => {
       return;
     }
 
-    const normalizedSignal = enrichSignalWithAiMetrics(signal);
+    let normalizedSignal = enrichSignalWithAiMetrics(signal);
+
+    // Run a fresh scan before executing to ensure the entry price/target/stop are current.
+    if (!skipPreScan) {
+      try {
+        if (!scannerLoading) setScannerLoading(true);
+        await scanMarketForQualityTrades(scannerMinQuality, true);
+        const latest = (qualityTrades || []).find((s) => String(s.symbol || '').toUpperCase() === String(normalizedSignal.symbol || '').toUpperCase());
+        if (latest) normalizedSignal = enrichSignalWithAiMetrics(latest);
+      } catch (e) {
+        console.warn('⚠️ Pre-entry market scan failed (auto-exec):', e?.message || e);
+      } finally {
+        try { setScannerLoading(false); } catch (e) {}
+      }
+    }
 
     // Prevent duplicate re-entry attempts on the same live signal while it's already open.
     const hasSameOpenTrade = activeTrades.some((t) => {
@@ -2320,7 +2472,14 @@ const AutoTradingDashboard = () => {
     const mode = isLiveMode ? 'LIVE' : 'DEMO';
     console.log(`🚀 AUTO-EXECUTING ${mode} TRADE: ${normalizedSignal.symbol} ${normalizedSignal.action} at ₹${normalizedSignal.entry_price}`);
     
-    const adjustedQuantity = normalizedSignal.quantity * lotMultiplier;
+    // Adjust quantity based on capital required: boost for inexpensive signals
+    const capReqExec = Number(normalizedSignal.capital_required ?? resolveSignalCapitalRequired(normalizedSignal, lotMultiplier));
+    let execQtyBoost = 1;
+    if (Number.isFinite(capReqExec)) {
+      if (capReqExec <= 3000) execQtyBoost = 3;
+      else if (capReqExec <= 5000) execQtyBoost = 2;
+    }
+    const adjustedQuantity = Math.max(1, Number(normalizedSignal.quantity || 1) * Number(lotMultiplier) * execQtyBoost);
     
     try {
       let effectiveBalance = 0;
@@ -2386,6 +2545,9 @@ const AutoTradingDashboard = () => {
       if (response.ok) {
         const data = await response.json();
         console.log(`✅ ${mode} TRADE EXECUTED: ${normalizedSignal.symbol} - ${data.message || 'Success!'}`);
+        // Update UI: refresh active trades and re-run scanner for fresh signals
+        try { await fetchData(); } catch (e) { console.warn('⚠️ Refresh after execute failed:', e?.message || e); }
+        try { await scanMarketForQualityTrades(scannerMinQuality, true); } catch (e) { console.warn('⚠️ Post-execute scanner failed:', e?.message || e); }
         // Don't show alert for auto-trades, just log
       } else {
         let errorMsg = 'Failed to execute trade.';
@@ -2421,12 +2583,43 @@ const AutoTradingDashboard = () => {
               shouldStopAutoTrading = false;
               
               // Extract cooldown minutes from error message
-              const cooldownMatch = errData.detail.match(/(\d+)\s*more\s*minutes/i);
+              const cooldownMatch = errData.detail && String(errData.detail).match(/(\d+)\s*more\s*minutes/i);
               if (cooldownMatch) {
                 cooldownMinutes = parseInt(cooldownMatch[1]);
                 console.log(`⏸️ COOLDOWN ACTIVE: Waiting ${cooldownMinutes} minutes before next trade attempt`);
               } else {
                 console.log(`⏸️ CONSECUTIVE LOSS LIMIT: Waiting for cooldown period to complete`);
+              }
+
+              // Schedule a refresh after the cooldown so scanner re-evaluates fresh signals
+              try {
+                if (cooldownTimerRef.current) {
+                  clearTimeout(cooldownTimerRef.current);
+                  cooldownTimerRef.current = null;
+                }
+                if (cooldownMinutes > 0) {
+                  const ms = cooldownMinutes * 60 * 1000;
+                  try {
+                    setCooldownEndsAt(Date.now() + ms);
+                    setCooldownRemainingMs(ms);
+                  } catch (e) {
+                    console.warn('⚠️ Could not set cooldown state:', e?.message || e);
+                  }
+                  cooldownTimerRef.current = setTimeout(async () => {
+                    try {
+                      console.log('🔁 Cooldown expired — refreshing trades and re-running scanner');
+                      await fetchData();
+                      await scanMarketForQualityTrades(scannerMinQuality, true);
+                    } catch (e) {
+                      console.warn('⚠️ Post-cooldown refresh failed:', e?.message || e);
+                    } finally {
+                      cooldownTimerRef.current = null;
+                      try { setCooldownEndsAt(null); setCooldownRemainingMs(0); } catch (e) {}
+                    }
+                  }, ms);
+                }
+              } catch (e) {
+                console.warn('⚠️ Could not schedule cooldown refresh:', e?.message || e);
               }
             }
             
@@ -2544,11 +2737,32 @@ const AutoTradingDashboard = () => {
       allowWhenWait = false,
       bypassMarketOpen = false,
       reason = null,
+      // allow skipping the pre-entry scan for internal calls if necessary
+      skipPreScan = false,
     } = options || {};
 
     if (!signal || !signal.symbol) return;
 
-    const normalizedSignal = enrichSignalWithAiMetrics(signal);
+    // Start with the incoming signal and enrich it.
+    let normalizedSignal = enrichSignalWithAiMetrics(signal);
+
+    // Before taking any new entry, run a fresh market scan to ensure prices/signals are up-to-date.
+    if (!skipPreScan) {
+      try {
+        if (!scannerLoading) setScannerLoading(true);
+        // Force a bypassed, real-time scan so cached snapshots are ignored.
+        await scanMarketForQualityTrades(scannerMinQuality, true);
+        // If the scan returned a newer version of this symbol, use that latest one
+        const latest = (qualityTrades || []).find((s) => String(s.symbol || '').toUpperCase() === String(normalizedSignal.symbol || '').toUpperCase());
+        if (latest) {
+          normalizedSignal = enrichSignalWithAiMetrics(latest);
+        }
+      } catch (e) {
+        console.warn('⚠️ Pre-entry market scan failed:', e?.message || e);
+      } finally {
+        try { setScannerLoading(false); } catch (e) {}
+      }
+    }
     const readiness = getEntryReadiness(normalizedSignal);
     if (!readiness.pass && !allowWhenWait) {
       console.log(`⏸️ Paper entry blocked: Start Trade WAIT (${readiness.reasons.join(' | ')})`);
@@ -2592,17 +2806,27 @@ const AutoTradingDashboard = () => {
       return;
     }
 
+    // Adjust quantity based on capital required: boost size for inexpensive signals
+    const capRequired = Number(normalizedSignal.capital_required ?? resolveSignalCapitalRequired(normalizedSignal, lotMultiplier));
+    let capitalQtyBoost = 1;
+    if (Number.isFinite(capRequired)) {
+      if (capRequired <= 3000) capitalQtyBoost = 3; // very small capital -> triple lots
+      else if (capRequired <= 5000) capitalQtyBoost = 2; // small capital -> double lots
+    }
+
     const payload = {
       symbol: normalizedSignal.symbol,
       index_name: normalizedSignal.index,
       side: normalizedSignal.action,
       signal_type: 'intraday_option',
-      quantity: (normalizedSignal.quantity || 1) * lotMultiplier,
+      quantity: Math.max(1, (Number(normalizedSignal.quantity || 1) * Number(lotMultiplier) * capitalQtyBoost)),
       entry_price: normalizedSignal.entry_price,
       stop_loss: normalizedSignal.stop_loss,
       target: normalizedSignal.target,
       strategy: normalizedSignal.strategy || 'ATM Option',
       signal_data: normalizedSignal,
+      // Allow paper/demo trades to be created even when server-side confirmation is strict
+      bypass_confirmation: true,
     };
 
     try {
@@ -2616,6 +2840,17 @@ const AutoTradingDashboard = () => {
           console.log(`✅ Paper trade created: ${normalizedSignal.symbol}`);
           setLastPaperSignalSymbol(paperSignalKey);
           setLastPaperSignalAt(Date.now());
+          // Refresh active trades and re-run a scanner pass so UI reflects the new entry
+          try {
+            await fetchData();
+          } catch (e) {
+            console.warn('⚠️ Refresh after trade creation failed:', e?.message || e);
+          }
+          try {
+            await scanMarketForQualityTrades(scannerMinQuality, true);
+          } catch (e) {
+            console.warn('⚠️ Post-create scanner failed:', e?.message || e);
+          }
         } else if (data?.success === false) {
           console.log(`⏸️ Paper trade rejected: ${data.message || 'Must close active trade first'}`);
         }
@@ -2979,6 +3214,18 @@ const AutoTradingDashboard = () => {
             }}>
               {wakeLockActive ? '😴 AWAKE' : '⚠️ SLEEP MODE'}
             </span>
+            {cooldownRemainingMs > 0 && (
+              <span style={{
+                fontSize: '14px',
+                padding: '4px 12px',
+                borderRadius: '20px',
+                background: '#ef4444',
+                color: 'white',
+                fontWeight: '700'
+              }}>
+                ⏳ Cooldown {formatCooldownLabel(cooldownRemainingMs)}
+              </span>
+            )}
           </h3>
           <p style={{
             margin: 0,

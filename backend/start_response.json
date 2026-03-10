@@ -1,0 +1,15 @@
+﻿{
+    "running":  true,
+    "state":  {
+                  "running":  true,
+                  "interval":  3.0,
+                  "symbols":  [
+                                  "NIFTY",
+                                  "BANKNIFTY"
+                              ],
+                  "instrument_type":  "weekly_option",
+                  "balance":  50000.0,
+                  "last_run":  null,
+                  "last_recommendation":  null
+              }
+}

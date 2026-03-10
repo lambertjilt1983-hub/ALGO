@@ -1,5 +1,5 @@
 import asyncio
-from fastapi import APIRouter, Body, Header, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Body, Header, HTTPException, BackgroundTasks, Query
 from pydantic import BaseModel
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
 
@@ -52,10 +52,12 @@ from app.models.trading import TradeReport
 from sqlalchemy import func
 from app.engine.auto_trading_engine import AutoTradingEngine
 from app.engine.zerodha_broker import ZerodhaBroker
+from app.models.auth import BrokerCredential
 from app.engine.simple_momentum_strategy import SimpleMomentumStrategy
 from app.core.market_hours import ist_now, is_market_open, market_status
 from app.routes.trade_metrics import normalize_active_trade_metrics
 from app.routes.signal_scoring import evaluate_advanced_ai_signal
+from app.engine.zerodha_order_util import place_zerodha_order
 
 
 router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
@@ -76,8 +78,8 @@ async def option_chain(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch option chain: {str(e)}")
 
-MAX_TRADES = 10000  # allow more intraday trades when signals align
-SINGLE_ACTIVE_TRADE = True  # hard lock: only one live trade at a time
+MAX_TRADES = 3  # allow up to 3 concurrent trades
+SINGLE_ACTIVE_TRADE = False  # permit multiple live trades concurrently
 EMERGENCY_STOP_MULTIPLIER = 0.9  # Trigger protective exits slightly before hard SL.
 TARGET_PCT = 0.6  # target move in percent (slightly above stop for RR >= 1)
 STOP_PCT = 0.4    # stop move in percent (tighter risk)
@@ -116,6 +118,7 @@ risk_config = {
     "capital_min_balance": 5000.0,      # Do not place live trades below this balance
     "live_start_balance_only": True,    # For live mode, require balance availability as an additional prerequisite
     "allow_simultaneous_live_trades": True,  # Permit concurrent live trades when setup is strong
+    "max_simultaneous_live_trades": 3,
     "max_simultaneous_live_trades": 3,       # Hard cap for concurrent live trades
     "simultaneous_min_quality": 82.0,        # Additional trade requires solid quality
     "simultaneous_min_confidence": 72.0,     # Additional trade requires healthy confidence
@@ -135,6 +138,18 @@ trail_config = {
     "buffer_pct": 0.1,    # Keep 0.1% buffer to avoid premature exits
 }
 BREAKEVEN_TRIGGER_PCT = 0.4  # Move stop to breakeven at 0.4% profit (lock in gains earlier)
+
+# ATR-based stop configuration
+atr_config = {
+    "enabled": True,
+    "period": 14,
+    # Multiplier applied to ATR for initial stop (in underlying points)
+    "multiplier": 1.0,
+    # For options we scale the underlying ATR to a conservative premium movement
+    "option_scale": 0.45,
+    # Minimum candles to compute ATR
+    "min_candles": 5,
+}
 
 state = {
     "is_demo_mode": False,
@@ -158,6 +173,18 @@ live_update_state = {
     "last_duration": 0.0,
 }
 execute_lock = asyncio.Lock()
+
+# Auto-scan background worker state
+auto_scan_task: Optional[asyncio.Task] = None
+auto_scan_state: Dict[str, Any] = {
+    "running": False,
+    "interval": 3,
+    "symbols": ["NIFTY", "BANKNIFTY"],
+    "instrument_type": "weekly_option",
+    "balance": 50000.0,
+    "last_run": None,
+    "last_recommendation": None,
+}
 
 # --- ADMIN/DEBUG: Manual reset endpoint ---
 from fastapi import Response
@@ -900,7 +927,6 @@ def _fetch_recent_candles(underlying: str, candle_count: int = 5) -> List[Dict[s
         df = ticker.history(period="2d", interval="5m")
         if df.empty:
             return []
-
         rows = []
         for _, row in df.tail(max(3, candle_count)).iterrows():
             rows.append({
@@ -913,6 +939,26 @@ def _fetch_recent_candles(underlying: str, candle_count: int = 5) -> List[Dict[s
     except Exception as e:
         print(f"[CANDLE FETCH ERROR] {underlying}: {e}")
         return []
+
+
+def _require_multi_tick_confirmation(underlying: str, entry_price: float, side: str, required_ticks: int = 3) -> bool:
+    """Return True if the last `required_ticks` closes confirm the entry direction.
+
+    For BUY we require closes >= entry_price for each recent candle.
+    For SELL we require closes <= entry_price for each recent candle.
+    This is a conservative server-side guard to avoid impulsive entries.
+    """
+    try:
+        candles = _fetch_recent_candles(underlying, candle_count=required_ticks)
+        if not candles or len(candles) < required_ticks:
+            return False
+        closes = [float(c.get('close', 0)) for c in candles[-required_ticks:]]
+        if side.upper() == 'BUY':
+            return all(c >= entry_price for c in closes)
+        else:
+            return all(c <= entry_price for c in closes)
+    except Exception:
+        return False
 
 
 @router.post("/toggle")
@@ -1016,73 +1062,95 @@ def _maybe_update_trail(trade: Dict[str, Any], new_price: float) -> None:
                 trade["trail_start"] = trail_start
                 trade["trail_stop"] = trail_stop
 
-def _close_trade(trade: Dict[str, any], exit_price: float) -> None:
-    qty = trade.get("quantity", 0) or 0
-    side = trade.get("side", "BUY").upper()
-    entry = trade.get("price", 0.0)
-    pnl = (exit_price - entry) * qty * (1 if side == "BUY" else -1)
-    pnl_percentage = (pnl / (entry * qty) * 100) if entry and qty else 0.0
-    exit_dt = datetime.utcnow()
-    terminal_status = (trade.get("status") or "").upper()
-    if terminal_status == "OPEN":
-        terminal_status = "CLOSED"
-    trade.update({
-        "status": terminal_status or "CLOSED",
-        "exit_price": exit_price,
-        "exit_time": exit_dt.isoformat(),
-        "pnl": round(pnl, 2),
-        "pnl_percentage": round(pnl_percentage, 2),
-    })
-    if terminal_status == "SL_HIT":
-        _record_sl_cooldown(trade.get("symbol") or trade.get("index"), side, exit_dt)
-    history.append(trade.copy())
-    
-    # Track daily P&L (both loss and profit)
-    state["daily_loss"] += pnl
-    state["daily_profit"] = state.get("daily_profit", 0.0) + max(0, pnl)  # Track only wins
-    
-    print(f"\n[TRADE CLOSED] P&L: ₹{pnl:.2f}")
-    print(f"  Daily Loss: ₹{state['daily_loss']:.2f} / ₹{risk_config['max_daily_loss']}")
-    print(f"  Daily Profit: ₹{state['daily_profit']:.2f} / ₹{risk_config['max_daily_profit']}")
-    
-    # Track consecutive losses for risk management (NO COOLDOWN - just log)
-    if pnl < 0:
-        state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
-        state["last_loss_time"] = datetime.now()
-        print(f"  ⚠️ Consecutive losses: {state['consecutive_losses']}")
-    else:
-        state["consecutive_losses"] = 0
-        print(f"  ✅ Win! Resetting consecutive loss counter")
 
-    # Persist closed trade to database for reporting
+def _close_trade(trade: Dict[str, Any], exit_price: float) -> None:
+    """Close an open trade: compute P&L, update state, record cooldowns and persist to DB."""
     try:
-        db = SessionLocal()
+        side = (trade.get("side") or "BUY").upper()
+        qty = int(trade.get("quantity") or 0)
+        entry = float(trade.get("price") or trade.get("entry_price") or 0.0)
+        exit_price = float(exit_price or trade.get("current_price") or entry)
+
+        pnl = _pnl_for_trade(trade, exit_price)
+        capital = float(trade.get("capital_used") or (entry * qty) or 0.0)
+        pnl_percentage = (pnl / capital * 100) if capital else 0.0
+
+        trade["exit_price"] = exit_price
+        trade["exit_time"] = _now()
+        trade["status"] = trade.get("status") or "CLOSED"
+        trade["pnl"] = round(pnl, 2)
+        trade["pnl_percentage"] = round(pnl_percentage, 2)
+
+        # Record SL cooldown and append to history
         exit_dt = datetime.fromisoformat(trade.get("exit_time")) if isinstance(trade.get("exit_time"), str) else datetime.utcnow()
-        entry_dt = datetime.fromisoformat(trade.get("entry_time")) if isinstance(trade.get("entry_time"), str) else datetime.utcnow()
-        report = TradeReport(
-            symbol=trade.get("symbol") or trade.get("index"),
-            side=side,
-            quantity=qty,
-            entry_price=entry,
-            exit_price=exit_price,
-            pnl=round(pnl, 2),
-            pnl_percentage=round(pnl_percentage, 2),
-            strategy=trade.get("strategy") or trade.get("strategy_name"),
-            status=trade.get("status") or "CLOSED",
-            entry_time=entry_dt,
-            exit_time=exit_dt,
-            trading_date=exit_dt.date(),
-            meta={"support": trade.get("support"), "resistance": trade.get("resistance")},
-        )
-        db.add(report)
-        db.commit()
-    except Exception as e:
-        print(f"Warning: failed to persist trade report: {e}")
-    finally:
+        _record_sl_cooldown(trade.get("symbol") or trade.get("index"), side, exit_dt)
+        history.append(trade.copy())
+
+        # Track daily P&L and consecutive losses
+        state["daily_loss"] += pnl
+        state["daily_profit"] = state.get("daily_profit", 0.0) + max(0, pnl)
+        if pnl < 0:
+            state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
+            state["last_loss_time"] = datetime.now()
+        else:
+            state["consecutive_losses"] = 0
+
+        print(f"\n[TRADE CLOSED] P&L: ₹{pnl:.2f}")
+        print(f"  Daily Loss: ₹{state['daily_loss']:.2f} / ₹{risk_config['max_daily_loss']}")
+        print(f"  Daily Profit: ₹{state['daily_profit']:.2f} / ₹{risk_config['max_daily_profit']}")
+
+        # Persist closed trade to database for reporting
         try:
-            db.close()
-        except Exception:
-            pass
+            db = SessionLocal()
+            entry_dt = datetime.fromisoformat(trade.get("entry_time")) if isinstance(trade.get("entry_time"), str) else datetime.utcnow()
+            report = TradeReport(
+                symbol=trade.get("symbol") or trade.get("index"),
+                side=side,
+                quantity=qty,
+                entry_price=entry,
+                exit_price=exit_price,
+                pnl=round(pnl, 2),
+                pnl_percentage=round(pnl_percentage, 2),
+                strategy=trade.get("strategy") or trade.get("strategy_name"),
+                status=trade.get("status") or "CLOSED",
+                entry_time=entry_dt,
+                exit_time=exit_dt,
+                trading_date=exit_dt.date(),
+                meta={"support": trade.get("support"), "resistance": trade.get("resistance")},
+            )
+            db.add(report)
+            db.commit()
+        except Exception as e:
+            print(f"Warning: failed to persist trade report: {e}")
+        finally:
+            try:
+                db.close()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[CLOSE TRADE ERROR] {e}")
+
+
+def _maybe_place_exit_order(trade: Dict[str, any], exit_price: float) -> None:
+    """Attempt to place a market exit order for live trades (no-op in demo)."""
+    try:
+        if state.get("is_demo_mode", False):
+            return
+        symbol = trade.get("symbol")
+        qty = int(trade.get("quantity") or 0)
+        side = (trade.get("side") or "BUY").upper()
+        if not symbol or qty <= 0:
+            return
+        exit_side = "SELL" if side == "BUY" else "BUY"
+        exchange = trade.get("exchange") or "NFO"
+        product = trade.get("product") or "MIS"
+        resp = place_zerodha_order(symbol=symbol, quantity=qty, side=exit_side, order_type="MARKET", product=product, exchange=exchange)
+        if resp.get("success"):
+            trade["exit_order_id"] = resp.get("order_id")
+        else:
+            trade["exit_error"] = resp.get("error")
+    except Exception as e:
+        trade["exit_error"] = str(e)
 
 
 def close_all_active_trades(reason: str = "Market close") -> int:
@@ -1155,6 +1223,52 @@ def _stop_hit(trade: Dict[str, any], price: float) -> bool:
     if side == "BUY":
         return price <= emergency_stop or price <= effective_stop
     return price >= emergency_stop or price >= effective_stop
+
+
+async def _auto_scan_worker():
+    """Background worker that calls `analyze` periodically and attempts to start trades when a start signal appears."""
+    global auto_scan_state
+    while auto_scan_state.get("running"):
+        try:
+            interval = float(auto_scan_state.get("interval") or 3)
+            symbols = auto_scan_state.get("symbols") or ["NIFTY", "BANKNIFTY"]
+            instrument_type = auto_scan_state.get("instrument_type") or "weekly_option"
+            balance = float(auto_scan_state.get("balance") or 50000.0)
+
+            auto_scan_state["last_run"] = _now()
+            # Call analyze with the configured symbols; it may auto-execute based on internal gates
+            try:
+                resp = await analyze(symbol=symbols[0], balance=balance, symbols=",".join(symbols), instrument_type=instrument_type, quantity=None)
+            except Exception as e:
+                resp = {"error": str(e)}
+
+            auto_scan_state["last_recommendation"] = resp.get("recommendation") if isinstance(resp, dict) else None
+
+            # If a recommendation exists and indicates start_trade_allowed, attempt execute
+            rec = auto_scan_state["last_recommendation"]
+            if rec and rec.get("start_trade_allowed"):
+                try:
+                    # If live is not armed, force demo/paper execution so UI 'GO' starts a paper trade
+                    force_demo = not bool(state.get("live_armed", True))
+                    await execute(
+                        symbol=rec.get("symbol"),
+                        price=float(rec.get("entry_price") or 0.0),
+                        balance=balance,
+                        quantity=int(rec.get("quantity") or 1),
+                        side=rec.get("action") or "BUY",
+                        stop_loss=rec.get("stop_loss"),
+                        target=rec.get("target"),
+                        force_demo=force_demo,
+                    )
+                    # After an executed trade, wait a bit longer to let positions settle
+                    await asyncio.sleep(max(5, interval))
+                except Exception as e:
+                    print(f"[AUTO_SCAN] execute failed: {e}")
+
+            await asyncio.sleep(interval)
+        except Exception as e:
+            print(f"[AUTO_SCAN] worker error: {e}")
+            await asyncio.sleep(3)
 
 
 def _calc_weekly_expiry(today: datetime) -> datetime:
@@ -1462,6 +1576,7 @@ async def analyze(
     instrument_type: str = "weekly_option",  # weekly_option | monthly_option | future | index
     quantity: Optional[int] = None,
     authorization: Optional[str] = Header(None),
+    allow_auto_execute: bool = True,
 ):
     # Block new analysis/trade discovery outside configured market window.
     if not _within_trade_window():
@@ -1836,9 +1951,13 @@ async def analyze(
 
     # Optionally auto-trigger trade execution for each recommendation
     auto_trade_result = None
-    if protection_active and can_trade and recommendation and recommendation.get("start_trade_allowed"):
+    # Allow auto-execution when enabled AND either protection is active (live) or we're in demo mode
+    demo_mode = bool(state.get("is_demo_mode", False))
+    if allow_auto_execute and (protection_active or demo_mode) and can_trade and recommendation and recommendation.get("start_trade_allowed"):
         try:
             from fastapi import Request
+            # If live is not armed, force demo execution so we simulate/paper-start trades
+            force_demo = not bool(state.get("live_armed", True))
             auto_trade_result = await execute(
                 symbol=recommendation["symbol"],
                 side=recommendation["action"],
@@ -1850,7 +1969,8 @@ async def analyze(
                 option_type=recommendation.get("option_type"),
                 trend_direction=recommendation.get("trend_direction"),
                 ai_edge_score=recommendation.get("ai_edge_score"),
-                authorization=authorization
+                force_demo=force_demo,
+                authorization=authorization,
             )
             if auto_trade_result is not None:
                 auto_trade_result["executed"] = True
@@ -1861,14 +1981,14 @@ async def analyze(
             auto_trade_result["executed"] = False
             auto_trade_result["error"] = str(e)
     else:
-        # Not enough money: show the trade as simulated, do not execute
+        # Not executing: show the trade as simulated, do not execute
         if recommendation:
             auto_trade_result = {
                 "executed": False,
                 "capital_required": recommendation["capital_required"],
                 "potential_profit": round((recommendation["target"] - recommendation["entry_price"]) * recommendation["quantity"], 2),
                 "potential_loss": round((recommendation["entry_price"] - recommendation["stop_loss"]) * recommendation["quantity"], 2),
-                "message": "Trade not auto-started (capital, availability, or start-trade gate). Simulated only.",
+                "message": "Trade not auto-started (capital, availability, or start-trade gate) or auto-execution disabled.",
                 "demo_mode": True,
                 "loss_brake": loss_brake,
                 "capital_protection": capital_profile,
@@ -1909,6 +2029,34 @@ async def analyze(
     return response
 
 
+@router.post("/diagnose")
+async def diagnose(
+    symbols: Optional[str] = Body(None, embed=True),
+    instrument_type: str = Body("weekly_option", embed=True),
+    balance: float = Body(50000.0, embed=True),
+    authorization: Optional[str] = Header(None),
+):
+    """Run analysis without performing auto-execution and return gating diagnostics."""
+    # Reuse analyze logic but disable auto-execution
+    resp = await analyze(symbol="NIFTY", balance=balance, symbols=symbols, instrument_type=instrument_type, quantity=None, authorization=authorization, allow_auto_execute=False)
+
+    # Build diagnostic summary
+    diag = {
+        "protection_active": resp.get("protection_active"),
+        "live_armed": resp.get("live_armed"),
+        "is_demo_mode": resp.get("is_demo_mode"),
+        "can_trade": resp.get("can_trade"),
+        "capital_guard_reasons": resp.get("capital_guard_reasons"),
+        "loss_brake_profile": resp.get("loss_brake_profile"),
+        "blocked_recommendations": resp.get("blocked_recommendations"),
+        "ai_rejected_recommendations": resp.get("ai_rejected_recommendations"),
+        "recommendation": resp.get("recommendation"),
+        "auto_trade_result": resp.get("auto_trade_result"),
+        "timestamp": resp.get("timestamp"),
+    }
+    return {"diagnostic": diag, **resp}
+
+
 try:
     BaseModel
 except NameError:
@@ -1936,24 +2084,40 @@ class CloseTradeRequest(BaseModel):
 
 @router.post("/execute")
 async def execute(
-    symbol: str,
-    price: float = 0.0,
-    balance: float = 100.0,
-    quantity: Optional[int] = None,
-    side: str = "BUY",
-    stop_loss: Optional[float] = None,
-    target: Optional[float] = None,
-    support: Optional[float] = None,
-    resistance: Optional[float] = None,
-    broker_id: int = 1,
-    quality_score: Optional[float] = None,
-    confirmation_score: Optional[float] = None,
-    ai_edge_score: Optional[float] = None,
-    option_type: Optional[str] = None,
-    trend_direction: Optional[str] = None,
-    trend_strength: Optional[str] = None,
+    trade: Optional[TradeRequest] = Body(None),
+    symbol: Optional[str] = Query(None),
+    price: float = Query(0.0),
+    balance: float = Query(100.0),
+    quantity: Optional[int] = Query(None),
+    side: str = Query("BUY"),
+    stop_loss: Optional[float] = Query(None),
+    target: Optional[float] = Query(None),
+    support: Optional[float] = Query(None),
+    resistance: Optional[float] = Query(None),
+    broker_id: int = Query(1),
+    quality_score: Optional[float] = Query(None),
+    confirmation_score: Optional[float] = Query(None),
+    ai_edge_score: Optional[float] = Query(None),
+    option_type: Optional[str] = Query(None),
+    trend_direction: Optional[str] = Query(None),
+    trend_strength: Optional[str] = Query(None),
+    force_demo: bool = Body(False),
     authorization: Optional[str] = Header(None),
 ):
+    # Resolve parameters from JSON body `trade` if provided (body takes precedence)
+    if trade is not None:
+        symbol = trade.symbol
+        price = float(trade.price or price or 0.0)
+        balance = float(trade.balance or balance or 0.0)
+        quantity = trade.quantity
+        side = trade.side or side
+        stop_loss = trade.stop_loss
+        target = trade.target
+        support = trade.support
+        resistance = trade.resistance
+        broker_id = int(trade.broker_id or broker_id)
+        expiry = getattr(trade, 'expiry', None)
+
     # Hard gate: never allow new trade execution outside configured market window.
     if not _within_trade_window():
         market = market_status(dt_time(9, 15), dt_time(15, 30))
@@ -1969,7 +2133,7 @@ async def execute(
 
     mode = "LIVE"
 
-    auto_demo = bool(state.get("is_demo_mode"))
+    auto_demo = bool(state.get("is_demo_mode")) or bool(force_demo)
     live_balance_only_mode = _live_protection_active() and bool(risk_config.get("live_start_balance_only", False)) and (not auto_demo)
     loss_brake = _loss_brake_profile()
     if loss_brake.get("block_new_entries") and not auto_demo:
@@ -2058,6 +2222,71 @@ async def execute(
             derived_stop = round(trade.price * (1 - pct), 2)
         else:
             derived_stop = round(trade.price * (1 + pct), 2)
+
+    # --- ATR-based dynamic stop override (more robust for volatile moves) ---
+    try:
+        if atr_config.get("enabled", False):
+            underlying = _extract_underlying_symbol(trade.symbol)
+            candles = _fetch_recent_candles(underlying, candle_count=30)
+            if candles and len(candles) >= atr_config.get("min_candles", 5):
+                # compute true range list without pandas
+                trs = []
+                prev_close = None
+                for c in candles:
+                    h = float(c.get("high", 0))
+                    l = float(c.get("low", 0))
+                    cl = float(c.get("close", 0))
+                    if prev_close is None:
+                        tr = h - l
+                    else:
+                        tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
+                    trs.append(tr)
+                    prev_close = cl
+
+                # Use rolling mean of last N values (period)
+                period = int(atr_config.get("period", 14))
+                sample = trs[-period:] if len(trs) >= period else trs
+                if sample:
+                    atr = sum(sample) / len(sample)
+                    if option_kind:
+                        # scale underlying ATR to an approximate option-premium movement
+                        scale = float(atr_config.get("option_scale", 0.45))
+                        atr_points = max(1.0, round(atr * scale, 2))
+                        if trade.side.upper() == "BUY":
+                            suggested = round(trade.price - atr_points, 2)
+                            # if client provided a tighter SL, keep it, else use ATR-based
+                            if trade.stop_loss is None:
+                                derived_stop = suggested
+                            else:
+                                # never widen provided protective stop
+                                if trade.stop_loss < trade.price:
+                                    derived_stop = round(max(suggested, float(trade.stop_loss)), 2)
+                        else:
+                            suggested = round(trade.price + atr_points, 2)
+                            if trade.stop_loss is None:
+                                derived_stop = suggested
+                            else:
+                                if trade.stop_loss > trade.price:
+                                    derived_stop = round(min(suggested, float(trade.stop_loss)), 2)
+                    else:
+                        atr_points = round(atr * float(atr_config.get("multiplier", 1.0)), 2)
+                        if trade.side.upper() == "BUY":
+                            suggested = round(trade.price - atr_points, 2)
+                            if trade.stop_loss is None:
+                                derived_stop = suggested
+                            else:
+                                if trade.stop_loss < trade.price:
+                                    derived_stop = round(max(suggested, float(trade.stop_loss)), 2)
+                        else:
+                            suggested = round(trade.price + atr_points, 2)
+                            if trade.stop_loss is None:
+                                derived_stop = suggested
+                            else:
+                                if trade.stop_loss > trade.price:
+                                    derived_stop = round(min(suggested, float(trade.stop_loss)), 2)
+    except Exception:
+        # ATR best-effort: ignore errors and continue with previously derived_stop
+        pass
     
     # Calculate stop loss in points
     stop_points = abs(trade.price - derived_stop)
@@ -2189,27 +2418,51 @@ async def execute(
         # --- REAL ZERODHA ORDER PLACEMENT ---
         # Map your signal to the correct Zerodha symbol (tradingsymbol)
         zerodha_symbol = trade.symbol  # You may need to convert to e.g. 'BANKNIFTY24FEB48000CE'
-        print(f"[API /execute] ▶ Placing {mode} order to Zerodha...")
-        print(f"[API /execute] ▶ Order Details: {zerodha_symbol}, {trade.quantity or 1} qty, {trade.side} at ₹{trade.price}")
-        real_order = place_zerodha_order(
-            symbol=zerodha_symbol,
-            quantity=trade.quantity or 1,
-            side=trade.side,
-            order_type="MARKET",
-            product="MIS",
-            exchange="NFO"  # Use 'NFO' for options
-        )
-        if real_order["success"]:
-            print(f"[API /execute] ✓ Zerodha order ACCEPTED - Order ID: {real_order.get('order_id', 'N/A')}")
-            broker_response = real_order
+        # Server-side multi-tick confirmation guard to reduce false entries
+        try:
+            underlying = _extract_underlying_symbol(trade.symbol)
+            confirmed = _require_multi_tick_confirmation(underlying, trade.price, trade.side, required_ticks=3)
+        except Exception:
+            confirmed = False
+
+        if not confirmed and not auto_demo:
+            raise HTTPException(status_code=403, detail={
+                "message": "Trade blocked: failed multi-tick confirmation (server guard).",
+                "underlying": underlying,
+                "required_ticks": 3,
+            })
+
+        # If demo mode is active or live is not armed, create a simulated/demo trade instead of placing a real order.
+        if auto_demo or (not bool(state.get("live_armed", True))):
+            trade_obj["status"] = "DEMO"
+            trade_obj["entry_time"] = _now()
+            trade_obj["broker_response"] = {"simulated": True}
+            demo_trades.append(trade_obj)
             active_trades.append(trade_obj)
+            broker_response = {"simulated": True}
+            print(f"[API /execute] ℹ Demo trade started for {trade_obj.get('symbol')} qty={trade_obj.get('quantity')}")
         else:
-            print(f"[API /execute] ✗ Zerodha order REJECTED - Error: {real_order.get('error', 'Unknown')}")
-            return {
-                "success": False,
-                "message": real_order["error"],
-                "timestamp": _now(),
-            }
+            print(f"[API /execute] ▶ Placing {mode} order to Zerodha...")
+            print(f"[API /execute] ▶ Order Details: {zerodha_symbol}, {trade.quantity or 1} qty, {trade.side} at ₹{trade.price}")
+            real_order = place_zerodha_order(
+                symbol=zerodha_symbol,
+                quantity=trade.quantity or 1,
+                side=trade.side,
+                order_type="MARKET",
+                product="MIS",
+                exchange="NFO"  # Use 'NFO' for options
+            )
+            if real_order.get("success"):
+                print(f"[API /execute] ✓ Zerodha order ACCEPTED - Order ID: {real_order.get('order_id', 'N/A')}")
+                broker_response = real_order
+                active_trades.append(trade_obj)
+            else:
+                print(f"[API /execute] ✗ Zerodha order REJECTED - Error: {real_order.get('error', 'Unknown')}")
+                return {
+                    "success": False,
+                    "message": real_order.get("error"),
+                    "timestamp": _now(),
+                }
 
         broker_logs.append({"trade": trade_obj, "response": broker_response})
 
@@ -2312,9 +2565,48 @@ async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
         new_price = float(live_price)
         live_price_cache[quote_symbol] = new_price
         for trade in trades:
+            prev_price = float(trade.get("current_price") or trade.get("price") or new_price)
             trade["current_price"] = new_price
             _maybe_update_trail(trade, new_price)
             updated_count += 1
+
+            # Profit-lock: when profit reaches threshold, move SL to lock-in level
+            try:
+                side = (trade.get("side") or "BUY").upper()
+                entry = float(trade.get("price") or trade.get("entry_price") or 0.0)
+                profit_points = round((new_price - entry) * (1 if side == "BUY" else -1), 2)
+            except Exception:
+                profit_points = 0
+
+            LOCK_POINTS = 20
+            if profit_points >= LOCK_POINTS and not trade.get("profit_lock_applied"):
+                if side == "BUY":
+                    locked_sl = round(entry + LOCK_POINTS, 2)
+                    trade["stop_loss"] = max(trade.get("stop_loss", entry - LOCK_POINTS), locked_sl)
+                else:
+                    locked_sl = round(entry - LOCK_POINTS, 2)
+                    trade["stop_loss"] = min(trade.get("stop_loss", entry + LOCK_POINTS), locked_sl)
+                trade["profit_lock_applied"] = True
+
+            # If profit was locked and price reverses from previous tick, close to lock profit
+            if trade.get("profit_lock_applied"):
+                if side == "BUY" and new_price < prev_price:
+                    trade["status"] = "SL_HIT"
+                    trade["exit_reason"] = "SL_HIT"
+                    _maybe_place_exit_order(trade, new_price)
+                    _close_trade(trade, new_price)
+                    to_close.append(trade)
+                    closed_count += 1
+                    continue
+                if side != "BUY" and new_price > prev_price:
+                    trade["status"] = "SL_HIT"
+                    trade["exit_reason"] = "SL_HIT"
+                    _maybe_place_exit_order(trade, new_price)
+                    _close_trade(trade, new_price)
+                    to_close.append(trade)
+                    closed_count += 1
+                    continue
+
             exit_reason = _should_exit_by_currency(trade, new_price)
             if exit_reason:
                 trade["status"] = exit_reason
@@ -2326,6 +2618,7 @@ async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
             if _stop_hit(trade, new_price):
                 trade["status"] = "SL_HIT"
                 trade["exit_reason"] = "SL_HIT"
+                _maybe_place_exit_order(trade, new_price)
                 _close_trade(trade, new_price)
                 to_close.append(trade)
                 closed_count += 1
@@ -2346,9 +2639,46 @@ async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
             new_price = float(live_price)
             live_price_cache[quote_symbol] = new_price
             for trade in trade_symbol_map.get(quote_symbol, []):
+                prev_price = float(trade.get("current_price") or trade.get("price") or new_price)
                 trade["current_price"] = new_price
                 _maybe_update_trail(trade, new_price)
                 updated_count += 1
+
+                try:
+                    side = (trade.get("side") or "BUY").upper()
+                    entry = float(trade.get("price") or trade.get("entry_price") or 0.0)
+                    profit_points = round((new_price - entry) * (1 if side == "BUY" else -1), 2)
+                except Exception:
+                    profit_points = 0
+
+                LOCK_POINTS = 20
+                if profit_points >= LOCK_POINTS and not trade.get("profit_lock_applied"):
+                    if side == "BUY":
+                        locked_sl = round(entry + LOCK_POINTS, 2)
+                        trade["stop_loss"] = max(trade.get("stop_loss", entry - LOCK_POINTS), locked_sl)
+                    else:
+                        locked_sl = round(entry - LOCK_POINTS, 2)
+                        trade["stop_loss"] = min(trade.get("stop_loss", entry + LOCK_POINTS), locked_sl)
+                    trade["profit_lock_applied"] = True
+
+                if trade.get("profit_lock_applied"):
+                    if side == "BUY" and new_price < prev_price:
+                        trade["status"] = "SL_HIT"
+                        trade["exit_reason"] = "SL_HIT"
+                        _maybe_place_exit_order(trade, new_price)
+                        _close_trade(trade, new_price)
+                        to_close.append(trade)
+                        closed_count += 1
+                        continue
+                    if side != "BUY" and new_price > prev_price:
+                        trade["status"] = "SL_HIT"
+                        trade["exit_reason"] = "SL_HIT"
+                        _maybe_place_exit_order(trade, new_price)
+                        _close_trade(trade, new_price)
+                        to_close.append(trade)
+                        closed_count += 1
+                        continue
+
                 exit_reason = _should_exit_by_currency(trade, new_price)
                 if exit_reason:
                     trade["status"] = exit_reason
@@ -2360,6 +2690,7 @@ async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
                 if _stop_hit(trade, new_price):
                     trade["status"] = "SL_HIT"
                     trade["exit_reason"] = "SL_HIT"
+                    _maybe_place_exit_order(trade, new_price)
                     _close_trade(trade, new_price)
                     to_close.append(trade)
                     closed_count += 1
@@ -2433,13 +2764,51 @@ async def update_trade_price(symbol: str, price: float, authorization: Optional[
     to_close = []
     for trade in active_trades:
         if trade.get("symbol") == symbol and trade.get("status") == "OPEN":
+            prev_price = float(trade.get("current_price") or trade.get("price") or price)
             _maybe_update_trail(trade, price)
             trade["current_price"] = price
             updated += 1
+
+            try:
+                side = (trade.get("side") or "BUY").upper()
+                entry = float(trade.get("price") or trade.get("entry_price") or 0.0)
+                profit_points = round((price - entry) * (1 if side == "BUY" else -1), 2)
+            except Exception:
+                profit_points = 0
+
+            LOCK_POINTS = 20
+            if profit_points >= LOCK_POINTS and not trade.get("profit_lock_applied"):
+                if side == "BUY":
+                    locked_sl = round(entry + LOCK_POINTS, 2)
+                    trade["stop_loss"] = max(trade.get("stop_loss", entry - LOCK_POINTS), locked_sl)
+                else:
+                    locked_sl = round(entry - LOCK_POINTS, 2)
+                    trade["stop_loss"] = min(trade.get("stop_loss", entry + LOCK_POINTS), locked_sl)
+                trade["profit_lock_applied"] = True
+
+            if trade.get("profit_lock_applied"):
+                if side == "BUY" and price < prev_price:
+                    trade["status"] = "SL_HIT"
+                    trade["exit_reason"] = "SL_HIT"
+                    _maybe_place_exit_order(trade, price)
+                    _close_trade(trade, price)
+                    to_close.append(trade)
+                    closed += 1
+                    continue
+                if side != "BUY" and price > prev_price:
+                    trade["status"] = "SL_HIT"
+                    trade["exit_reason"] = "SL_HIT"
+                    _maybe_place_exit_order(trade, price)
+                    _close_trade(trade, price)
+                    to_close.append(trade)
+                    closed += 1
+                    continue
+
             exit_reason = _should_exit_by_currency(trade, price)
             if exit_reason:
                 trade["status"] = exit_reason
                 trade["exit_reason"] = exit_reason
+                _maybe_place_exit_order(trade, price)
                 _close_trade(trade, price)
                 to_close.append(trade)
                 closed += 1
@@ -2447,6 +2816,7 @@ async def update_trade_price(symbol: str, price: float, authorization: Optional[
             if _stop_hit(trade, price):
                 trade["status"] = "SL_HIT"
                 trade["exit_reason"] = "SL_HIT"
+                _maybe_place_exit_order(trade, price)
                 _close_trade(trade, price)
                 to_close.append(trade)
                 closed += 1
@@ -2563,6 +2933,96 @@ async def monitor(authorization: Optional[str] = Header(None)):
         "timestamp": _now(),
     }
     return {"monitor": payload, **payload}
+
+
+@router.post("/auto_scan/start")
+async def start_auto_scan(
+    interval: Optional[float] = Body(3, embed=True),
+    symbols: Optional[str] = Body("NIFTY,BANKNIFTY", embed=True),
+    instrument_type: Optional[str] = Body("weekly_option", embed=True),
+    balance: Optional[float] = Body(None, embed=True),
+    authorization: Optional[str] = Header(None),
+):
+    """Start background auto-scan worker. Polls every `interval` seconds."""
+    global auto_scan_task, auto_scan_state
+    if auto_scan_state.get("running"):
+        return {"running": True, "message": "Auto-scan already running", "state": auto_scan_state}
+
+    auto_scan_state.update({
+        "running": True,
+        "interval": max(1.0, float(interval or 3)),
+        "symbols": [s.strip().upper() for s in (symbols or "").split(",") if s.strip()],
+        "instrument_type": instrument_type or "weekly_option",
+    })
+
+    # If caller did not supply a balance, try to fetch from active Zerodha credentials
+    resolved_balance: Optional[float] = None
+    if balance is not None:
+        try:
+            resolved_balance = float(balance)
+        except Exception:
+            resolved_balance = None
+
+    if resolved_balance is None:
+        # attempt to read active Zerodha broker credentials and fetch balance
+        try:
+            db = SessionLocal()
+            cred = (
+                db.query(BrokerCredential)
+                .filter(BrokerCredential.broker_name.ilike("%zerodha%"), BrokerCredential.is_active == True)
+                .order_by(BrokerCredential.id.desc())
+                .first()
+            )
+            if cred:
+                zb = ZerodhaBroker()
+                creds = {"api_key": getattr(cred, "api_key", None), "access_token": getattr(cred, "access_token", None)}
+                if zb.connect(creds):
+                    bal_resp = zb.get_balance()
+                    if isinstance(bal_resp, dict) and bal_resp.get("success"):
+                        funds = bal_resp.get("funds") or {}
+                        # try common keys returned by brokers
+                        for key in ("available", "available_cash", "equity", "net", "cash", "cash_available"):
+                            if key in funds:
+                                try:
+                                    resolved_balance = float(funds[key])
+                                    break
+                                except Exception:
+                                    continue
+                        # if still not found, try numeric aggregation
+                        if resolved_balance is None and isinstance(funds, dict):
+                            nums = [v for v in funds.values() if isinstance(v, (int, float))]
+                            if nums:
+                                resolved_balance = float(sum(nums))
+        except Exception:
+            resolved_balance = None
+        finally:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+    # fallback: use last known state or zero (no hard-coded magic number)
+    auto_scan_state["balance"] = float(resolved_balance or auto_scan_state.get("balance") or 0.0)
+    auto_scan_task = asyncio.create_task(_auto_scan_worker())
+    return {"running": True, "state": auto_scan_state}
+
+
+@router.post("/auto_scan/stop")
+async def stop_auto_scan(authorization: Optional[str] = Header(None)):
+    global auto_scan_task, auto_scan_state
+    auto_scan_state["running"] = False
+    if auto_scan_task:
+        try:
+            auto_scan_task.cancel()
+        except Exception:
+            pass
+        auto_scan_task = None
+    return {"running": False, "state": auto_scan_state}
+
+
+@router.get("/auto_scan/status")
+async def auto_scan_status(authorization: Optional[str] = Header(None)):
+    return {"state": auto_scan_state}
 
 @router.post("/run-strategy")
 async def run_strategy(market_data: dict, credentials: dict, authorization: Optional[str] = Header(None)):
