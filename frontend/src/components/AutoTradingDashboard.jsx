@@ -1187,8 +1187,9 @@ const AutoTradingDashboard = () => {
   }, [signalsLoaded, autoScanActive, scannerUserOverride, scannerMinQuality, isMarketOpen]);
 
   // Core data fetch logic (extracted for reuse)
-  const performDataFetch = async () => {
-    if (dataFetchInFlightRef.current) {
+  // forceRefresh: if true, bypasses the in-flight check to ensure immediate update (used after trade execution)
+  const performDataFetch = async (forceRefresh = false) => {
+    if (dataFetchInFlightRef.current && !forceRefresh) {
       return;
     }
     dataFetchInFlightRef.current = true;
@@ -1199,9 +1200,12 @@ const AutoTradingDashboard = () => {
       new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), ms))
     ]);
 
-    // Do not block table refresh on slow price-update endpoints.
-    timeoutPromise(config.authFetch(PAPER_TRADES_UPDATE_API, { method: 'POST' }), 3000).catch(() => null);
-    timeoutPromise(config.authFetch(AUTO_TRADE_UPDATE_API, { method: 'POST' }), 3000).catch(() => null);
+    // Update live prices FIRST, then fetch trades to ensure prices are current
+    // Wait for updates to complete (or timeout), but don't block if they fail
+    await Promise.all([
+      timeoutPromise(config.authFetch(PAPER_TRADES_UPDATE_API, { method: 'POST' }), 3000).catch(() => null),
+      timeoutPromise(config.authFetch(AUTO_TRADE_UPDATE_API, { method: 'POST' }), 3000).catch(() => null),
+    ]);
 
     const safeFetch = async (url) => {
       try {
@@ -1319,9 +1323,10 @@ const AutoTradingDashboard = () => {
   };
 
   // User-triggered fetch with loading state
-  const fetchData = async () => {
+  // forceRefresh: bypass in-flight check to ensure data updates immediately (used after trade execution)
+  const fetchData = async (forceRefresh = false) => {
     try {
-      await performDataFetch();
+      await performDataFetch(forceRefresh);
     } catch (e) {
       // Keep previously rendered rows/data on fetch failure to avoid flicker.
       setIsUsingStaleData(true);
@@ -1797,12 +1802,12 @@ const AutoTradingDashboard = () => {
       if (autoTradingActive) {
         console.log('🚀 AUTO-TRADING ENABLED - Executing LIVE trade...');
         await executeAutoTrade(bestSignal);
-        await fetchData();
+        await fetchData(true);
         console.log('✅ Live trade executed!');
       } else {
         console.log('📊 AUTO-TRADING DISABLED - Creating PAPER trade for review...');
         await createPaperTradeFromSignal(bestSignal);
-        await fetchData();
+        await fetchData(true);
         console.log('✅ Paper trade created - Review quality and click "Start Auto-Trading" to go live!');
       }
     } catch (error) {
@@ -2373,7 +2378,7 @@ const AutoTradingDashboard = () => {
       for (const candidate of chosen) {
         await executeAutoTrade(candidate);
       }
-      await fetchData();
+      await fetchData(true);
     })().finally(() => {
       autoBatchExecutingRef.current = false;
     });
@@ -2529,7 +2534,7 @@ const AutoTradingDashboard = () => {
         stop_loss: normalizedSignal.stop_loss,
         quantity: adjustedQuantity,
         side: normalizedSignal.action,
-        quality_score: normalizedSignal.quality_score ?? normalizedSignal.quality,
+        quality_score: tradeQuality.quality,  // Send frontend-calculated quality instead of signal's original value
         confirmation_score: normalizedSignal.confirmation_score ?? normalizedSignal.confidence,
         option_type: normalizedSignal.option_type,
         trend_direction: normalizedSignal.trend_direction,
@@ -2545,14 +2550,20 @@ const AutoTradingDashboard = () => {
       if (response.ok) {
         const data = await response.json();
         console.log(`✅ ${mode} TRADE EXECUTED: ${normalizedSignal.symbol} - ${data.message || 'Success!'}`);
-        // Update UI: refresh active trades and re-run scanner for fresh signals
-        try { await fetchData(); } catch (e) { console.warn('⚠️ Refresh after execute failed:', e?.message || e); }
+        // Update UI: refresh active trades immediately with force flag to bypass in-flight guard
+        try { await fetchData(true); } catch (e) { console.warn('⚠️ Refresh after execute failed:', e?.message || e); }
         try { await scanMarketForQualityTrades(scannerMinQuality, true); } catch (e) { console.warn('⚠️ Post-execute scanner failed:', e?.message || e); }
         // Don't show alert for auto-trades, just log
       } else {
         let errorMsg = 'Failed to execute trade.';
-        let shouldStopAutoTrading = true;
+        let shouldStopAutoTrading = false;
         let cooldownMinutes = 0;
+
+        // Keep auto-trading running for transient/server-side failures.
+        // Only disarm automatically for explicit auth failures or hard risk locks.
+        if (response.status === 401) {
+          shouldStopAutoTrading = true;
+        }
         
         try {
           const errData = await response.json();
@@ -2608,7 +2619,7 @@ const AutoTradingDashboard = () => {
                   cooldownTimerRef.current = setTimeout(async () => {
                     try {
                       console.log('🔁 Cooldown expired — refreshing trades and re-running scanner');
-                      await fetchData();
+                      await fetchData(true);
                       await scanMarketForQualityTrades(scannerMinQuality, true);
                     } catch (e) {
                       console.warn('⚠️ Post-cooldown refresh failed:', e?.message || e);
@@ -2722,13 +2733,13 @@ const AutoTradingDashboard = () => {
       if (!response.ok) {
         const errText = await response.text();
         console.error('❌ Close trade failed:', errText);
-        await fetchData();
+        await fetchData(true);
         return;
       }
       await refreshTradesQuietly();
     } catch (e) {
       console.error('❌ Close trade error:', e.message);
-      await fetchData();
+      await fetchData(true);
     }
   };
 
@@ -2840,9 +2851,9 @@ const AutoTradingDashboard = () => {
           console.log(`✅ Paper trade created: ${normalizedSignal.symbol}`);
           setLastPaperSignalSymbol(paperSignalKey);
           setLastPaperSignalAt(Date.now());
-          // Refresh active trades and re-run a scanner pass so UI reflects the new entry
+          // Refresh active trades immediately with force flag to ensure UI update
           try {
-            await fetchData();
+            await fetchData(true);
           } catch (e) {
             console.warn('⚠️ Refresh after trade creation failed:', e?.message || e);
           }
