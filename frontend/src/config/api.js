@@ -111,17 +111,31 @@ export const config = {
     const url = (typeof endpoint === 'string' && (endpoint.startsWith('http://') || endpoint.startsWith('https://'))) 
       ? endpoint 
       : config.getUrl(endpoint);
-    
-    const response = await fetch(url, {
+
+    const requestOptions = {
       ...options,
       headers: {
         'Content-Type': 'application/json',
         ...config.getAuthHeaders(),
         ...options.headers,
       },
-    });
-    
-    return response;
+    };
+
+    const method = String(requestOptions.method || 'GET').toUpperCase();
+    const canRetry = method === 'GET';
+
+    try {
+      return await fetch(url, requestOptions);
+    } catch (error) {
+      if (!canRetry) throw error;
+
+      // Retry once for intermittent transport/decode issues seen in dev (e.g. content-length mismatch).
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      return await fetch(url, {
+        ...requestOptions,
+        cache: 'no-store',
+      });
+    }
   },
 };
 

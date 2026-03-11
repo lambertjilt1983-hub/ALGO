@@ -1285,8 +1285,11 @@ async def _auto_scan_worker():
             rec = auto_scan_state["last_recommendation"]
             if rec and rec.get("start_trade_allowed"):
                 try:
-                    # If live is not armed, force demo/paper execution so UI 'GO' starts a paper trade
-                    force_demo = not bool(state.get("live_armed", True))
+                    # Demo mode should be explicit; do not silently downgrade live to demo.
+                    force_demo = bool(state.get("is_demo_mode", False))
+                    if (not force_demo) and (not bool(state.get("live_armed", True))):
+                        await asyncio.sleep(interval)
+                        continue
                     await execute(
                         symbol=rec.get("symbol"),
                         price=float(rec.get("entry_price") or 0.0),
@@ -1993,8 +1996,8 @@ async def analyze(
     if allow_auto_execute and (protection_active or demo_mode) and can_trade and recommendation and recommendation.get("start_trade_allowed"):
         try:
             from fastapi import Request
-            # If live is not armed, force demo execution so we simulate/paper-start trades
-            force_demo = not bool(state.get("live_armed", True))
+            # Demo mode should be explicit; keep live execution live when armed.
+            force_demo = bool(state.get("is_demo_mode", False))
             auto_trade_result = await execute(
                 symbol=recommendation["symbol"],
                 side=recommendation["action"],

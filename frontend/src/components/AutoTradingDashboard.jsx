@@ -160,6 +160,9 @@ const AutoTradingDashboard = () => {
   const [confirmationMode, setConfirmationMode] = useState('balanced');
   const [historyStartDate, setHistoryStartDate] = useState(() => new Date().toLocaleDateString('en-CA'));
   const [historyEndDate, setHistoryEndDate] = useState(() => new Date().toLocaleDateString('en-CA'));
+  const [historyModeFilter, setHistoryModeFilter] = useState('ALL');
+  const [historyActionFilter, setHistoryActionFilter] = useState('ALL');
+  const [historyStatusFilter, setHistoryStatusFilter] = useState('ALL');
   const [selectedSignalSymbol, setSelectedSignalSymbol] = useState(() => {
     if (typeof window === 'undefined') return null;
     return localStorage.getItem('selectedSignalSymbol');
@@ -1232,8 +1235,16 @@ const AutoTradingDashboard = () => {
     const perfData = perfRes?.ok ? await perfRes.json() : null;
     const statusData = statusRes?.ok ? await statusRes.json() : {};
 
-    const paperActive = Array.isArray(paperActiveData.trades) ? paperActiveData.trades : [];
-    const liveActive = Array.isArray(liveActiveData.trades) ? liveActiveData.trades : [];
+    const paperActive = (Array.isArray(paperActiveData.trades) ? paperActiveData.trades : []).map((t) => ({
+      ...t,
+      trade_mode: 'DEMO',
+      trade_source: 'paper',
+    }));
+    const liveActive = (Array.isArray(liveActiveData.trades) ? liveActiveData.trades : []).map((t) => ({
+      ...t,
+      trade_mode: 'LIVE',
+      trade_source: 'live',
+    }));
     const activeCandidates = [...liveActive, ...paperActive];
     const history = historyData.trades || [];
     const backendStatus = statusData.status || statusData;
@@ -1251,6 +1262,7 @@ const AutoTradingDashboard = () => {
               (t.action || t.side) === (trade.action || trade.side) &&
               Number(t.entry_price ?? t.price) === Number(trade.entry_price ?? trade.price) &&
               (t.entry_time || t.timestamp) === (trade.entry_time || trade.timestamp)
+              && String(t.trade_mode || '') === String(trade.trade_mode || '')
             ) === idx
           );
         })
@@ -2064,6 +2076,12 @@ const AutoTradingDashboard = () => {
     && Number(liveAccountBalance) >= 0
     && Number.isFinite(Number(liveBalanceSyncedAt));
   const liveBalanceValue = hasLiveBalance ? Number(liveAccountBalance) : 0;
+  const hasPositiveGateBalance = hasLiveBalance && liveBalanceValue > 0;
+  const estimatedGateBalance = Math.max(Number(displayCapitalRequired || 0), MIN_LIVE_BALANCE_REQUIRED);
+  const effectiveGateBalance = hasPositiveGateBalance ? liveBalanceValue : estimatedGateBalance;
+  const effectiveGateBalanceLabel = hasPositiveGateBalance
+    ? `₹${effectiveGateBalance.toLocaleString()}`
+    : `₹${Math.round(effectiveGateBalance).toLocaleString()} (estimated)`;
   const gateStatusRows = [
     {
       label: 'Market Open',
@@ -2072,7 +2090,7 @@ const AutoTradingDashboard = () => {
     },
     {
       label: 'Auto-Trading Armed',
-      pass: !isLiveMode || !!autoTradingActive,
+      pass: !!autoTradingActive,
       detail: autoTradingActive ? 'Enabled' : 'Disabled'
     },
     {
@@ -2089,21 +2107,13 @@ const AutoTradingDashboard = () => {
     },
     {
       label: 'Min Live Balance',
-      pass: !isLiveMode || (hasLiveBalance && liveBalanceValue >= MIN_LIVE_BALANCE_REQUIRED),
-      detail: !isLiveMode
-        ? 'Not required in demo mode'
-        : (hasLiveBalance
-          ? `₹${liveBalanceValue.toLocaleString()} / Min ₹${MIN_LIVE_BALANCE_REQUIRED.toLocaleString()}`
-          : 'Balance not synced')
+      pass: effectiveGateBalance >= MIN_LIVE_BALANCE_REQUIRED,
+      detail: `${effectiveGateBalanceLabel} / Min ₹${MIN_LIVE_BALANCE_REQUIRED.toLocaleString()}`
     },
     {
       label: 'Capital Availability',
-      pass: !isLiveMode || (hasLiveBalance && Number.isFinite(displayCapitalRequired) && displayCapitalRequired > 0 && liveBalanceValue >= displayCapitalRequired),
-      detail: !isLiveMode
-        ? 'Not required in demo mode'
-        : (hasLiveBalance
-          ? `Need ₹${Math.round(displayCapitalRequired || 0).toLocaleString()} / Avail ₹${liveBalanceValue.toLocaleString()}`
-          : 'Balance not synced')
+      pass: Number.isFinite(displayCapitalRequired) && displayCapitalRequired > 0 && effectiveGateBalance >= displayCapitalRequired,
+      detail: `Need ₹${Math.round(displayCapitalRequired || 0).toLocaleString()} / Avail ${effectiveGateBalanceLabel}`
     },
     {
       label: 'Risk Pause',
@@ -2540,6 +2550,7 @@ const AutoTradingDashboard = () => {
         trend_direction: normalizedSignal.trend_direction,
         trend_strength: normalizedSignal.trend_strength,
         expiry: normalizedSignal.expiry_date,
+        force_demo: !isLiveMode,
         broker_id: isLiveMode && Number.isFinite(effectiveBrokerId) && effectiveBrokerId > 0 ? effectiveBrokerId : 1,
         balance: isLiveMode ? effectiveBalance : 0  // 0 = demo mode, positive = live mode
       };
@@ -2711,7 +2722,8 @@ const AutoTradingDashboard = () => {
 
     try {
       let response;
-      if (isLiveMode) {
+      const isTradeLive = String(trade?.trade_mode || trade?.trade_source || '').toUpperCase() === 'LIVE';
+      if (isTradeLive) {
         response = await config.authFetch(config.endpoints.autoTrade.closeTrade, {
           method: 'POST',
           body: JSON.stringify({ trade_id: trade.id, symbol: trade.symbol })
@@ -3108,6 +3120,25 @@ const AutoTradingDashboard = () => {
   });
   const sumPnl = (trades) => trades.reduce((acc, t) => acc + Number(t.profit_loss ?? t.pnl ?? 0), 0);
   const sumWins = (trades) => trades.filter((t) => Number(t.profit_loss ?? t.pnl ?? 0) > 0).length;
+  const inferExitPrice = (trade) => {
+    const directExit = trade?.exit_price;
+    if (directExit !== null && directExit !== undefined && Number.isFinite(Number(directExit))) {
+      return Number(directExit);
+    }
+    const current = trade?.current_price ?? trade?.ltp;
+    if (current !== null && current !== undefined && Number.isFinite(Number(current))) {
+      return Number(current);
+    }
+    const entry = Number(trade?.entry_price ?? trade?.price ?? 0);
+    const qty = Number(trade?.quantity ?? 0);
+    const pnl = Number(trade?.profit_loss ?? trade?.pnl ?? 0);
+    const side = String(trade?.action || trade?.side || 'BUY').toUpperCase();
+    if (entry > 0 && qty > 0 && Number.isFinite(pnl)) {
+      const dir = side === 'BUY' ? 1 : -1;
+      return entry + (pnl / (qty * dir));
+    }
+    return null;
+  };
   const overallPnl = reportSummary?.total_pnl ?? sumPnl(tradeHistory);
   const todayPnlFromSummary = reportSummary?.by_date?.find((d) => d.date === todayIso)?.pnl;
   const dateFilteredHistory = tradeHistory.filter((trade) => {
@@ -3119,9 +3150,22 @@ const AutoTradingDashboard = () => {
     return true;
   });
   const filteredHistory = dateFilteredHistory.filter((t) => {
+    const mode = String(
+      t?.trade_mode
+      || t?.trade_source
+      || t?.mode
+      || (t?.broker_order_id ? 'LIVE' : 'DEMO')
+    ).toUpperCase();
+    const action = String(t?.action || t?.side || '').toUpperCase();
+    const status = String(t?.status || 'CLOSED').toUpperCase();
+
+    if (historyModeFilter !== 'ALL' && mode !== historyModeFilter) return false;
+    if (historyActionFilter !== 'ALL' && action !== historyActionFilter) return false;
+    if (historyStatusFilter !== 'ALL' && status !== historyStatusFilter) return false;
+
     const q = historySearch.trim().toLowerCase();
     if (!q) return true;
-    return [t.symbol, t.index, t.action, t.status, t.strategy]
+    return [t.symbol, t.index, t.action, t.side, t.status, t.strategy, mode]
       .filter(Boolean)
       .some((field) => String(field).toLowerCase().includes(q));
   });
@@ -4037,7 +4081,7 @@ const AutoTradingDashboard = () => {
                   ? '⏳ Arming...'
                   : autoTradingActive
                     ? '🛑 Stop Auto-Trading'
-                    : '▶️ Enable Auto-Trading (Live)'}
+                    : '▶️ Start/Enable Live Trade'}
               </button>
               {armStatus && (
                 <div style={{
@@ -4300,6 +4344,7 @@ const AutoTradingDashboard = () => {
               <thead>
                 <tr style={{ background: '#f7fafc', borderBottom: '2px solid #e2e8f0' }}>
                   <th style={{ padding: '10px', textAlign: 'left' }}>Symbol</th>
+                  <th style={{ padding: '10px', textAlign: 'center' }}>Mode</th>
                   <th style={{ padding: '10px', textAlign: 'left' }}>Action</th>
                   <th style={{ padding: '10px', textAlign: 'right' }}>Entry</th>
                   <th style={{ padding: '10px', textAlign: 'right' }}>Current</th>
@@ -4318,6 +4363,7 @@ const AutoTradingDashboard = () => {
                   const entry = Number(trade.entry_price ?? trade.price ?? 0);
                   const current = Number(trade.current_price ?? entry);
                   const action = String(trade.side || trade.action || 'BUY').toUpperCase();
+                  const tradeMode = String(trade?.trade_mode || trade?.trade_source || (isLiveMode ? 'LIVE' : 'DEMO')).toUpperCase();
                   const qty = Number(trade.quantity ?? 0);
                   const computedPnl = entry > 0 && qty > 0
                     ? (action === 'BUY' ? (current - entry) * qty : (entry - current) * qty)
@@ -4335,6 +4381,18 @@ const AutoTradingDashboard = () => {
                   return (
                     <tr key={getTradeRowKey(trade)} style={{ borderBottom: '1px solid #e2e8f0' }}>
                       <td style={{ padding: '10px', fontWeight: '600' }}>{trade.symbol}</td>
+                      <td style={{ padding: '10px', textAlign: 'center' }}>
+                        <span style={{
+                          padding: '2px 8px',
+                          borderRadius: '999px',
+                          background: tradeMode === 'LIVE' ? '#fee2e2' : '#e0f2fe',
+                          color: tradeMode === 'LIVE' ? '#991b1b' : '#0c4a6e',
+                          fontSize: '11px',
+                          fontWeight: '700'
+                        }}>
+                          {tradeMode}
+                        </span>
+                      </td>
                       <td style={{ padding: '10px' }}>
                         <span style={{
                           padding: '2px 6px',
@@ -4400,7 +4458,7 @@ const AutoTradingDashboard = () => {
                 })}
                 {activeTrades.length === 0 && (
                   <tr>
-                    <td colSpan={12} style={{ padding: '16px', textAlign: 'center', color: '#718096' }}>
+                    <td colSpan={13} style={{ padding: '16px', textAlign: 'center', color: '#718096' }}>
                       Waiting for latest active trade update...
                     </td>
                   </tr>
@@ -4483,6 +4541,51 @@ const AutoTradingDashboard = () => {
             >
               Today
             </button>
+            <select
+              value={historyModeFilter}
+              onChange={(e) => setHistoryModeFilter(e.target.value)}
+              style={{
+                padding: '6px 10px',
+                border: '1px solid #e2e8f0',
+                borderRadius: '6px',
+                fontSize: '12px'
+              }}
+            >
+              <option value="ALL">Mode: All</option>
+              <option value="LIVE">Mode: Live</option>
+              <option value="DEMO">Mode: Demo</option>
+            </select>
+            <select
+              value={historyActionFilter}
+              onChange={(e) => setHistoryActionFilter(e.target.value)}
+              style={{
+                padding: '6px 10px',
+                border: '1px solid #e2e8f0',
+                borderRadius: '6px',
+                fontSize: '12px'
+              }}
+            >
+              <option value="ALL">Action: All</option>
+              <option value="BUY">Action: BUY</option>
+              <option value="SELL">Action: SELL</option>
+            </select>
+            <select
+              value={historyStatusFilter}
+              onChange={(e) => setHistoryStatusFilter(e.target.value)}
+              style={{
+                padding: '6px 10px',
+                border: '1px solid #e2e8f0',
+                borderRadius: '6px',
+                fontSize: '12px'
+              }}
+            >
+              <option value="ALL">Status: All</option>
+              <option value="OPEN">OPEN</option>
+              <option value="MANUAL_CLOSE">MANUAL_CLOSE</option>
+              <option value="SL_HIT">SL_HIT</option>
+              <option value="TARGET_HIT">TARGET_HIT</option>
+              <option value="EXPIRED">EXPIRED</option>
+            </select>
             <div style={{
               marginLeft: 'auto',
               display: 'flex',
@@ -4530,6 +4633,7 @@ const AutoTradingDashboard = () => {
                 <tr style={{ borderBottom: '2px solid #e2e8f0' }}>
                   <th style={{ padding: '10px', textAlign: 'left' }}>ID</th>
                   <th style={{ padding: '10px', textAlign: 'left' }}>Symbol</th>
+                  <th style={{ padding: '10px', textAlign: 'center' }}>Mode</th>
                   <th style={{ padding: '10px', textAlign: 'left' }}>Action</th>
                   <th style={{ padding: '10px', textAlign: 'right' }}>Entry</th>
                   <th style={{ padding: '10px', textAlign: 'right' }}>Exit</th>
@@ -4542,14 +4646,33 @@ const AutoTradingDashboard = () => {
               <tbody>
                 {filteredHistory.map((trade, idx) => {
                   const entry = Number(trade.entry_price || trade.price || 0);
-                  const exit = trade.exit_price != null ? Number(trade.exit_price) : null;
+                  const inferredExit = inferExitPrice(trade);
+                  const exit = inferredExit != null ? Number(inferredExit) : null;
                   const pnl = Number(trade.profit_loss ?? trade.pnl ?? 0);
                   const pnlPct = Number(trade.profit_percentage ?? trade.pnl_percent ?? 0);
                   const action = trade.action || trade.side || 'BUY';
+                  const tradeMode = String(
+                    trade?.trade_mode
+                    || trade?.trade_source
+                    || trade?.mode
+                    || (trade?.broker_order_id ? 'LIVE' : 'DEMO')
+                  ).toUpperCase();
                   return (
                     <tr key={getHistoryDisplayKey(trade, idx)} style={{ borderBottom: '1px solid #e2e8f0' }}>
                       <td style={{ padding: '10px' }}>#{idx + 1}</td>
                       <td style={{ padding: '10px', fontWeight: '600' }}>{trade.symbol || trade.index || '—'}</td>
+                      <td style={{ padding: '10px', textAlign: 'center' }}>
+                        <span style={{
+                          padding: '2px 8px',
+                          borderRadius: '999px',
+                          background: tradeMode === 'LIVE' ? '#fee2e2' : '#e0f2fe',
+                          color: tradeMode === 'LIVE' ? '#991b1b' : '#0c4a6e',
+                          fontSize: '11px',
+                          fontWeight: '700'
+                        }}>
+                          {tradeMode}
+                        </span>
+                      </td>
                       <td style={{ padding: '10px' }}>
                         <span style={{
                           padding: '2px 6px',
@@ -4600,7 +4723,7 @@ const AutoTradingDashboard = () => {
                 })}
                 {filteredHistory.length === 0 && (
                   <tr>
-                    <td colSpan={9} style={{ padding: '16px', textAlign: 'center', color: '#718096' }}>
+                    <td colSpan={10} style={{ padding: '16px', textAlign: 'center', color: '#718096' }}>
                       No trades in selected date range.
                     </td>
                   </tr>
@@ -4710,7 +4833,8 @@ const AutoTradingDashboard = () => {
                 <tbody>
                   {todayTableRows.map((t, idx) => {
                     const entry = Number(t.entry_price || t.price || 0);
-                    const exit = t.exit_price != null ? Number(t.exit_price) : null;
+                    const inferredExit = inferExitPrice(t);
+                    const exit = inferredExit != null ? Number(inferredExit) : null;
                     const pnl = Number(t.pnl ?? t.profit_loss ?? 0);
                     const action = t.action || t.side || 'BUY';
                     return (
@@ -4761,6 +4885,7 @@ const AutoTradingDashboard = () => {
                   <tr style={{ borderBottom: '2px solid #e2e8f0' }}>
                     <th style={{ padding: '10px', textAlign: 'left' }}>ID</th>
                     <th style={{ padding: '10px', textAlign: 'left' }}>Symbol</th>
+                    <th style={{ padding: '10px', textAlign: 'center' }}>Mode</th>
                     <th style={{ padding: '10px', textAlign: 'left' }}>Action</th>
                     <th style={{ padding: '10px', textAlign: 'right' }}>Entry</th>
                     <th style={{ padding: '10px', textAlign: 'right' }}>Exit</th>
@@ -4773,14 +4898,33 @@ const AutoTradingDashboard = () => {
                 <tbody>
                   {filteredHistory.map((trade, idx) => {
                     const entry = Number(trade.entry_price || trade.price || 0);
-                    const exit = trade.exit_price != null ? Number(trade.exit_price) : null;
+                    const inferredExit = inferExitPrice(trade);
+                    const exit = inferredExit != null ? Number(inferredExit) : null;
                     const pnl = Number(trade.profit_loss ?? trade.pnl ?? 0);
                     const pnlPct = Number(trade.profit_percentage ?? trade.pnl_percent ?? 0);
                     const action = trade.action || trade.side || 'BUY';
+                    const tradeMode = String(
+                      trade?.trade_mode
+                      || trade?.trade_source
+                      || trade?.mode
+                      || (trade?.broker_order_id ? 'LIVE' : 'DEMO')
+                    ).toUpperCase();
                     return (
                       <tr key={idx} style={{ borderBottom: '1px solid #e2e8f0' }}>
                         <td style={{ padding: '10px' }}>#{trade.id}</td>
                         <td style={{ padding: '10px', fontWeight: '600' }}>{trade.symbol || trade.index || '—'}</td>
+                        <td style={{ padding: '10px', textAlign: 'center' }}>
+                          <span style={{
+                            padding: '2px 8px',
+                            borderRadius: '999px',
+                            background: tradeMode === 'LIVE' ? '#fee2e2' : '#e0f2fe',
+                            color: tradeMode === 'LIVE' ? '#991b1b' : '#0c4a6e',
+                            fontSize: '11px',
+                            fontWeight: '700'
+                          }}>
+                            {tradeMode}
+                          </span>
+                        </td>
                         <td style={{ padding: '10px' }}>
                           <span style={{
                             padding: '2px 6px',
