@@ -96,6 +96,33 @@ def test_ai_entry_validation_blocks_when_hard_loss_brake_active():
     assert diag["loss_brake"]["block_new_entries"] is True
 
 
+def test_ai_entry_validation_allows_high_conviction_soft_ai_reasons(monkeypatch):
+    signal = _sample_signal()
+    signal.update(
+        {
+            "quality_score": 91,
+            "confirmation_score": 89,
+            "target": 101.25,
+            "stop_loss": 99.0,
+            "market_regime": "TRENDING",
+        }
+    )
+
+    monkeypatch.setattr(
+        "app.routes.auto_trading_simple.evaluate_advanced_ai_signal",
+        lambda _s: {
+            "entry_valid": False,
+            "entry_reasons": ["low_momentum", "low_ai_edge_score"],
+        },
+    )
+
+    ok, reasons, diag = _ai_entry_validation(signal, loss_brake={"enabled": False, "stage": "OFF"})
+
+    assert ok is True
+    assert reasons == []
+    assert diag.get("override_applied") == "HIGH_CONVICTION_SOFT_AI_GATE"
+
+
 def test_capital_protection_profile_scales_limits_from_balance():
     profile = _capital_protection_profile(50000)
 

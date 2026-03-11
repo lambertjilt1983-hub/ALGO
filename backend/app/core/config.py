@@ -48,7 +48,8 @@ class Settings(BaseSettings):
     FRONTEND_ALT_URL: str = "https://algo-trade-frontend.up.railway.app"
 
     # CORS
-    ALLOWED_ORIGINS: str = "https://algo-trade-frontend.up.railway.app"
+    # comma-separated list; include localhost for development
+    ALLOWED_ORIGINS: str = "http://localhost:3000"
     
     class Config:
         env_file = os.environ.get("ENV_FILE", ".env")

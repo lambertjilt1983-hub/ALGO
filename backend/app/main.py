@@ -96,12 +96,29 @@ app = FastAPI(
 settings = get_settings()
 allowed_origins = [origin.strip() for origin in settings.ALLOWED_ORIGINS.split(",") if origin.strip()]
 placeholder_hosts = {"https://yourdomain.com", "https://www.yourdomain.com"}
-if not allowed_origins or placeholder_hosts.intersection(allowed_origins):
+# Ensure localhost is always allowed during development
+if (not allowed_origins or placeholder_hosts.intersection(allowed_origins)):
     # Fallback to known frontend URLs when env var still has placeholders.
     allowed_origins = [
         settings.FRONTEND_URL,
         settings.FRONTEND_ALT_URL,
     ]
+
+# Add localhost automatically if running locally and not already present
+if any(h in settings.FRONTEND_URL for h in ("localhost", "127.0.0.1")) or os.getenv("ENV_FILE") == "env.local":
+    if "http://localhost:3000" not in allowed_origins:
+        allowed_origins.append("http://localhost:3000")
+    if "http://localhost:8000" not in allowed_origins:
+        allowed_origins.append("http://localhost:8000")
+
+
+# make sure localhost is always allowed in dev (safe to include in prod too)
+for host in ("http://localhost:3000", "http://localhost:3001", "http://localhost:8000"):
+    if host not in allowed_origins:
+        allowed_origins.append(host)
+
+print(f"[STARTUP] CORS allowed origins: {allowed_origins}")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -109,6 +126,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Logging middleware for debugging CORS issues
+@app.middleware("http")
+async def log_cors_request(request, call_next):
+    # log only execute endpoint
+    if request.url.path.startswith("/autotrade/execute"):
+        print(f"[CORS DEBUG] Incoming {request.method} {request.url} Headers: {dict(request.headers)}")
+    response = await call_next(request)
+    if request.url.path.startswith("/autotrade/execute"):
+        print(f"[CORS DEBUG] Response status {response.status_code} Headers: {dict(response.headers)}")
+    return response
 
 # Include routers
 app.include_router(auth.router)

@@ -4,8 +4,14 @@ Tests the complete workflow: generation, filtering, and classification of stock 
 """
 
 import pytest
+import sys
+import os
 from unittest.mock import Mock, MagicMock, patch, call
 from datetime import date, timedelta
+
+# Add backend to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
 from app.engine.option_signal_generator import (
     fetch_index_option_chain,
     generate_signals,

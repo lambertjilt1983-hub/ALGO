@@ -586,6 +586,32 @@ def fetch_index_option_chain(
         
         # Return BOTH CE and PE signals
         signal_type = "stock" if is_stock else "index"
+        
+        # Use percentage-based targets for stocks, fixed points for indices
+        # This ensures better RR ratios across different price scales
+        if is_stock:
+            # For stock options: use percentage-based targeting (8% target, 5% stop)
+            target_pct = 1.08  # 8% profit target
+            stop_pct = 0.95    # 5% stop loss
+            ce_target = round(ce_quote * target_pct, 2)
+            ce_stop = _safe_buy_stop(ce_quote, ce_quote * stop_pct)
+            pe_target = round(pe_quote * target_pct, 2)
+            pe_stop = _safe_buy_stop(pe_quote, pe_quote * stop_pct)
+            ce_profit = round((ce_target - ce_quote) * lot_size, 2)
+            ce_risk = round((ce_quote - ce_stop) * lot_size, 2)
+            pe_profit = round((pe_target - pe_quote) * lot_size, 2)
+            pe_risk = round((pe_quote - pe_stop) * lot_size, 2)
+        else:
+            # For index options: use fixed point targeting (25 points target, 20 points stop)
+            ce_target = ce_quote + 25
+            ce_stop = _safe_buy_stop(ce_quote, ce_quote - 20)
+            pe_target = pe_quote + 25
+            pe_stop = _safe_buy_stop(pe_quote, pe_quote - 20)
+            ce_profit = 25 * lot_size
+            ce_risk = 20 * lot_size
+            pe_profit = 25 * lot_size
+            pe_risk = 20 * lot_size
+        
         ce_signal = {
             "index": index_name,
             "signal_type": signal_type,  # NEW: Mark whether this is stock or index
@@ -596,16 +622,16 @@ def fetch_index_option_chain(
             "expiry_zone": nearest_expiry,
             "risk_note": "Live data",
             "entry_price": ce_quote,
-            "target": ce_quote + 25,
-            "stop_loss": _safe_buy_stop(ce_quote, ce_quote - 20),
+            "target": ce_target,
+            "stop_loss": ce_stop,
             "confidence": 85 if trend_bullish else 75,
             "strategy": f"ATM Option CE ({'Stock' if is_stock else 'Index'})",
             "action": "BUY",
             "symbol": ce_symbol,
             "quantity": lot_size,
             "expiry_date": str(nearest_expiry),
-            "potential_profit": 25 * lot_size,
-            "risk": 20 * lot_size,
+            "potential_profit": ce_profit,
+            "risk": ce_risk,
             "option_type": "CE",
             "trend_direction": trend_direction,
             "trend_strength": trend_strength,
@@ -623,16 +649,16 @@ def fetch_index_option_chain(
             "expiry_zone": nearest_expiry,
             "risk_note": "Live data",
             "entry_price": pe_quote,
-            "target": pe_quote + 25,
-            "stop_loss": _safe_buy_stop(pe_quote, pe_quote - 20),
+            "target": pe_target,
+            "stop_loss": pe_stop,
             "confidence": 85 if not trend_bullish else 75,
             "strategy": f"ATM Option PE ({'Stock' if is_stock else 'Index'})",
             "action": "BUY",
             "symbol": pe_symbol,
             "quantity": lot_size,
             "expiry_date": str(nearest_expiry),
-            "potential_profit": 25 * lot_size,
-            "risk": 20 * lot_size,
+            "potential_profit": pe_profit,
+            "risk": pe_risk,
             "option_type": "PE",
             "trend_direction": trend_direction,
             "trend_strength": trend_strength,
