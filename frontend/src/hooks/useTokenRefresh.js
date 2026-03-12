@@ -7,6 +7,17 @@ import { useEffect, useRef } from 'react';
 import config from '../config/api';
 
 const TOKEN_REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes in milliseconds
+const tokenRefreshLogLastAt = new Map();
+
+const tokenLog = (level, key, message, minIntervalMs = 0) => {
+  const now = Date.now();
+  const lastAt = Number(tokenRefreshLogLastAt.get(key) || 0);
+  if (minIntervalMs > 0 && (now - lastAt) < minIntervalMs) {
+    return;
+  }
+  tokenRefreshLogLastAt.set(key, now);
+  console[level](message);
+};
 
 export const useTokenRefresh = () => {
   const refreshTimerRef = useRef(null);
@@ -16,11 +27,11 @@ export const useTokenRefresh = () => {
       const refreshToken = localStorage.getItem('refresh_token');
       
       if (!refreshToken) {
-        console.warn('[TokenRefresh] No refresh token found - skipping refresh');
+        tokenLog('warn', 'no_refresh_token', '[TokenRefresh] No refresh token found - skipping refresh', 60000);
         return;
       }
 
-      console.log('[TokenRefresh] Attempting to refresh access token...');
+      tokenLog('log', 'refresh_attempt', '[TokenRefresh] Attempting to refresh access token...', 60000);
 
       const response = await fetch(`${config.API_BASE_URL}/auth/refresh?refresh_token=${encodeURIComponent(refreshToken)}`, {
         method: 'POST',
@@ -35,7 +46,7 @@ export const useTokenRefresh = () => {
         // Update access token in localStorage
         localStorage.setItem('access_token', data.access_token);
         
-        console.log('[TokenRefresh] ✓ Access token refreshed successfully');
+        tokenLog('log', 'refresh_ok', '[TokenRefresh] ✓ Access token refreshed successfully', 60000);
         
         return true;
       } else {
@@ -44,7 +55,7 @@ export const useTokenRefresh = () => {
         
         // If refresh token is invalid, clear storage and force re-login
         if (response.status === 401 || response.status === 403) {
-          console.warn('[TokenRefresh] Refresh token expired - clearing session');
+          tokenLog('warn', 'refresh_expired', '[TokenRefresh] Refresh token expired - clearing session', 15000);
           localStorage.removeItem('access_token');
           localStorage.removeItem('refresh_token');
           window.location.href = '/'; // Redirect to login
@@ -81,10 +92,10 @@ export const useTokenRefresh = () => {
         const needsReauth = results.some(r => r.status === 'requires_reauth');
         
         if (needsReauth) {
-          console.warn('[TokenRefresh] Broker tokens require re-authentication');
+          tokenLog('warn', 'broker_reauth', '[TokenRefresh] Broker tokens require re-authentication', 60000);
           // You could trigger a notification or modal here
         } else {
-          console.log('[TokenRefresh] ✓ All broker tokens valid');
+          tokenLog('log', 'broker_valid', '[TokenRefresh] ✓ All broker tokens valid', 60000);
         }
       }
     } catch (error) {
@@ -106,19 +117,19 @@ export const useTokenRefresh = () => {
 
     // Set up periodic refresh every 5 minutes
     refreshTimerRef.current = setInterval(async () => {
-      console.log('[TokenRefresh] Running scheduled token refresh...');
+      tokenLog('log', 'scheduled_refresh', '[TokenRefresh] Running scheduled token refresh...', 60000);
       await refreshAccessToken();
       await validateBrokerToken();
     }, TOKEN_REFRESH_INTERVAL);
 
-    console.log('[TokenRefresh] Auto-refresh enabled (every 5 minutes)');
+    tokenLog('log', 'auto_refresh_enabled', '[TokenRefresh] Auto-refresh enabled (every 5 minutes)', 15000);
   };
 
   const stopAutoRefresh = () => {
     if (refreshTimerRef.current) {
       clearInterval(refreshTimerRef.current);
       refreshTimerRef.current = null;
-      console.log('[TokenRefresh] Auto-refresh disabled');
+      tokenLog('log', 'auto_refresh_disabled', '[TokenRefresh] Auto-refresh disabled', 15000);
     }
   };
 
@@ -126,7 +137,7 @@ export const useTokenRefresh = () => {
     const accessToken = localStorage.getItem('access_token');
     
     if (accessToken) {
-      console.log('[TokenRefresh] Initializing auto-refresh...');
+      tokenLog('log', 'auto_refresh_init', '[TokenRefresh] Initializing auto-refresh...', 15000);
       startAutoRefresh();
     }
 

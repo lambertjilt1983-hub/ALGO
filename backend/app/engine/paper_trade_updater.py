@@ -19,6 +19,22 @@ _price_update_cache = {
 }
 
 
+def _paper_profit_protect_status(trade) -> str:
+    try:
+        entry = float(trade.entry_price or 0)
+        stop = float(trade.stop_loss) if trade.stop_loss is not None else None
+        side = str(trade.side or "BUY").upper()
+        if stop is None or entry <= 0:
+            return "SL_HIT"
+        if side == "BUY" and stop > entry:
+            return "PROFIT_TRAIL"
+        if side == "SELL" and stop < entry:
+            return "PROFIT_TRAIL"
+    except Exception:
+        return "SL_HIT"
+    return "SL_HIT"
+
+
 def _fetch_ltp_with_timeout(kite, symbols: List[str], timeout_s: float = 2.5):
     """Fetch LTP with a hard timeout so API route does not hang indefinitely."""
     if not symbols:
@@ -137,28 +153,28 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
         for trade in trades:
             try:
                 # Smart Profit Booking + Trailing Stop Logic
-                # 1) Move SL to breakeven after 50% of target is reached.
+                # 1) Move SL to breakeven after 35% of target is reached.
                 # 2) Close at target (profit booking).
-                # 3) If target is exceeded, keep a tight trailing SL (5pts).
+                # 3) If target is exceeded, keep a tighter trailing SL (3pts).
                 if trade.side == "BUY":
                     if trade.stop_loss is not None:
                         profit_points = new_price - trade.entry_price
                         target_reached = trade.target is not None and new_price >= trade.target
-                        half_target = trade.target is not None and new_price >= (trade.entry_price + (trade.target - trade.entry_price) * 0.5)
+                        half_target = trade.target is not None and new_price >= (trade.entry_price + (trade.target - trade.entry_price) * 0.35)
                         if half_target and trade.stop_loss < trade.entry_price:
                             trade.stop_loss = round(trade.entry_price, 2)
                             print(
-                                f"✅ BREAKEVEN set at {trade.stop_loss} after 50% target reached (Profit: +{profit_points:.1f}pts)"
+                                f"✅ BREAKEVEN set at {trade.stop_loss} after 35% target reached (Profit: +{profit_points:.1f}pts)"
                             )
-                        # Lock-in 20 points profit: once profit >= 20, move SL to entry+20
-                        if profit_points >= 20:
-                            locked_sl = round(trade.entry_price + 20, 2)
+                        # Lock-in 12 points profit: once profit >= 12, move SL to entry+12
+                        if profit_points >= 12:
+                            locked_sl = round(trade.entry_price + 12, 2)
                             if trade.stop_loss < locked_sl:
                                 trade.stop_loss = locked_sl
                                 print(f"🔒 LOCKED PROFIT: SL moved to {trade.stop_loss} (Profit: +{profit_points:.1f}pts)")
                             # If price starts dropping from last seen price, exit immediately to lock profit
                             if (trade.current_price is not None) and (new_price < trade.current_price):
-                                trade.status = "SL_HIT"
+                                trade.status = "PROFIT_TRAIL"
                                 trade.exit_price = new_price
                                 trade.exit_time = datetime.utcnow()
                                 trade.pnl = (trade.exit_price - trade.entry_price) * trade.quantity
@@ -182,7 +198,7 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
                             updated_count += 1
                             continue
                         if trade.target is not None and profit_points > (trade.target - trade.entry_price):
-                            new_trailing_sl = round(new_price - 5, 2)
+                            new_trailing_sl = round(new_price - 3, 2)
                             if new_trailing_sl > trade.stop_loss:
                                 trade.stop_loss = new_trailing_sl
                                 print(
@@ -192,21 +208,21 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
                     if trade.stop_loss is not None:
                         profit_points = trade.entry_price - new_price
                         target_reached = trade.target is not None and new_price <= trade.target
-                        half_target = trade.target is not None and new_price <= (trade.entry_price - (trade.entry_price - trade.target) * 0.5)
+                        half_target = trade.target is not None and new_price <= (trade.entry_price - (trade.entry_price - trade.target) * 0.35)
                         if half_target and trade.stop_loss > trade.entry_price:
                             trade.stop_loss = round(trade.entry_price, 2)
                             print(
-                                f"✅ BREAKEVEN set at {trade.stop_loss} after 50% target reached (Profit: +{profit_points:.1f}pts)"
+                                f"✅ BREAKEVEN set at {trade.stop_loss} after 35% target reached (Profit: +{profit_points:.1f}pts)"
                             )
-                        # Lock-in 20 points profit for shorts: once profit >= 20, move SL to entry-20
-                        if profit_points >= 20:
-                            locked_sl = round(trade.entry_price - 20, 2)
+                        # Lock-in 12 points profit for shorts: once profit >= 12, move SL to entry-12
+                        if profit_points >= 12:
+                            locked_sl = round(trade.entry_price - 12, 2)
                             if trade.stop_loss > locked_sl:
                                 trade.stop_loss = locked_sl
                                 print(f"🔒 LOCKED PROFIT: SL moved to {trade.stop_loss} (Profit: +{profit_points:.1f}pts)")
                             # If price starts rising from last seen price, exit immediately to lock profit
                             if (trade.current_price is not None) and (new_price > trade.current_price):
-                                trade.status = "SL_HIT"
+                                trade.status = "PROFIT_TRAIL"
                                 trade.exit_price = new_price
                                 trade.exit_time = datetime.utcnow()
                                 trade.pnl = (trade.entry_price - trade.exit_price) * trade.quantity
@@ -230,7 +246,7 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
                             updated_count += 1
                             continue
                         if trade.target is not None and profit_points > (trade.entry_price - trade.target):
-                            new_trailing_sl = round(new_price + 5, 2)
+                            new_trailing_sl = round(new_price + 3, 2)
                             if new_trailing_sl < trade.stop_loss:
                                 trade.stop_loss = new_trailing_sl
                                 print(
@@ -241,7 +257,7 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
                 if trade.side == "BUY":
                     if trade.stop_loss is not None and new_price <= trade.stop_loss:
                         new_price = trade.stop_loss
-                        trade.status = "SL_HIT"
+                        trade.status = _paper_profit_protect_status(trade)
                         trade.exit_price = trade.stop_loss
                         trade.exit_time = datetime.utcnow()
                         trade.pnl = (trade.stop_loss - trade.entry_price) * trade.quantity
@@ -251,7 +267,7 @@ def update_open_paper_trades(db, *, force: bool = False) -> Dict:
                 else:  # SELL
                     if trade.stop_loss is not None and new_price >= trade.stop_loss:
                         new_price = trade.stop_loss
-                        trade.status = "SL_HIT"
+                        trade.status = _paper_profit_protect_status(trade)
                         trade.exit_price = trade.stop_loss
                         trade.exit_time = datetime.utcnow()
                         trade.pnl = (trade.entry_price - trade.stop_loss) * trade.quantity

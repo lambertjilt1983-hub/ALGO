@@ -1,6 +1,7 @@
 import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from app.routes import auth, broker, orders, strategies, market_intelligence, auto_trading_simple, test_market, token_refresh, admin, option_signals, zerodha_postback, paper_trading
 from app.core.database import Base, engine, SessionLocal
 from app.core.config import get_settings
@@ -130,11 +131,26 @@ app.add_middleware(
 # Logging middleware for debugging CORS issues
 @app.middleware("http")
 async def log_cors_request(request, call_next):
-    # log only execute endpoint
-    if request.url.path.startswith("/autotrade/execute"):
+    should_log = request.url.path.startswith("/autotrade/execute")
+    if should_log:
         print(f"[CORS DEBUG] Incoming {request.method} {request.url} Headers: {dict(request.headers)}")
-    response = await call_next(request)
-    if request.url.path.startswith("/autotrade/execute"):
+
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        # Keep error responses CORS-readable for the frontend, even when downstream raises.
+        response = JSONResponse(
+            status_code=500,
+            content={"detail": f"Unhandled server error: {e.__class__.__name__}"},
+        )
+
+    origin = request.headers.get("origin")
+    if origin and origin in allowed_origins:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Vary"] = "Origin"
+
+    if should_log:
         print(f"[CORS DEBUG] Response status {response.status_code} Headers: {dict(response.headers)}")
     return response
 

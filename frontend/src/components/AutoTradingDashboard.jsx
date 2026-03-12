@@ -58,18 +58,21 @@ const DEFAULT_DAILY_LOSS_LIMIT = 5000; // ₹5000 max daily loss - hardstop
 const DEFAULT_DAILY_PROFIT_TARGET = 10000; // ₹10000 profit target - auto-stop at profit
 const MIN_SIGNAL_CONFIDENCE = 80; // 80%+ confidence (AI adjusts dynamically)
 const MIN_RR = 1.2; // Minimum risk:reward for entries
-const MIN_PAPER_CONFIDENCE = 50; // Lower threshold for demo/paper trades
+const MIN_PAPER_CONFIDENCE = 48; // Slightly lower threshold for demo/paper trades
 const MIN_PAPER_RR = 1.0; // Lower RR threshold for demo/paper trades
 const MAX_STOP_POINTS = 20; // 20-point max stop loss
 const MIN_TREND_STRENGTH = 0.8; // 80%+ trend strength
 const MIN_REGIME_SCORE = 0.6; // Market regime quality
-const MIN_TRADE_QUALITY_SCORE = 0.50; // Minimum 50% quality threshold with weighted scoring
+const MIN_TRADE_QUALITY_SCORE = 0.48; // Minimum 48% quality threshold with weighted scoring
 const MIN_LIVE_BALANCE_REQUIRED = 5000; // Mirror backend capital_min_balance for frontend gate visibility
 const DEFAULT_SCANNER_MIN_QUALITY = 70; // Balanced default so scanner is not empty in normal sessions
 const SCANNER_MIN_REFRESH_MS = 8000; // Prevent rapid manual refresh jitter
 const SCANNER_STABILITY_WINDOW_MS = 120000; // Keep continuity over recent scans
 const SCANNER_STICKY_MS = 45000; // Keep selected scanner rows stable for brief period unless quality threshold changes
+const SCANNER_LOOP_INTERVAL_MS = 3000; // Lower backend pressure vs 1s loop to reduce transport truncation/mismatch
+const PAPER_REJECTION_COOLDOWN_MS = 180000; // Back off repeated create attempts for same root/side after rejection
 const EMPTY_ACTIVE_POLLS_TO_CLEAR = 2; // Anti-flicker: clear rows only after consecutive confirmed empty polls
+const UI_ERROR_TTL_MS = 5000; // Auto-clear transient blocker/error messages after 5s
 // Frontend mirror of backend concurrent trade limit
 const MAX_CONCURRENT_TRADES = 3;
 
@@ -174,6 +177,7 @@ const AutoTradingDashboard = () => {
   const [lastProfessionalVisibleSignal, setLastProfessionalVisibleSignal] = useState(null);
   const [lastAiRecommendationSignal, setLastAiRecommendationSignal] = useState(null);
   const [aiGateRejections, setAiGateRejections] = useState([]);
+  const [entryBlockEvents, setEntryBlockEvents] = useState([]);
   const [liveAccountBalance, setLiveAccountBalance] = useState(null);
   const [liveBalanceSyncedAt, setLiveBalanceSyncedAt] = useState(null);
   const [liveBalanceBrokerId, setLiveBalanceBrokerId] = useState(null);
@@ -230,7 +234,7 @@ const AutoTradingDashboard = () => {
   const [scannerLastError, setScannerLastError] = useState(null);
   const [scannerTab, setScannerTab] = useState('all');
   const [autoScanActive, setAutoScanActive] = useState(true); // Track auto-refresh status (auto-enable for immediate scans)
-  // Allows user to request continuous scanning even when auto-trading isn't enabled
+  // User pause toggle for scanner loop
   const [scannerUserOverride, setScannerUserOverride] = useState(false);
   // Track when the last market scan completed (for UI timing)
   const [scannerLastRunAt, setScannerLastRunAt] = useState(null);
@@ -329,9 +333,93 @@ const AutoTradingDashboard = () => {
     return estimateSignalCapitalRequired(signal, qtyMultiplier);
   };
 
+  const pushEntryBlockEvent = ({ symbol, action, mode, message, reasons = [], source = 'client' } = {}) => {
+    const cleanedReasons = Array.isArray(reasons)
+      ? reasons.map((r) => String(r || '').trim()).filter(Boolean)
+      : [];
+    const finalMessage = String(message || '').trim() || 'Entry blocked';
+    const event = {
+      at: new Date().toISOString(),
+      symbol: symbol || '--',
+      action: action || '',
+      mode: String(mode || '').toUpperCase() || 'UNKNOWN',
+      message: finalMessage,
+      reasons: cleanedReasons,
+      source,
+      signature: `${String(symbol || '').toUpperCase()}|${String(action || '').toUpperCase()}|${String(mode || '').toUpperCase()}|${finalMessage}|${cleanedReasons.join('|')}`,
+    };
+    setEntryBlockEvents((prev) => {
+      const last = Array.isArray(prev) ? prev[0] : null;
+      if (last && last.signature === event.signature) {
+        const prevTs = new Date(last.at).getTime();
+        const nowTs = new Date(event.at).getTime();
+        if (Number.isFinite(prevTs) && Number.isFinite(nowTs) && (nowTs - prevTs) < 3000) {
+          return prev;
+        }
+      }
+      return [event, ...(Array.isArray(prev) ? prev : [])].slice(0, 12);
+    });
+  };
+
+  useEffect(() => {
+    if (!scannerLastError) return;
+    const timer = setTimeout(() => {
+      setScannerLastError(null);
+    }, UI_ERROR_TTL_MS);
+    return () => clearTimeout(timer);
+  }, [scannerLastError]);
+
+  useEffect(() => {
+    const parseTs = (item) => {
+      const ts = new Date(item?.at || 0).getTime();
+      return Number.isFinite(ts) ? ts : 0;
+    };
+    const keepRecent = (item, cutoff) => parseTs(item) >= cutoff;
+
+    const cutoffNow = Date.now() - UI_ERROR_TTL_MS;
+    const currentEntry = Array.isArray(entryBlockEvents) ? entryBlockEvents : [];
+    const currentAi = Array.isArray(aiGateRejections) ? aiGateRejections : [];
+    const nextEntry = currentEntry.filter((item) => keepRecent(item, cutoffNow));
+    const nextAi = currentAi.filter((item) => keepRecent(item, cutoffNow));
+
+    if (nextEntry.length !== currentEntry.length) setEntryBlockEvents(nextEntry);
+    if (nextAi.length !== currentAi.length) setAiGateRejections(nextAi);
+
+    const allTimestamps = [...nextEntry, ...nextAi].map(parseTs).filter((ts) => ts > 0);
+    if (allTimestamps.length === 0) return;
+
+    const soonestExpiry = Math.min(...allTimestamps) + UI_ERROR_TTL_MS;
+    const delayMs = Math.max(120, soonestExpiry - Date.now() + 20);
+    const timer = setTimeout(() => {
+      const cutoff = Date.now() - UI_ERROR_TTL_MS;
+      setEntryBlockEvents((prev) => (Array.isArray(prev) ? prev.filter((item) => keepRecent(item, cutoff)) : []));
+      setAiGateRejections((prev) => (Array.isArray(prev) ? prev.filter((item) => keepRecent(item, cutoff)) : []));
+    }, delayMs);
+
+    return () => clearTimeout(timer);
+  }, [entryBlockEvents, aiGateRejections]);
+
   const fmtPct = (v) => {
     const n = Number(v);
     return Number.isFinite(n) ? `${n.toFixed(1)}%` : '--';
+  };
+
+  const getTradeStatusPalette = (status) => {
+    const normalized = String(status || 'CLOSED').toUpperCase();
+    switch (normalized) {
+      case 'TARGET_HIT':
+        return { background: '#dcfce7', color: '#166534', label: 'TARGET_HIT' };
+      case 'PROFIT_TRAIL':
+        return { background: '#dbeafe', color: '#1d4ed8', label: 'PROFIT_TRAIL' };
+      case 'MANUAL_CLOSE':
+        return { background: '#ede9fe', color: '#6d28d9', label: 'MANUAL_CLOSE' };
+      case 'SL_HIT':
+        return { background: '#fee2e2', color: '#b91c1c', label: 'SL_HIT' };
+      case 'EXPIRED':
+        return { background: '#fef3c7', color: '#92400e', label: 'EXPIRED' };
+      default:
+        return { background: '#e5e7eb', color: '#374151', label: normalized };
+    }
   };
 
   const pickPreferredBroker = (brokers) => {
@@ -403,6 +491,9 @@ const AutoTradingDashboard = () => {
   const fmtYesNo = (v) => (v === true ? 'YES' : v === false ? 'NO' : '--');
 
   const getAdaptiveThresholds = (signal) => {
+    // Risk-field limits match backend paper_trading.py constants so frontend gate
+    // accurately predicts what the backend will allow.
+    // PAPER_MAX_FAKE_MOVE_RISK=16 / PAPER_MAX_NEWS_RISK=18 / PAPER_MAX_LIQUIDITY_SPIKE_RISK=16 / PAPER_MAX_PREMIUM_DISTORTION=14
     const regime = String(signal?.market_regime || signal?.regime || 'UNKNOWN').toUpperCase();
     const explicit = signal?.thresholds;
     if (explicit && typeof explicit === 'object') {
@@ -410,23 +501,23 @@ const AutoTradingDashboard = () => {
         min_ai_edge: Number(explicit.min_ai_edge ?? 60),
         min_momentum: Number(explicit.min_momentum ?? 50),
         min_breakout: Number(explicit.min_breakout ?? 45),
-        max_fake_move_risk: Number(explicit.max_fake_move_risk ?? 55),
+        max_fake_move_risk: Number(explicit.max_fake_move_risk ?? 16),
         min_rr: Number(explicit.min_rr ?? 1.1),
-        max_news_risk: Number(explicit.max_news_risk ?? 45),
-        max_liquidity_spike_risk: Number(explicit.max_liquidity_spike_risk ?? 50),
-        max_premium_distortion_risk: Number(explicit.max_premium_distortion_risk ?? 50),
+        max_news_risk: Number(explicit.max_news_risk ?? 18),
+        max_liquidity_spike_risk: Number(explicit.max_liquidity_spike_risk ?? 16),
+        max_premium_distortion_risk: Number(explicit.max_premium_distortion_risk ?? 14),
       };
     }
     if (regime === 'TRENDING') {
-      return { min_ai_edge: 55, min_momentum: 45, min_breakout: 42, max_fake_move_risk: 65, min_rr: 1.05, max_news_risk: 55, max_liquidity_spike_risk: 55, max_premium_distortion_risk: 55 };
+      return { min_ai_edge: 55, min_momentum: 45, min_breakout: 42, max_fake_move_risk: 18, min_rr: 1.05, max_news_risk: 20, max_liquidity_spike_risk: 18, max_premium_distortion_risk: 16 };
     }
     if (regime === 'RANGING') {
-      return { min_ai_edge: 72, min_momentum: 62, min_breakout: 60, max_fake_move_risk: 38, min_rr: 1.25, max_news_risk: 30, max_liquidity_spike_risk: 35, max_premium_distortion_risk: 35 };
+      return { min_ai_edge: 72, min_momentum: 62, min_breakout: 60, max_fake_move_risk: 14, min_rr: 1.25, max_news_risk: 16, max_liquidity_spike_risk: 14, max_premium_distortion_risk: 12 };
     }
     if (regime === 'VOLATILE') {
-      return { min_ai_edge: 68, min_momentum: 58, min_breakout: 58, max_fake_move_risk: 42, min_rr: 1.3, max_news_risk: 32, max_liquidity_spike_risk: 35, max_premium_distortion_risk: 35 };
+      return { min_ai_edge: 68, min_momentum: 58, min_breakout: 58, max_fake_move_risk: 12, min_rr: 1.3, max_news_risk: 14, max_liquidity_spike_risk: 12, max_premium_distortion_risk: 10 };
     }
-    return { min_ai_edge: 60, min_momentum: 50, min_breakout: 45, max_fake_move_risk: 55, min_rr: 1.1, max_news_risk: 45, max_liquidity_spike_risk: 50, max_premium_distortion_risk: 50 };
+    return { min_ai_edge: 60, min_momentum: 50, min_breakout: 45, max_fake_move_risk: 16, min_rr: 1.1, max_news_risk: 18, max_liquidity_spike_risk: 16, max_premium_distortion_risk: 14 };
   };
 
   const enrichSignalWithAiMetrics = (signal) => {
@@ -496,9 +587,10 @@ const AutoTradingDashboard = () => {
       momentum_score: Number.isFinite(existingMomentum) ? existingMomentum : Number(momentumScore.toFixed(2)),
       breakout_score: Number.isFinite(existingBreakout) ? existingBreakout : Number(breakoutScore.toFixed(2)),
       fake_move_risk: Number.isFinite(existingFakeRisk) ? existingFakeRisk : Number(fakeMoveRisk.toFixed(2)),
-      sudden_news_risk: Number.isFinite(Number(signal.sudden_news_risk)) ? Number(signal.sudden_news_risk) : Number(suddenNewsRisk.toFixed(2)),
+      sudden_news_risk: Number.isFinite(Number(signal.sudden_news_risk ?? signal.news_risk)) ? Number(signal.sudden_news_risk ?? signal.news_risk) : Number(suddenNewsRisk.toFixed(2)),
       liquidity_spike_risk: Number.isFinite(Number(signal.liquidity_spike_risk)) ? Number(signal.liquidity_spike_risk) : Number(liquiditySpikeRisk.toFixed(2)),
-      premium_distortion_risk: Number.isFinite(Number(signal.premium_distortion_risk)) ? Number(signal.premium_distortion_risk) : Number(premiumDistortionRisk.toFixed(2)),
+      premium_distortion_risk: Number.isFinite(Number(signal.premium_distortion_risk ?? signal.premium_distortion)) ? Number(signal.premium_distortion_risk ?? signal.premium_distortion) : Number(premiumDistortionRisk.toFixed(2)),
+      timing_risk: signal.timing_risk || timingWindow,
       breakout_hold_confirmed:
         typeof signal.breakout_hold_confirmed === 'boolean'
           ? signal.breakout_hold_confirmed
@@ -542,21 +634,75 @@ const AutoTradingDashboard = () => {
     const stop = Number(normalizedSignal.stop_loss ?? 0);
     const rr = Number(normalizedSignal.rr ?? (entry > 0 ? (Math.abs(target - entry) / Math.max(0.0001, Math.abs(entry - stop))) : 0));
 
+    const qualityScore = Number(normalizedSignal.quality_score ?? normalizedSignal.quality ?? 0);
+    const marketBias = String(normalizedSignal.market_bias || '').toUpperCase();
+    const timingRisk = String(normalizedSignal.timing_risk || normalizedSignal?.timing_risk_profile?.window || '').toUpperCase();
+    const breakoutHold = normalizedSignal.breakout_hold_confirmed;
+    const isStockSignal = normalizedSignal.signal_type === 'stock' || normalizedSignal.is_stock === true;
+
+    // Unified frontend gate policy for BOTH demo and live:
+    // - Index options: quality>=66, conf>=70, ai_edge>=35, rr>=1.30
+    // - Stocks: quality>=61, conf>=65, ai_edge>=30, rr>=1.20
+    // - Risk caps and WEAK_BOTH overrides are identical across modes.
+    const backendBaseline = isStockSignal
+      ? {
+          min_quality: 61,
+          min_confidence: 65,
+          min_ai_edge: 30,
+          min_rr: 1.20,
+          weak_both_quality_override: 90,
+          weak_both_confidence_override: 92,
+          max_fake_move_risk: 16,
+          max_news_risk: 18,
+          max_liquidity_spike_risk: 16,
+          max_premium_distortion_risk: 14,
+        }
+      : {
+          min_quality: 66,
+          min_confidence: 70,
+          min_ai_edge: 35,
+          min_rr: 1.30,
+          weak_both_quality_override: 90,
+          weak_both_confidence_override: 92,
+          max_fake_move_risk: 16,
+          max_news_risk: 18,
+          max_liquidity_spike_risk: 16,
+          max_premium_distortion_risk: 14,
+        };
+
+    // Keep adaptive gates, but never looser than backend baseline.
+    const effectiveMinAiEdge = Math.max(Number(thresholds.min_ai_edge || 0), Number(backendBaseline.min_ai_edge || 0));
+    const effectiveMinRr = Math.max(Number(thresholds.min_rr || 0), Number(backendBaseline.min_rr || 0));
+    const effectiveMaxFakeRisk = Math.min(Number(thresholds.max_fake_move_risk || 100), Number(backendBaseline.max_fake_move_risk || 100));
+    const effectiveMaxNewsRisk = Math.min(Number(thresholds.max_news_risk || 100), Number(backendBaseline.max_news_risk || 100));
+    const effectiveMaxLiquidityRisk = Math.min(Number(thresholds.max_liquidity_spike_risk || 100), Number(backendBaseline.max_liquidity_spike_risk || 100));
+    const effectiveMaxPremiumRisk = Math.min(Number(thresholds.max_premium_distortion_risk || 100), Number(backendBaseline.max_premium_distortion_risk || 100));
+
     const checks = [
       {
         ok: (normalizedSignal.start_trade_allowed !== false)
           && String(normalizedSignal.start_trade_decision || '').toUpperCase() !== 'NO',
         fail: 'Start Trade decision is NO',
       },
-      { ok: aiEdge >= thresholds.min_ai_edge, fail: `AI edge ${aiEdge.toFixed(1)} < ${thresholds.min_ai_edge}` },
+      { ok: qualityScore >= backendBaseline.min_quality, fail: `Quality ${qualityScore.toFixed(1)} < ${backendBaseline.min_quality}` },
+      { ok: confidence >= backendBaseline.min_confidence, fail: `Confidence ${confidence.toFixed(1)} < ${backendBaseline.min_confidence}` },
+      { ok: aiEdge >= effectiveMinAiEdge, fail: `AI edge ${aiEdge.toFixed(1)} < ${effectiveMinAiEdge}` },
       { ok: momentum >= thresholds.min_momentum, fail: `Momentum ${momentum.toFixed(1)} < ${thresholds.min_momentum}` },
       { ok: breakout >= thresholds.min_breakout, fail: `Breakout ${breakout.toFixed(1)} < ${thresholds.min_breakout}` },
-      { ok: fakeRisk <= thresholds.max_fake_move_risk, fail: `Fake risk ${fakeRisk.toFixed(1)} > ${thresholds.max_fake_move_risk}` },
-      { ok: newsRisk <= thresholds.max_news_risk, fail: `News risk ${newsRisk.toFixed(1)} > ${thresholds.max_news_risk}` },
-      { ok: liquidityRisk <= thresholds.max_liquidity_spike_risk, fail: `Liquidity risk ${liquidityRisk.toFixed(1)} > ${thresholds.max_liquidity_spike_risk}` },
-      { ok: premiumRisk <= thresholds.max_premium_distortion_risk, fail: `Premium risk ${premiumRisk.toFixed(1)} > ${thresholds.max_premium_distortion_risk}` },
-      { ok: rr >= thresholds.min_rr, fail: `RR ${rr.toFixed(2)} < ${thresholds.min_rr}` },
-      { ok: confidence >= 70, fail: `Confidence ${confidence.toFixed(1)} < 70` },
+      { ok: fakeRisk <= effectiveMaxFakeRisk, fail: `Fake Move Risk ${fakeRisk.toFixed(1)}% > limit ${effectiveMaxFakeRisk}%` },
+      { ok: newsRisk <= effectiveMaxNewsRisk, fail: `News Risk ${newsRisk.toFixed(1)}% > limit ${effectiveMaxNewsRisk}%` },
+      { ok: liquidityRisk <= effectiveMaxLiquidityRisk, fail: `Liquidity Risk ${liquidityRisk.toFixed(1)}% > limit ${effectiveMaxLiquidityRisk}%` },
+      { ok: premiumRisk <= effectiveMaxPremiumRisk, fail: `Premium Distortion ${premiumRisk.toFixed(1)}% > limit ${effectiveMaxPremiumRisk}%` },
+      { ok: rr >= effectiveMinRr, fail: `RR ${rr.toFixed(2)} < ${effectiveMinRr}` },
+      // Market bias: WEAK_BOTH blocked unless very high override (match backend behavior)
+      {
+        ok: marketBias !== 'WEAK_BOTH' || (qualityScore >= backendBaseline.weak_both_quality_override && confidence >= backendBaseline.weak_both_confidence_override),
+        fail: `Market Bias WEAK_BOTH (needs quality>=${backendBaseline.weak_both_quality_override} and confidence>=${backendBaseline.weak_both_confidence_override})`
+      },
+      // Timing risk HIGH is always blocked
+      { ok: timingRisk !== 'HIGH', fail: 'Timing Risk HIGH — entry blocked' },
+      // Breakout hold must be confirmed (null/undefined = not yet assessed, treated as ok)
+      { ok: breakoutHold !== false, fail: 'Breakout Hold NOT confirmed' },
       { ok: normalizedSignal.trend_confirmed !== false, fail: 'Trend not confirmed' },
       { ok: normalizedSignal.momentum_confirmed !== false, fail: 'Momentum not confirmed' },
       { ok: normalizedSignal.breakout_confirmed !== false, fail: 'Breakout not confirmed' },
@@ -646,7 +792,6 @@ const AutoTradingDashboard = () => {
   
   // Track previous active trades count to detect exits
   const prevActiveTradesCount = React.useRef(0);
-  const didAutoStart = React.useRef(false);
   const executingRef = React.useRef(false);
   const autoBatchExecutingRef = React.useRef(false);
   const activeTradesRef = React.useRef([]);
@@ -682,9 +827,21 @@ const AutoTradingDashboard = () => {
   const [showTradeHistoryTable] = useState(DEFAULT_TABLE_VISIBILITY.showTradeHistoryTable);
   const dataFetchSeqRef = React.useRef(0);
   const dataFetchInFlightRef = React.useRef(false);
+  const slowFetchCacheRef = React.useRef({
+    at: 0,
+    history: { trades: [] },
+    perf: null,
+  });
   const scannerLastRunAtRef = React.useRef(0);
   const scannerSnapshotRef = React.useRef({ at: 0, minQuality: null, trades: [], total: 0 });
   const scannerStabilityRef = React.useRef(new Map());
+  const scannerLogRef = React.useRef({
+    startAt: 0,
+    completeAt: 0,
+    completeSummary: '',
+  });
+  const paperRejectCooldownRef = React.useRef(new Map());
+  const paperCreateInFlightRef = React.useRef(new Set());
 
   useEffect(() => {
     activeTradesRef.current = activeTrades;
@@ -782,13 +939,32 @@ const AutoTradingDashboard = () => {
       try {
         const res = await config.authFetch(PROFESSIONAL_SIGNAL_API);
         if (!res.ok) {
+          if (res.status === 401) {
+            setProfessionalSignal({ error: 'Session expired. Please login again.' });
+            return;
+          }
           // Backend can legitimately return 503 when no live professional setup is available.
           if (res.status === 503) {
             setProfessionalSignal({ error: 'No live option signals available.' });
             return;
           }
         }
-        const data = await res.json();
+        const parseProfessionalJson = async (response) => {
+          try {
+            return await response.json();
+          } catch {
+            // Retry once for intermittent truncated body/decode issues.
+            const retryRes = await config.authFetch(PROFESSIONAL_SIGNAL_API, { cache: 'no-store' });
+            if (!retryRes.ok) return null;
+            return await retryRes.json();
+          }
+        };
+
+        const data = await parseProfessionalJson(res);
+        if (!data) {
+          setProfessionalSignal({ error: 'Professional signal temporarily unavailable.' });
+          return;
+        }
         // Check if API returned an error (detail field indicates error)
         if (data.detail || data.error) {
           console.log('⚠️ Professional signal error:', data.detail || data.error);
@@ -811,6 +987,10 @@ const AutoTradingDashboard = () => {
     const parsedMinQuality = Number(minQuality);
     const safeMinQuality = Number.isFinite(parsedMinQuality) ? parsedMinQuality : Number(scannerMinQuality);
     const nowMs = Date.now();
+
+    if (typeof document !== 'undefined' && document.hidden && !autoTradingActive) {
+      return;
+    }
     const lastSnapshot = scannerSnapshotRef.current;
     
     // Skip cache checks when bypassCache=true (e.g., when auto-trading needs real-time updates)
@@ -844,7 +1024,10 @@ const AutoTradingDashboard = () => {
 
     setScannerLoading(true);
     setScannerLastError(null);
-    console.log(`🔍 Scanning entire market for top-quality trades (${safeMinQuality}%+)...`);
+    if ((nowMs - scannerLogRef.current.startAt) >= 30000) {
+      console.log(`🔍 Scanning entire market for top-quality trades (${safeMinQuality}%+)...`);
+      scannerLogRef.current.startAt = nowMs;
+    }
     
     try {
       // Fetch all signals from market with bounded full-universe first, then safe fallback.
@@ -863,6 +1046,16 @@ const AutoTradingDashboard = () => {
       let allSignals = [];
       let lastError = null;
       let sawHttpError = false;
+      const parseScanJsonWithRetry = async (url, response) => {
+        try {
+          return await response.json();
+        } catch {
+          // Retry once for intermittent truncated body/decode issues.
+          const retryRes = await config.authFetch(url, { cache: 'no-store' });
+          if (!retryRes.ok) return null;
+          return await retryRes.json();
+        }
+      };
       for (const url of requestsToTry) {
         try {
           const res = await config.authFetch(url);
@@ -870,7 +1063,10 @@ const AutoTradingDashboard = () => {
             sawHttpError = true;
             continue;
           }
-          const data = await res.json();
+          const data = await parseScanJsonWithRetry(url, res);
+          if (!data) {
+            continue;
+          }
           const candidateSignals = Array.isArray(data?.signals) ? data.signals : [];
           const isTimeoutCache = String(data?.status || '') === 'timeout_using_cache';
           const requestedBroadUniverse = url.includes('include_fno_universe=true');
@@ -896,7 +1092,14 @@ const AutoTradingDashboard = () => {
           try {
             const res = await fetch(url);
             if (!res.ok) continue;
-            const data = await res.json();
+            let data;
+            try {
+              data = await res.json();
+            } catch {
+              const retryRes = await fetch(url, { cache: 'no-store' });
+              if (!retryRes.ok) continue;
+              data = await retryRes.json();
+            }
             const candidateSignals = Array.isArray(data?.signals) ? data.signals : [];
             if (candidateSignals.length > 0) {
               allSignals = candidateSignals;
@@ -1013,7 +1216,8 @@ const AutoTradingDashboard = () => {
         const key = `${getUnderlyingRoot(signal)}:${signal.option_type || ''}:${signal.action || ''}`;
         const meta = nextStability.get(key);
         const confidence = Number(signal.confirmation_score ?? signal.confidence ?? 0);
-        return Number(signal.quality || 0) >= 85 || confidence >= 75 || (meta?.seenCount || 0) >= 2;
+        const quality = Number(signal.quality || 0);
+        return quality >= 85 && (confidence >= 75 || (meta?.seenCount || 0) >= 2);
       });
 
       // Deterministic ordering avoids tie-based reshuffling on each refresh.
@@ -1126,7 +1330,15 @@ const AutoTradingDashboard = () => {
       });
       const totalTradesToday = tradesToday.length + activeToday.length;
       
-      console.log(`✅ Market Scan Complete: ${qualityOnly.length} quality trades found (${allSignals.length} total signals, threshold ${minQuality}%+)`);
+      const scanSummary = `${qualityOnly.length}|${allSignals.length}|${safeMinQuality}`;
+      const shouldLogComplete =
+        scanSummary !== scannerLogRef.current.completeSummary
+        || (nowMs - scannerLogRef.current.completeAt) >= 60000;
+      if (shouldLogComplete) {
+        console.log(`✅ Market Scan Complete: ${qualityOnly.length} quality trades found (${allSignals.length} total signals, threshold ${safeMinQuality}%+)`);
+        scannerLogRef.current.completeSummary = scanSummary;
+        scannerLogRef.current.completeAt = nowMs;
+      }
       // Enrich signals once and store enriched snapshot to avoid recomputing
       // differences between renders which can flip Start/WAIT rapidly.
       const enrichedQualityOnly = qualityOnly.map((s) => enrichSignalWithAiMetrics(s));
@@ -1160,7 +1372,7 @@ const AutoTradingDashboard = () => {
   // Auto-scan effect: when signals load, run a bypassed scan immediately and then every 5s
   useEffect(() => {
     if (!signalsLoaded) return;
-    if (!autoScanActive && !scannerUserOverride) return;
+    if (!autoScanActive || scannerUserOverride) return;
     if (!isMarketOpen) return; // avoid scanning when market closed
 
     let cancelled = false;
@@ -1218,22 +1430,62 @@ const AutoTradingDashboard = () => {
       }
     };
 
+    const historyUrl = `${PAPER_TRADES_HISTORY_API}?days=7&limit=100`;
+    const perfUrl = `${PAPER_TRADES_PERFORMANCE_API}?days=30`;
+
+    const nowMs = Date.now();
+    const shouldFetchSlowEndpoints = forceRefresh || (nowMs - Number(slowFetchCacheRef.current?.at || 0)) >= 10000;
+
     const [paperActiveRes, liveActiveRes, historyRes, perfRes, statusRes] = await Promise.all([
       safeFetch(PAPER_TRADES_ACTIVE_API),
       safeFetch(AUTO_TRADE_ACTIVE_API),
-      safeFetch(`${PAPER_TRADES_HISTORY_API}?days=7&limit=100`),
-      safeFetch(`${PAPER_TRADES_PERFORMANCE_API}?days=30`),
+      shouldFetchSlowEndpoints ? safeFetch(historyUrl) : Promise.resolve({ ok: false, skipped: true }),
+      shouldFetchSlowEndpoints ? safeFetch(perfUrl) : Promise.resolve({ ok: false, skipped: true }),
       safeFetch(AUTO_TRADE_STATUS_API),
     ]);
 
     const hasAnyFreshResponse = [paperActiveRes, liveActiveRes, historyRes, perfRes, statusRes]
       .some((res) => !!res?.ok);
 
-    const paperActiveData = paperActiveRes?.ok ? await paperActiveRes.json() : { trades: [] };
-    const liveActiveData = liveActiveRes?.ok ? await liveActiveRes.json() : { trades: [] };
-    const historyData = historyRes?.ok ? await historyRes.json() : { trades: [] };
-    const perfData = perfRes?.ok ? await perfRes.json() : null;
-    const statusData = statusRes?.ok ? await statusRes.json() : {};
+    const parseJsonSafe = async (response, fallback, retryUrl = null) => {
+      if (!response?.ok) return fallback;
+      try {
+        return await response.json();
+      } catch (err) {
+        // Retry once on intermittent transport/body truncation in dev.
+        if (retryUrl) {
+          try {
+            const retry = await timeoutPromise(
+              config.authFetch(retryUrl, { cache: 'no-store' }),
+              8000,
+            );
+            if (retry?.ok) {
+              return await retry.json();
+            }
+          } catch {}
+        }
+        console.warn(`⚠️ Response decode failed for ${retryUrl || 'request'}:`, err?.message || err);
+        return fallback;
+      }
+    };
+
+    const paperActiveData = await parseJsonSafe(paperActiveRes, { trades: [] }, PAPER_TRADES_ACTIVE_API);
+    const liveActiveData = await parseJsonSafe(liveActiveRes, { trades: [] }, AUTO_TRADE_ACTIVE_API);
+    const historyData = shouldFetchSlowEndpoints
+      ? await parseJsonSafe(historyRes, { trades: [] }, historyUrl)
+      : (slowFetchCacheRef.current?.history || { trades: [] });
+    const perfData = shouldFetchSlowEndpoints
+      ? await parseJsonSafe(perfRes, null, perfUrl)
+      : (slowFetchCacheRef.current?.perf ?? null);
+    const statusData = await parseJsonSafe(statusRes, {}, AUTO_TRADE_STATUS_API);
+
+    if (shouldFetchSlowEndpoints) {
+      slowFetchCacheRef.current = {
+        at: nowMs,
+        history: historyData || { trades: [] },
+        perf: perfData ?? null,
+      };
+    }
 
     const paperActive = (Array.isArray(paperActiveData.trades) ? paperActiveData.trades : []).map((t) => ({
       ...t,
@@ -1942,11 +2194,20 @@ const AutoTradingDashboard = () => {
     : null;
 
   const compareScannerSignals = (a, b) => {
+    const getRatingTier = (signal) => {
+      const q = Number(signal?.quality ?? signal?.quality_score ?? 0);
+      if (q >= 90) return 2; // EXCELLENT
+      if (q >= 80) return 1; // GOOD
+      return 0; // POOR
+    };
+
     const aStart = getEntryReadiness(enrichSignalWithAiMetrics(a)).pass ? 1 : 0;
     const bStart = getEntryReadiness(enrichSignalWithAiMetrics(b)).pass ? 1 : 0;
     if (bStart !== aStart) return bStart - aStart;
     const qDiff = Number(b?.quality || 0) - Number(a?.quality || 0);
     if (qDiff !== 0) return qDiff;
+    const ratingDiff = getRatingTier(b) - getRatingTier(a);
+    if (ratingDiff !== 0) return ratingDiff;
     const aCapital = resolveSignalCapitalRequired(a, lotMultiplier);
     const bCapital = resolveSignalCapitalRequired(b, lotMultiplier);
     if (Number.isFinite(aCapital) && Number.isFinite(bCapital) && aCapital !== bCapital) {
@@ -1959,11 +2220,20 @@ const AutoTradingDashboard = () => {
     return String(a?.symbol || '').localeCompare(String(b?.symbol || ''));
   };
 
+  const strictDisplayThreshold = Number(scannerMinQuality);
+  const strictDisplayPass = (signal) => Number(signal?.quality ?? signal?.quality_score ?? 0) > strictDisplayThreshold;
+
+  // Show only strict scanner signals above current selected threshold.
+  const displayQualityTrades = qualityTrades.filter((t) => strictDisplayPass(t));
+  // Execution fallback only: allow high-quality >=85 setups when strict bucket is empty.
+  const executionQualityTrades = qualityTrades.filter((t) => Number(t?.quality ?? t?.quality_score ?? 0) >= 85);
+
   // Get best quality trade from market scanner (if available)
-  const sortedQualityTrades = qualityTrades.slice().sort(compareScannerSignals);
+  const sortedQualityTrades = displayQualityTrades.slice().sort(compareScannerSignals);
+  const sortedExecutionQualityTrades = executionQualityTrades.slice().sort(compareScannerSignals);
   const bestQualityTrade = sortedQualityTrades.length > 0 ? sortedQualityTrades[0] : null;
-  const qualityTradesIndices = qualityTrades.filter((t) => getSignalGroup(t) === 'indices').sort(compareScannerSignals);
-  const qualityTradesStocks = qualityTrades.filter((t) => getSignalGroup(t) === 'stocks').sort(compareScannerSignals);
+  const qualityTradesIndices = displayQualityTrades.filter((t) => getSignalGroup(t) === 'indices').sort(compareScannerSignals);
+  const qualityTradesStocks = displayQualityTrades.filter((t) => getSignalGroup(t) === 'stocks').sort(compareScannerSignals);
   const scannerTrades = scannerTab === 'indices'
     ? qualityTradesIndices
     : scannerTab === 'stocks'
@@ -1980,12 +2250,17 @@ const AutoTradingDashboard = () => {
     return (!best || ((curr.confirmation_score ?? curr.confidence) > (best.confirmation_score ?? best.confidence))) ? curr : best;
   }, null);
 
-  // For recommendation panel, use scanner-best signal only.
+  // For recommendation panel, use strict scanner-best signal only.
   const activeSignal = bestQualityTrade || null;
 
-  const currentProfessionalSignal = bestQualityTrade || (professionalSignal && !professionalSignal.error ? professionalSignal : null);
-  const professionalSignalDisplay = enrichSignalWithAiMetrics(currentProfessionalSignal || lastProfessionalVisibleSignal);
-  const activeSignalUi = enrichSignalWithAiMetrics(activeSignal || lastAiRecommendationSignal);
+  const professionalSignalEligible = professionalSignal && !professionalSignal.error && strictDisplayPass(professionalSignal)
+    ? professionalSignal
+    : null;
+  const currentProfessionalSignal = bestQualityTrade || professionalSignalEligible;
+  const lastProfessionalEligible = strictDisplayPass(lastProfessionalVisibleSignal) ? lastProfessionalVisibleSignal : null;
+  const lastRecommendationEligible = strictDisplayPass(lastAiRecommendationSignal) ? lastAiRecommendationSignal : null;
+  const professionalSignalDisplay = enrichSignalWithAiMetrics(currentProfessionalSignal || lastProfessionalEligible);
+  const activeSignalUi = enrichSignalWithAiMetrics(activeSignal || lastRecommendationEligible);
   const professionalReadiness = getEntryReadiness(professionalSignalDisplay);
   const recommendationReadiness = getEntryReadiness(activeSignalUi);
   const canStartTradingNow = recommendationReadiness?.pass === true;
@@ -2089,9 +2364,9 @@ const AutoTradingDashboard = () => {
       detail: isMarketOpen ? 'Open now' : (marketClosedReason || 'Closed')
     },
     {
-      label: 'Auto-Trading Armed',
-      pass: !!autoTradingActive,
-      detail: autoTradingActive ? 'Enabled' : 'Disabled'
+      label: 'Live-Trading Armed',
+      pass: true,
+      detail: autoTradingActive ? 'Live Mode' : 'Demo Mode'
     },
     {
       label: 'AI Entry Gate',
@@ -2107,13 +2382,17 @@ const AutoTradingDashboard = () => {
     },
     {
       label: 'Min Live Balance',
-      pass: effectiveGateBalance >= MIN_LIVE_BALANCE_REQUIRED,
-      detail: `${effectiveGateBalanceLabel} / Min ₹${MIN_LIVE_BALANCE_REQUIRED.toLocaleString()}`
+      pass: !isLiveMode || effectiveGateBalance >= MIN_LIVE_BALANCE_REQUIRED,
+      detail: !isLiveMode
+        ? 'Demo mode - skipped'
+        : `${effectiveGateBalanceLabel} / Min ₹${MIN_LIVE_BALANCE_REQUIRED.toLocaleString()}`
     },
     {
       label: 'Capital Availability',
-      pass: Number.isFinite(displayCapitalRequired) && displayCapitalRequired > 0 && effectiveGateBalance >= displayCapitalRequired,
-      detail: `Need ₹${Math.round(displayCapitalRequired || 0).toLocaleString()} / Avail ${effectiveGateBalanceLabel}`
+      pass: !isLiveMode || (Number.isFinite(displayCapitalRequired) && displayCapitalRequired > 0 && effectiveGateBalance >= displayCapitalRequired),
+      detail: !isLiveMode
+        ? 'Demo mode - skipped'
+        : `Need ₹${Math.round(displayCapitalRequired || 0).toLocaleString()} / Avail ${effectiveGateBalanceLabel}`
     },
     {
       label: 'Risk Pause',
@@ -2264,7 +2543,6 @@ const AutoTradingDashboard = () => {
   // Stop refreshing once a trade is active to avoid constant rescanning
   const scannerPrevShouldRunRef = React.useRef(null);
   const scannerIntervalRef = React.useRef(null);
-
   useEffect(() => {
     // Compute whether any active trade is currently open (derived from array contents)
     const hasActiveTrade = activeTrades.some((t) => {
@@ -2272,9 +2550,10 @@ const AutoTradingDashboard = () => {
       return status === 'OPEN' || (status !== 'CLOSED' && status !== 'CANCELLED' && status !== 'SL_HIT');
     });
 
-    // Keep scanning while UI shows WAIT. Stop scanning once `Start Trade` becomes YES
-    const startTradeYes = !!(recommendationReadiness && recommendationReadiness.pass === true);
-    const shouldRunScanner = isMarketOpen && (autoTradingActive || scannerUserOverride) && !hasActiveTrade && !startTradeYes;
+    const isActuallyExecuting = executingRef.current || autoBatchExecutingRef.current || executing;
+    // Always scan during market hours when no active trade.
+    // Pause only while execution is actively in progress to avoid starving scanner on backend rejects.
+    const shouldRunScanner = isMarketOpen && !hasActiveTrade && !isActuallyExecuting && !scannerUserOverride;
 
     // Only act when desired run-state changes to avoid churn from frequent state updates
     if (scannerPrevShouldRunRef.current === shouldRunScanner) {
@@ -2289,20 +2568,23 @@ const AutoTradingDashboard = () => {
         scannerIntervalRef.current = null;
       }
       setAutoScanActive(false);
-      if (startTradeYes) {
-        console.log('⏹️ Stopped market scanner (Start Trade = YES)');
-      } else {
-        console.log('⏹️ Stopped market scanner (trade active, market closed or user stopped)');
-      }
+      const _stopReason = hasActiveTrade
+        ? 'active trade open'
+        : !isMarketOpen
+          ? 'market closed'
+          : isActuallyExecuting
+            ? 'order execution in progress'
+            : 'not needed';
+      console.log(`⏹️ Stopped market scanner (${_stopReason})`);
       return;
     }
 
     // Start scanner
     setAutoScanActive(true);
-    console.log('🔄 Starting continuous market scanner (auto-refresh every 1 second with fresh data)...');
+    console.log('🔄 Starting continuous market scanner (auto-refresh every 3 seconds with fresh data)...');
     scannerIntervalRef.current = setInterval(() => {
       scanMarketForQualityTrades(scannerMinQuality, true).catch(() => {});
-    }, 1000);
+    }, SCANNER_LOOP_INTERVAL_MS);
 
     return () => {
       if (scannerIntervalRef.current) {
@@ -2313,7 +2595,7 @@ const AutoTradingDashboard = () => {
       scannerPrevShouldRunRef.current = null;
       console.log('⏹️ Stopped market scanner (cleanup)');
     };
-  }, [isMarketOpen, autoTradingActive, activeTrades.length, scannerMinQuality, scannerUserOverride, recommendationReadiness]);
+  }, [isMarketOpen, activeTrades.length, scannerMinQuality, executing, scannerUserOverride]);
 
   // Auto-start rule:
   // - Start Trade YES + auto-trading enabled => execute eligible LIVE candidates.
@@ -2323,8 +2605,8 @@ const AutoTradingDashboard = () => {
     if (!isMarketOpen) return;
     if (autoBatchExecutingRef.current) return;
 
-    const sourceSignals = qualityTrades.length > 0
-      ? qualityTrades
+    const sourceSignals = executionQualityTrades.length > 0
+      ? executionQualityTrades
       : (activeSignal ? [activeSignal] : []);
     if (!sourceSignals.length) return;
 
@@ -2369,6 +2651,8 @@ const AutoTradingDashboard = () => {
 
     // Exclude candidates that share root with an already-open trade, and dedupe by root.
     const openRoots = new Set((activeTrades || []).map((t) => symbolRoot(t?.symbol)));
+    const selectionBalance = Number(liveAccountBalance);
+    const hasSelectionBalance = Number.isFinite(selectionBalance) && selectionBalance > 0;
     const chosen = [];
     const seenRoots = new Set();
     for (const c of executableCandidates) {
@@ -2376,6 +2660,15 @@ const AutoTradingDashboard = () => {
       if (!root) continue;
       if (openRoots.has(root)) continue; // avoid retrying same root while open
       if (seenRoots.has(root)) continue; // don't start two trades on same root in same batch
+
+      // In LIVE mode, skip symbols that cannot fit at minimum lot/multiplier.
+      if (isLiveMode && hasSelectionBalance) {
+        const minRequired = estimateSignalCapitalRequired(c, 1);
+        if (Number.isFinite(minRequired) && minRequired > selectionBalance) {
+          continue;
+        }
+      }
+
       seenRoots.add(root);
       chosen.push(c);
       if (chosen.length >= availableSlots) break;
@@ -2443,7 +2736,16 @@ const AutoTradingDashboard = () => {
 
     const readiness = getEntryReadiness(normalizedSignal);
     if (!readiness.pass) {
-      console.log(`⏸️ Live entry blocked: Start Trade WAIT (${readiness.reasons.join(' | ')})`);
+      const blockText = `Live entry blocked: Start Trade WAIT (${readiness.reasons.join(' | ')})`;
+      console.log(`⏸️ ${blockText}`);
+      pushEntryBlockEvent({
+        symbol: normalizedSignal?.symbol,
+        action: normalizedSignal?.action,
+        mode: 'LIVE',
+        message: blockText,
+        reasons: readiness.reasons,
+        source: 'client-gate',
+      });
       return;
     }
 
@@ -2487,14 +2789,15 @@ const AutoTradingDashboard = () => {
     const mode = isLiveMode ? 'LIVE' : 'DEMO';
     console.log(`🚀 AUTO-EXECUTING ${mode} TRADE: ${normalizedSignal.symbol} ${normalizedSignal.action} at ₹${normalizedSignal.entry_price}`);
     
-    // Adjust quantity based on capital required: boost for inexpensive signals
+    // Adjust quantity based on capital required: boost for inexpensive signals in DEMO only.
+    // In LIVE mode, keep base qty to avoid inflating risk/capital and triggering server capital shield rejects.
     const capReqExec = Number(normalizedSignal.capital_required ?? resolveSignalCapitalRequired(normalizedSignal, lotMultiplier));
     let execQtyBoost = 1;
-    if (Number.isFinite(capReqExec)) {
+    if (!isLiveMode && Number.isFinite(capReqExec)) {
       if (capReqExec <= 3000) execQtyBoost = 3;
       else if (capReqExec <= 5000) execQtyBoost = 2;
     }
-    const adjustedQuantity = Math.max(1, Number(normalizedSignal.quantity || 1) * Number(lotMultiplier) * execQtyBoost);
+    let adjustedQuantity = Math.max(1, Number(normalizedSignal.quantity || 1) * Number(lotMultiplier) * execQtyBoost);
     
     try {
       let effectiveBalance = 0;
@@ -2527,13 +2830,23 @@ const AutoTradingDashboard = () => {
       if (isLiveMode) {
         const estimatedRequired = estimateSignalCapitalRequired(normalizedSignal, lotMultiplier);
         if (Number.isFinite(estimatedRequired) && estimatedRequired > effectiveBalance) {
-          const msg = `Insufficient live balance: required ₹${estimatedRequired.toFixed(2)}, available ₹${Number(effectiveBalance).toFixed(2)}`;
-          if (manualStart) {
-            alert(msg);
+          const minUnitRequired = estimateSignalCapitalRequired(normalizedSignal, 1);
+          if (Number.isFinite(minUnitRequired) && minUnitRequired > 0 && effectiveBalance >= minUnitRequired) {
+            const affordableMultiplier = Math.max(1, Math.floor(effectiveBalance / minUnitRequired));
+            adjustedQuantity = Math.max(1, Number(normalizedSignal.quantity || 1) * affordableMultiplier);
+            console.log(`⚙️ Live qty auto-scaled to fit balance: qty=${adjustedQuantity} (multiplier=${affordableMultiplier})`);
           } else {
-            console.log(`⏸️ ${msg}`);
+            const balanceValue = Number(effectiveBalance);
+            const deficit = Math.max(0, estimatedRequired - balanceValue);
+            const coveragePct = estimatedRequired > 0 ? (balanceValue / estimatedRequired) * 100 : 0;
+            const msg = `Insufficient live balance: required ₹${estimatedRequired.toFixed(2)}, available ₹${balanceValue.toFixed(2)}, short ₹${deficit.toFixed(2)} (${coveragePct.toFixed(1)}% covered)`;
+            if (manualStart) {
+              alert(msg);
+            } else {
+              console.log(`⏸️ ${msg}`);
+            }
+            return;
           }
-          return;
         }
       }
 
@@ -2546,9 +2859,27 @@ const AutoTradingDashboard = () => {
         side: normalizedSignal.action,
         quality_score: tradeQuality.quality,  // Send frontend-calculated quality instead of signal's original value
         confirmation_score: normalizedSignal.confirmation_score ?? normalizedSignal.confidence,
+        ai_edge_score: normalizedSignal.ai_edge_score,
+        momentum_score: normalizedSignal.momentum_score,
+        breakout_score: normalizedSignal.breakout_score,
         option_type: normalizedSignal.option_type,
         trend_direction: normalizedSignal.trend_direction,
         trend_strength: normalizedSignal.trend_strength,
+        breakout_confirmed: normalizedSignal.breakout_confirmed,
+        momentum_confirmed: normalizedSignal.momentum_confirmed,
+        breakout_hold_confirmed: normalizedSignal.breakout_hold_confirmed,
+        timing_risk: normalizedSignal.timing_risk || normalizedSignal?.timing_risk_profile?.window,
+        sudden_news_risk: normalizedSignal.sudden_news_risk ?? normalizedSignal.news_risk,
+        news_risk: normalizedSignal.sudden_news_risk ?? normalizedSignal.news_risk,
+        liquidity_spike_risk: normalizedSignal.liquidity_spike_risk,
+        premium_distortion_risk: normalizedSignal.premium_distortion_risk ?? normalizedSignal.premium_distortion,
+        premium_distortion: normalizedSignal.premium_distortion_risk ?? normalizedSignal.premium_distortion,
+        close_back_in_range: normalizedSignal.close_back_in_range,
+        fake_breakout_by_candle: normalizedSignal.fake_breakout_by_candle,
+        start_trade_allowed: normalizedSignal.start_trade_allowed,
+        start_trade_decision: normalizedSignal.start_trade_decision,
+        market_bias: normalizedSignal.market_bias,
+        market_regime: normalizedSignal.market_regime,
         expiry: normalizedSignal.expiry_date,
         force_demo: !isLiveMode,
         broker_id: isLiveMode && Number.isFinite(effectiveBrokerId) && effectiveBrokerId > 0 ? effectiveBrokerId : 1,
@@ -2593,11 +2924,25 @@ const AutoTradingDashboard = () => {
                 at: new Date().toISOString(),
                 symbol: normalizedSignal.symbol,
                 action: normalizedSignal.action,
+                mode,
                 message: aiGateMsg || 'Rejected by AI quality gate',
                 reasons: aiGateReasons,
               };
               setAiGateRejections((prev) => [event, ...prev].slice(0, 8));
             }
+
+            const detailReasons = Array.isArray(errData?.detail?.reasons)
+              ? errData.detail.reasons
+              : (typeof errData?.detail === 'string' ? [errData.detail] : []);
+            const liveRejectMsg = `Live trade rejected: ${errData?.message || errData?.detail?.message || 'Execution blocked'}`;
+            pushEntryBlockEvent({
+              symbol: normalizedSignal?.symbol,
+              action: normalizedSignal?.action,
+              mode,
+              message: liveRejectMsg,
+              reasons: detailReasons,
+              source: 'server-reject',
+            });
             
             // Check if it's a cooldown/consecutive loss error (temporary - don't stop auto-trading)
             const detailLower = detailText.toLowerCase();
@@ -2788,7 +3133,16 @@ const AutoTradingDashboard = () => {
     }
     const readiness = getEntryReadiness(normalizedSignal);
     if (!readiness.pass && !allowWhenWait) {
-      console.log(`⏸️ Paper entry blocked: Start Trade WAIT (${readiness.reasons.join(' | ')})`);
+      const blockText = `Paper entry blocked: Start Trade WAIT (${readiness.reasons.join(' | ')})`;
+      console.log(`⏸️ ${blockText}`);
+      pushEntryBlockEvent({
+        symbol: normalizedSignal?.symbol,
+        action: normalizedSignal?.action,
+        mode: 'DEMO',
+        message: blockText,
+        reasons: readiness.reasons,
+        source: 'client-gate',
+      });
       return;
     }
     if (!readiness.pass && allowWhenWait) {
@@ -2808,8 +3162,15 @@ const AutoTradingDashboard = () => {
     }
     
     const paperSignalKey = `${normalizedSignal.symbol}:${normalizedSignal.entry_price}:${normalizedSignal.target}:${normalizedSignal.stop_loss}`;
+    const paperRootKey = `${getUnderlyingRoot(normalizedSignal)}:${String(normalizedSignal.action || 'BUY').toUpperCase()}`;
     const now = Date.now();
+    if (paperCreateInFlightRef.current.has(paperSignalKey)) {
+      console.log(`⏸️ Paper entry skipped: request already in-flight for ${paperSignalKey}`);
+      return;
+    }
     if (lastPaperSignalSymbol === paperSignalKey && (now - lastPaperSignalAt) < 60000) return;
+    const recentReject = paperRejectCooldownRef.current.get(paperRootKey);
+    if (recentReject && (now - recentReject.at) < PAPER_REJECTION_COOLDOWN_MS) return;
 
     if (isLossLimitHit() && autoTradingActive) {
       console.log('🛑 Daily loss limit hit - paper trading paused');
@@ -2848,10 +3209,11 @@ const AutoTradingDashboard = () => {
       target: normalizedSignal.target,
       strategy: normalizedSignal.strategy || 'ATM Option',
       signal_data: normalizedSignal,
-      // Allow paper/demo trades to be created even when server-side confirmation is strict
-      bypass_confirmation: true,
+      // Keep server confirmation guard active in demo to avoid low-stability entries.
+      bypass_confirmation: false,
     };
 
+    paperCreateInFlightRef.current.add(paperSignalKey);
     try {
       const res = await config.authFetch(PAPER_TRADES_CREATE_API, {
         method: 'POST',
@@ -2861,6 +3223,7 @@ const AutoTradingDashboard = () => {
         const data = await res.json();
         if (data?.success === true) {
           console.log(`✅ Paper trade created: ${normalizedSignal.symbol}`);
+          paperRejectCooldownRef.current.delete(paperRootKey);
           setLastPaperSignalSymbol(paperSignalKey);
           setLastPaperSignalAt(Date.now());
           // Refresh active trades immediately with force flag to ensure UI update
@@ -2875,6 +3238,31 @@ const AutoTradingDashboard = () => {
             console.warn('⚠️ Post-create scanner failed:', e?.message || e);
           }
         } else if (data?.success === false) {
+          paperRejectCooldownRef.current.set(paperRootKey, {
+            at: Date.now(),
+            reason: String(data?.message || data?.quality_gate_reason || 'rejected'),
+          });
+          const demoGateMsg = data?.message || '';
+          const demoGateReason = data?.quality_gate_reason || '';
+          if (String(demoGateMsg).toLowerCase().includes('quality gate') || String(demoGateReason).length > 0) {
+            const event = {
+              at: new Date().toISOString(),
+              symbol: normalizedSignal.symbol,
+              action: normalizedSignal.action,
+              mode: 'DEMO',
+              message: demoGateMsg || 'Rejected by quality gate',
+              reasons: demoGateReason ? [String(demoGateReason)] : [],
+            };
+            setAiGateRejections((prev) => [event, ...prev].slice(0, 8));
+          }
+          pushEntryBlockEvent({
+            symbol: normalizedSignal?.symbol,
+            action: normalizedSignal?.action,
+            mode: 'DEMO',
+            message: `Paper trade rejected: ${data?.message || 'Must close active trade first'}`,
+            reasons: demoGateReason ? [String(demoGateReason)] : [],
+            source: 'server-reject',
+          });
           console.log(`⏸️ Paper trade rejected: ${data.message || 'Must close active trade first'}`);
         }
       } else {
@@ -2882,6 +3270,8 @@ const AutoTradingDashboard = () => {
       }
     } catch (e) {
       console.error('Paper trade creation error:', e);
+    } finally {
+      paperCreateInFlightRef.current.delete(paperSignalKey);
     }
   };
 
@@ -3006,9 +3396,8 @@ const AutoTradingDashboard = () => {
       document.removeEventListener('visibilitychange', handleVisibilityRefresh);
       clearInterval(wakeLockStatusInterval);
       releaseWakeLock();
-      stopKeepAliveHeartbeat();
     };
-  }, [enabled]); // Only re-run when component is enabled, not on every trade change
+  }, []); // Run once on mount to avoid wake-lock release/reacquire churn during mode toggles
 
   useEffect(() => {
     if (!isLiveMode) return undefined;
@@ -3032,15 +3421,9 @@ const AutoTradingDashboard = () => {
     };
   }, [isLiveMode, activeBrokerId]);
 
-  // Default: auto-trading OFF on load (paper trades only until user clicks Start)
+  // Default: keep auto-trading off on load, but do not disarm backend live state.
   useEffect(() => {
-    if (didAutoStart.current) return;
-    didAutoStart.current = true;
     setAutoTradingActive(false);
-    setIsLiveMode(false);
-    void armLiveTrading(false, true).catch((e) => {
-      console.warn('⚠️ Startup disarm failed:', e?.message || e);
-    });
   }, []);
 
   // Refresh once whenever wake lock state changes.
@@ -3457,26 +3840,28 @@ const AutoTradingDashboard = () => {
           </div>
           <button
             onClick={() => {
-              // Toggle user-requested continuous scanning. If enabling, perform an immediate fresh scan.
-              if (scannerUserOverride || autoScanActive) {
-                setScannerUserOverride(false);
-              } else {
-                setScannerUserOverride(true);
-                scanMarketForQualityTrades(scannerMinQuality, true).catch(() => {});
-              }
+              // Toggle scanner pause/resume explicitly.
+              setScannerUserOverride((prev) => {
+                const next = !prev;
+                if (!next) {
+                  // Resuming: trigger an immediate fresh scan.
+                  scanMarketForQualityTrades(scannerMinQuality, true).catch(() => {});
+                }
+                return next;
+              });
             }}
-            disabled={scannerLoading && !(scannerUserOverride || autoScanActive)}
+            disabled={scannerLoading}
             style={{
               padding: '10px 20px',
-              background: (scannerLoading || autoScanActive) ? '#cbd5e0' : '#f59e0b',
+              background: scannerLoading ? '#cbd5e0' : (scannerUserOverride ? '#64748b' : '#f59e0b'),
               color: 'white',
               border: 'none',
               borderRadius: '6px',
               fontSize: '14px',
               fontWeight: '600',
-              cursor: (scannerLoading || autoScanActive) ? 'wait' : 'pointer'
+              cursor: scannerLoading ? 'wait' : 'pointer'
             }}>
-            {(autoScanActive || scannerUserOverride) ? '⏹️ Auto-Scanning' : (scannerLoading ? '🔄 Scanning...' : '🔄 Refresh')}
+            {scannerLoading ? '🔄 Scanning...' : (scannerUserOverride ? '▶️ Resume Scanner' : '⏸️ Pause Scanner')}
           </button>
         </div>
 
@@ -3508,7 +3893,7 @@ const AutoTradingDashboard = () => {
             </button>
           ))}
           {[
-            { key: 'all', label: `All (${qualityTrades.length})` },
+            { key: 'all', label: `All (${displayQualityTrades.length})` },
             { key: 'indices', label: `Indices (${qualityTradesIndices.length})` },
             { key: 'stocks', label: `Stocks (${qualityTradesStocks.length})` },
           ].map((tab) => (
@@ -3531,7 +3916,7 @@ const AutoTradingDashboard = () => {
           ))}
         </div>
 
-        {qualityTrades.length > 0 ? (
+        {scannerTradesSorted.length > 0 ? (
           <div style={{ overflowX: 'auto' }}>
             <table style={{
               width: '100%',
@@ -3622,9 +4007,9 @@ const AutoTradingDashboard = () => {
             padding: '20px'
           }}>
             {autoScanActive ? (
-              <p style={{ margin: '10px 0' }}>🔄 <strong>Auto-scanning every 1 second...</strong> Searching for {scannerMinQuality}%+ quality signals.</p>
+              <p style={{ margin: '10px 0' }}>🔄 <strong>Auto-scanning...</strong> Searching for top-tier signals (&gt;90% quality).</p>
             ) : scannerLoading ? (
-              <p style={{ margin: '10px 0' }}>🔄 Scanning all markets for {scannerMinQuality}%+ quality signals...</p>
+              <p style={{ margin: '10px 0' }}>🔄 Scanning all markets for top-tier signals (&gt;90% quality)...</p>
             ) : scannerLastError ? (
               <div>
                 <p style={{ margin: '10px 0', fontWeight: '600' }}>⚠️ Scanner temporarily unavailable</p>
@@ -3632,10 +4017,13 @@ const AutoTradingDashboard = () => {
                   {scannerLastError}. Keeping last visible results if available.
                 </p>
               </div>
-            ) : qualityTrades.length === 0 && totalSignalsScanned > 0 ? (
+            ) : displayQualityTrades.length === 0 && totalSignalsScanned > 0 ? (
               <div>
-                <p style={{ margin: '10px 0', fontWeight: '600' }}>📊 No signals found with {scannerMinQuality}%+ quality</p>
-                <p style={{ margin: '5px 0', fontSize: '12px', color: '#92400e', opacity: 0.8 }}>Scanned {totalSignalsScanned} signals • Try lowering to 80% or 70% for more setups</p>
+                <p style={{ margin: '10px 0', fontWeight: '600' }}>📊 No signals found above {strictDisplayThreshold}% quality</p>
+                <p style={{ margin: '5px 0', fontSize: '12px', color: '#92400e', opacity: 0.8 }}>
+                  Scanned {totalSignalsScanned} signals • Cards/table follow strict view (&gt;{strictDisplayThreshold}%).
+                  {executionQualityTrades.length > 0 ? ` Auto-entry fallback candidates (≥85%): ${sortedExecutionQualityTrades.length}.` : ''}
+                </p>
               </div>
             ) : (
               <p style={{ margin: '10px 0' }}>📊 No signals available yet. Click Refresh to scan the market.</p>
@@ -4268,46 +4656,94 @@ const AutoTradingDashboard = () => {
         </div>
       )}
 
-      {/* Active Trades */}
-      {aiGateRejections.length > 0 && (
-        <div style={{
-          marginBottom: '18px',
-          padding: '12px',
-          background: '#fff7ed',
-          border: '1px solid #fdba74',
-          borderRadius: '8px'
-        }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', gap: '8px', flexWrap: 'wrap' }}>
-            <h4 style={{ margin: 0, color: '#9a3412', fontSize: '14px', fontWeight: '700' }}>
-              🤖 AI Gate Rejections (Server)
-            </h4>
-            <button
-              onClick={() => setAiGateRejections([])}
-              style={{
-                border: '1px solid #fdba74',
-                background: '#ffedd5',
-                color: '#9a3412',
-                borderRadius: '6px',
-                padding: '4px 8px',
-                cursor: 'pointer',
-                fontSize: '11px',
-                fontWeight: '700'
-              }}
-            >
-              Clear
-            </button>
+      {/* Scan & Trade Status Banner */}
+      {(() => {
+        const _hasOpenTrade = (activeTrades || []).some((t) => String(t?.status || '').toUpperCase() === 'OPEN');
+        const _entryBlockers = recommendationReadiness?.reasons || [];
+        const _signalsAvailable = (qualityTrades || []).length > 0 || !!activeSignalUi?.symbol;
+        if (_hasOpenTrade) return null;
+        if (!isMarketOpen) return (
+          <div style={{ marginBottom: '14px', padding: '10px 14px', background: '#f1f5f9', border: '1px solid #cbd5e1', borderRadius: '8px', fontSize: '12px', color: '#475569' }}>
+            <strong>⏸️ Market Closed</strong> — Scanner paused until next trading session.
           </div>
-          <div style={{ display: 'grid', gap: '6px' }}>
-            {aiGateRejections.map((item, idx) => (
-              <div key={`${item.at}-${item.symbol}-${idx}`} style={{ fontSize: '12px', color: '#7c2d12', background: '#fffaf0', border: '1px solid #fed7aa', borderRadius: '6px', padding: '8px' }}>
-                <strong>{item.symbol}</strong> {item.action ? `(${item.action})` : ''} | {formatTimeIST(item.at)}<br />
-                {item.message}
-                {Array.isArray(item.reasons) && item.reasons.length > 0 ? ` | ${item.reasons.join(', ')}` : ''}
-              </div>
+        );
+        if (!_signalsAvailable && !scannerLoading) return (
+          <div style={{ marginBottom: '14px', padding: '10px 14px', background: '#fefce8', border: '1px solid #fde047', borderRadius: '8px', fontSize: '12px', color: '#713f12' }}>
+            <strong>🔍 Scanner Active ({scannerMinQuality}%+):</strong> No quality signals found yet.{' '}
+            {autoScanActive ? 'Scanning continuously...' : 'Click Refresh to scan.'}
+          </div>
+        );
+        if (_signalsAvailable && !autoTradingActive) return (
+          <div style={{ marginBottom: '14px', padding: '10px 14px', background: '#eff6ff', border: '1px solid #93c5fd', borderRadius: '8px', fontSize: '12px', color: '#1e3a8a' }}>
+            <strong>📡 {(qualityTrades || []).length || 1} signal{((qualityTrades || []).length || 1) !== 1 ? 's' : ''} ready</strong>{' '}—{' '}
+            Auto-trading is <strong>OFF</strong>. Use <em>▶️ Start/Enable Live Trade</em> or enable demo auto-trading to execute.
+          </div>
+        );
+        if (_signalsAvailable && _entryBlockers.length > 0) return (
+          <div style={{ marginBottom: '14px', padding: '10px 14px', background: '#fff7ed', border: '1px solid #fb923c', borderRadius: '8px', fontSize: '12px' }}>
+            <div style={{ fontWeight: '700', color: '#9a3412', marginBottom: '4px' }}>
+              ⛔ Entry Blocked — {(qualityTrades || []).length || 1} signal{((qualityTrades || []).length || 1) !== 1 ? 's' : ''} found but gate failed:
+            </div>
+            {_entryBlockers.slice(0, 5).map((r, i) => (
+              <div key={i} style={{ color: '#7c2d12', paddingLeft: '8px' }}>• {r}</div>
             ))}
           </div>
-        </div>
-      )}
+        );
+        return null;
+      })()}
+
+      {(() => {
+        const mergedBlockers = [
+          ...(entryBlockEvents || []).map((item) => ({ ...item, sourceLabel: 'Client Gate' })),
+          ...(aiGateRejections || []).map((item) => ({ ...item, sourceLabel: 'Server Gate' })),
+        ]
+          .sort((a, b) => new Date(b?.at || 0).getTime() - new Date(a?.at || 0).getTime())
+          .slice(0, 14);
+
+        if (mergedBlockers.length === 0) return null;
+
+        return (
+          <div style={{
+            marginBottom: '18px',
+            padding: '12px',
+            background: '#fff7ed',
+            border: '1px solid #fdba74',
+            borderRadius: '8px'
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', gap: '8px', flexWrap: 'wrap' }}>
+              <h4 style={{ margin: 0, color: '#9a3412', fontSize: '14px', fontWeight: '700' }}>
+                ⛔ Execution Blockers (Live + Demo)
+              </h4>
+              <button
+                onClick={() => { setEntryBlockEvents([]); setAiGateRejections([]); }}
+                style={{
+                  border: '1px solid #fdba74',
+                  background: '#ffedd5',
+                  color: '#9a3412',
+                  borderRadius: '6px',
+                  padding: '4px 8px',
+                  cursor: 'pointer',
+                  fontSize: '11px',
+                  fontWeight: '700'
+                }}
+              >
+                Clear
+              </button>
+            </div>
+            <div style={{ display: 'grid', gap: '6px' }}>
+              {mergedBlockers.map((item, idx) => (
+                <div key={`${item.at}-${item.symbol}-${item.sourceLabel || 'gate'}-${idx}`} style={{ fontSize: '12px', color: '#7c2d12', background: '#fffaf0', border: '1px solid #fed7aa', borderRadius: '6px', padding: '8px' }}>
+                  <strong>{item.symbol}</strong> {item.action ? `(${item.action})` : ''} {item.mode ? `[${item.mode}]` : ''} | {formatTimeIST(item.at)} | {item.sourceLabel || 'Gate'}<br />
+                  {item.message}
+                  {Array.isArray(item.reasons) && item.reasons.length > 0 ? ` | ${item.reasons.join(' | ')}` : ''}
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Active Trades */}
 
       {showActiveTradesTable && (
         <div style={{ marginBottom: '24px' }}>
@@ -4649,7 +5085,7 @@ const AutoTradingDashboard = () => {
                   const inferredExit = inferExitPrice(trade);
                   const exit = inferredExit != null ? Number(inferredExit) : null;
                   const pnl = Number(trade.profit_loss ?? trade.pnl ?? 0);
-                  const pnlPct = Number(trade.profit_percentage ?? trade.pnl_percent ?? 0);
+                  const pnlPct = Number(trade.pnl_percentage ?? trade.profit_percentage ?? trade.pnl_percent ?? 0);
                   const action = trade.action || trade.side || 'BUY';
                   const tradeMode = String(
                     trade?.trade_mode
@@ -4657,6 +5093,7 @@ const AutoTradingDashboard = () => {
                     || trade?.mode
                     || (trade?.broker_order_id ? 'LIVE' : 'DEMO')
                   ).toUpperCase();
+                  const statusPalette = getTradeStatusPalette(trade.status);
                   return (
                     <tr key={getHistoryDisplayKey(trade, idx)} style={{ borderBottom: '1px solid #e2e8f0' }}>
                       <td style={{ padding: '10px' }}>#{idx + 1}</td>
@@ -4707,12 +5144,12 @@ const AutoTradingDashboard = () => {
                         <span style={{
                           padding: '2px 6px',
                           borderRadius: '3px',
-                          background: trade.status === 'CLOSED' ? '#bee3f8' : '#feebc8',
-                          color: trade.status === 'CLOSED' ? '#2c5282' : '#7c2d12',
+                          background: statusPalette.background,
+                          color: statusPalette.color,
                           fontSize: '11px',
                           fontWeight: 'bold'
                         }}>
-                          {trade.status || 'CLOSED'}
+                          {statusPalette.label}
                         </span>
                       </td>
                       <td style={{ padding: '10px', fontSize: '11px', color: '#718096' }}>
@@ -4901,7 +5338,7 @@ const AutoTradingDashboard = () => {
                     const inferredExit = inferExitPrice(trade);
                     const exit = inferredExit != null ? Number(inferredExit) : null;
                     const pnl = Number(trade.profit_loss ?? trade.pnl ?? 0);
-                    const pnlPct = Number(trade.profit_percentage ?? trade.pnl_percent ?? 0);
+                    const pnlPct = Number(trade.pnl_percentage ?? trade.profit_percentage ?? trade.pnl_percent ?? 0);
                     const action = trade.action || trade.side || 'BUY';
                     const tradeMode = String(
                       trade?.trade_mode
@@ -4909,6 +5346,7 @@ const AutoTradingDashboard = () => {
                       || trade?.mode
                       || (trade?.broker_order_id ? 'LIVE' : 'DEMO')
                     ).toUpperCase();
+                    const statusPalette = getTradeStatusPalette(trade.status);
                     return (
                       <tr key={idx} style={{ borderBottom: '1px solid #e2e8f0' }}>
                         <td style={{ padding: '10px' }}>#{trade.id}</td>
@@ -4959,12 +5397,12 @@ const AutoTradingDashboard = () => {
                           <span style={{
                             padding: '2px 6px',
                             borderRadius: '3px',
-                            background: trade.status === 'CLOSED' ? '#bee3f8' : '#feebc8',
-                            color: trade.status === 'CLOSED' ? '#2c5282' : '#7c2d12',
+                            background: statusPalette.background,
+                            color: statusPalette.color,
                             fontSize: '11px',
                             fontWeight: 'bold'
                           }}>
-                            {trade.status || 'CLOSED'}
+                            {statusPalette.label}
                           </span>
                         </td>
                         <td style={{ padding: '10px', fontSize: '11px', color: '#718096' }}>

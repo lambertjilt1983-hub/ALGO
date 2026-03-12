@@ -99,3 +99,78 @@ def test_trade_history_returns_closed_rows_after_price_exit():
     finally:
         ats.active_trades.clear()
         ats.history.clear()
+
+
+def test_trade_history_marks_profit_pullback_as_profit_trail():
+    ats.active_trades.clear()
+    ats.history.clear()
+    try:
+        trade = _open_trade(31, "NIFTYTESTPE", price=100.0, current_price=130.0)
+        trade["stop_loss"] = 96.0
+        ats.active_trades.append(trade)
+
+        close_res = asyncio.run(ats.update_trade_price(symbol="NIFTYTESTPE", price=129.0))
+        assert close_res["closed"] == 1
+
+        hist = asyncio.run(ats.get_trade_history(limit=50))
+        assert hist["trades"][0]["status"] == "PROFIT_TRAIL"
+        assert hist["trades"][0]["pnl"] > 0
+    finally:
+        ats.active_trades.clear()
+        ats.history.clear()
+        ats.state["recent_exit_contexts"] = {}
+
+
+def test_same_move_reentry_requires_stronger_signal():
+    ats.state["recent_exit_contexts"] = {}
+    try:
+        ats._record_recent_exit_context({
+            "symbol": "NIFTYTESTPE",
+            "side": "BUY",
+            "status": "PROFIT_TRAIL",
+            "quality_score": 82,
+            "ai_edge_score": 52,
+            "momentum_score": 61,
+            "breakout_score": 63,
+            "start_trade_allowed": True,
+            "breakout_confirmed": True,
+            "momentum_confirmed": True,
+            "breakout_hold_confirmed": True,
+        })
+
+        blocked, detail = ats._same_move_reentry_info({
+            "symbol": "NIFTYTESTPE",
+            "side": "BUY",
+            "quality_score": 83,
+            "ai_edge_score": 53,
+            "momentum_score": 62,
+            "breakout_score": 64,
+            "start_trade_allowed": True,
+            "breakout_confirmed": True,
+            "momentum_confirmed": True,
+            "breakout_hold_confirmed": True,
+            "close_back_in_range": False,
+            "fake_breakout_by_candle": False,
+        })
+        assert blocked is True
+        assert detail["reason"] == "SAME_MOVE_REENTRY_GUARD"
+
+        blocked, detail = ats._same_move_reentry_info({
+            "symbol": "NIFTYTESTPE",
+            "side": "BUY",
+            "quality_score": 88,
+            "ai_edge_score": 61,
+            "momentum_score": 72,
+            "breakout_score": 75,
+            "start_trade_allowed": True,
+            "breakout_confirmed": True,
+            "momentum_confirmed": True,
+            "breakout_hold_confirmed": True,
+            "close_back_in_range": False,
+            "fake_breakout_by_candle": False,
+        })
+        assert blocked is False
+        assert detail["reason"] == "SAME_MOVE_REENTRY_GUARD"
+        assert detail["blocked"] is False
+    finally:
+        ats.state["recent_exit_contexts"] = {}

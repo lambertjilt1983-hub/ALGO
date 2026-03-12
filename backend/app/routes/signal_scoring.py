@@ -189,21 +189,21 @@ def evaluate_advanced_ai_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     ai_edge_score = _clamp(ai_edge_score, 0.0, 1.0)
 
     thresholds = {
-        "min_ai_edge": 60.0,
-        "min_momentum": 50.0,
+        "min_ai_edge": 58.0,
+        "min_momentum": 48.0,
         "min_breakout": 45.0,
-        "max_fake_move_risk": 55.0,
-        "min_rr": 1.10,
+        "max_fake_move_risk": 58.0,
+        "min_rr": 1.08,
         "max_news_risk": 45.0,
         "max_liquidity_spike_risk": 50.0,
         "max_premium_distortion_risk": 50.0,
     }
     if market_regime == "TRENDING":
         thresholds = {
-            "min_ai_edge": 55.0,
-            "min_momentum": 45.0,
+            "min_ai_edge": 53.0,
+            "min_momentum": 43.0,
             "min_breakout": 42.0,
-            "max_fake_move_risk": 65.0,
+            "max_fake_move_risk": 68.0,
             "min_rr": 1.05,
             "max_news_risk": 55.0,
             "max_liquidity_spike_risk": 55.0,
@@ -211,21 +211,21 @@ def evaluate_advanced_ai_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         }
     elif market_regime == "RANGING":
         thresholds = {
-            "min_ai_edge": 72.0,
-            "min_momentum": 62.0,
-            "min_breakout": 60.0,
-            "max_fake_move_risk": 38.0,
-            "min_rr": 1.25,
+            "min_ai_edge": 68.0,
+            "min_momentum": 58.0,
+            "min_breakout": 58.0,
+            "max_fake_move_risk": 42.0,
+            "min_rr": 1.22,
             "max_news_risk": 30.0,
             "max_liquidity_spike_risk": 35.0,
             "max_premium_distortion_risk": 35.0,
         }
     elif market_regime == "VOLATILE":
         thresholds = {
-            "min_ai_edge": 68.0,
-            "min_momentum": 58.0,
+            "min_ai_edge": 66.0,
+            "min_momentum": 56.0,
             "min_breakout": 58.0,
-            "max_fake_move_risk": 42.0,
+            "max_fake_move_risk": 45.0,
             "min_rr": 1.30,
             "max_news_risk": 32.0,
             "max_liquidity_spike_risk": 35.0,

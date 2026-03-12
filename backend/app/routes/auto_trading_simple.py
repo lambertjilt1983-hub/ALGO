@@ -94,6 +94,20 @@ MIN_WIN_SAMPLE = 8          # minimum closed trades before applying win-rate gat
 
 # Risk controls (can be made configurable later)
 risk_config = {
+    # QUALITY GATES (NEW) - Reduce trade volume to 10-20 high-quality trades/day
+    "quality_score_minimum": 66,             # Align with demo index baseline
+    "confirmation_score_minimum": 70,        # Ultra-strict confirmation gate
+    "ai_edge_minimum": 35.0,                 # Align with demo index baseline
+    "entry_rr_minimum": 1.30,                # Align with demo index baseline
+    "require_ai_entry_validation": False,    # Keep quality gate identical to paper/frontend baseline
+    "require_both_confirmations": True,      # BOTH breakout_confirmed AND momentum_confirmed (not just one)
+    "market_regime_filter": True,            # Skip trades in LOW_VOLATILITY or CHOPPY regimes
+    "enforce_daily_limits": True,            # Align with demo daily discipline
+    "max_daily_trades": 14,                  # Align with demo max daily trades
+    "consecutive_sl_hit_limit": 2,           # Align with demo consecutive SL guard
+    "daily_profit_target": 5000.0,           # Reduce position size or stop after ₹5k profit
+    
+    # EXISTING LIMITS (UNCHANGED)
     "max_daily_loss": 5000.0,        # ₹5000 max daily loss (hardstop to protect capital)
     "max_daily_profit": 10000.0,     # ₹10000 daily profit target (auto-stop at profit)
     "max_per_trade_loss": 600.0,     # ₹600 max loss per trade (prevent single trade disaster)
@@ -116,10 +130,10 @@ risk_config = {
     "loss_brake_qty_warn": 0.75,        # Reduce quantity to 75% in warning state
     "loss_brake_qty_hard": 0.50,        # Reduce quantity to 50% in hard state
     "capital_protection_mode": True,    # Enforce strict profile-based capital safeguards
-    "capital_daily_loss_pct": 0.01,     # Stop new entries after 1% daily drawdown on account balance
-    "capital_per_trade_risk_pct": 0.003,  # Per-trade max risk: 0.3% of balance
-    "capital_position_pct": 0.03,       # Max 3% of balance in a single new position
-    "capital_portfolio_pct": 0.06,      # Max 6% total live exposure
+    "capital_daily_loss_pct": 0.03,     # Stop new entries after 3% daily drawdown on account balance
+    "capital_per_trade_risk_pct": 0.025,  # Per-trade max risk: 2.5% of balance
+    "capital_position_pct": 0.60,       # Max 60% of balance in a single new position
+    "capital_portfolio_pct": 1.00,      # Max 100% total live exposure
     "capital_min_balance": 5000.0,      # Do not place live trades below this balance
     "live_start_balance_only": True,    # For live mode, require balance availability as an additional prerequisite
     "allow_simultaneous_live_trades": True,  # Permit concurrent live trades when setup is strong
@@ -129,6 +143,11 @@ risk_config = {
     "simultaneous_min_confidence": 72.0,     # Additional trade requires healthy confidence
     "simultaneous_min_ai_edge": 40.0,        # Additional trade requires minimum positive AI edge
     "simultaneous_require_different_root": True,  # Second trade must be on different underlying/root
+    "reentry_guard_minutes": 12,             # Re-check same move before re-entry on same root/kind/side
+    "reentry_min_quality_improvement": 4.0,  # Require materially better quality for same-move re-entry
+    "reentry_min_ai_edge_improvement": 6.0,  # Require materially better AI edge for same-move re-entry
+    "reentry_min_breakout_improvement": 8.0, # Require stronger breakout score for same-move re-entry
+    "reentry_require_breakout_hold": True,   # Require breakout hold confirmation for same-move re-entry
 }
 
 trade_window = {
@@ -138,11 +157,11 @@ trade_window = {
 
 trail_config = {
     "enabled": True,
-    "trigger_pct": 0.3,   # Start trailing at 0.3% profit to lock in gains
-    "step_pct": 0.15,     # Move stop every additional +0.15% move (wider steps)
-    "buffer_pct": 0.1,    # Keep 0.1% buffer to avoid premature exits
+    "trigger_pct": 0.2,   # Start trailing earlier to protect winners faster
+    "step_pct": 0.1,      # Move stop more frequently as price moves in favor
+    "buffer_pct": 0.08,   # Slightly tighter buffer to reduce giveback
 }
-BREAKEVEN_TRIGGER_PCT = 0.4  # Move stop to breakeven at 0.4% profit (lock in gains earlier)
+BREAKEVEN_TRIGGER_PCT = 0.25  # Move stop to breakeven sooner to reduce hard SL outcomes
 
 # ATR-based stop configuration
 atr_config = {
@@ -167,6 +186,7 @@ state = {
     "trading_paused": False,  # NEW: Pause if profit/loss limits hit
     "pause_reason": None,  # NEW: Why trading is paused
     "symbol_cooldowns": {},  # Track recent exits to avoid immediate re-entry
+    "recent_exit_contexts": {},  # Track same-move exit context to prevent churn re-entries
 }
 active_trades: List[Dict] = []
 history: List[Dict] = []
@@ -352,6 +372,164 @@ def _cooldown_info(symbol: str | None, side: str | None) -> Tuple[bool, float, O
     return active_remaining > 0, max(0.0, active_remaining), hit_key
 
 
+def _reentry_keys_for_trade(symbol: str | None, side: str | None) -> List[str]:
+    root = _symbol_root(symbol)
+    kind = _option_kind(symbol) or "NA"
+    norm_side = (side or "BUY").upper()
+    keys: List[str] = []
+    if root and kind != "NA":
+        keys.append(f"{root}:{kind}:{norm_side}")
+    if symbol:
+        keys.append(f"{symbol.upper()}:{norm_side}")
+    return keys
+
+
+def _boolish(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y"}:
+        return True
+    if text in {"false", "0", "no", "n"}:
+        return False
+    return None
+
+
+def _safe_metric(value: Any, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else default
+    except Exception:
+        return default
+
+
+def _record_recent_exit_context(trade: Dict[str, Any], at: Optional[datetime] = None) -> None:
+    at = at or datetime.utcnow()
+    minutes = int(risk_config.get("reentry_guard_minutes", 12) or 12)
+    expiry = at + timedelta(minutes=minutes)
+    context = {
+        "symbol": trade.get("symbol") or trade.get("index"),
+        "side": (trade.get("side") or "BUY").upper(),
+        "status": trade.get("status"),
+        "quality_score": _safe_metric(trade.get("quality_score")),
+        "ai_edge_score": _safe_metric(trade.get("ai_edge_score")),
+        "momentum_score": _safe_metric(trade.get("momentum_score")),
+        "breakout_score": _safe_metric(trade.get("breakout_score")),
+        "start_trade_allowed": _boolish(trade.get("start_trade_allowed")),
+        "breakout_confirmed": _boolish(trade.get("breakout_confirmed")),
+        "momentum_confirmed": _boolish(trade.get("momentum_confirmed")),
+        "breakout_hold_confirmed": _boolish(trade.get("breakout_hold_confirmed")),
+        "close_back_in_range": _boolish(trade.get("close_back_in_range")),
+        "fake_breakout_by_candle": _boolish(trade.get("fake_breakout_by_candle")),
+        "market_regime": trade.get("market_regime"),
+        "exit_time": at.isoformat(),
+        "expires_at": expiry.isoformat(),
+    }
+    contexts = state.setdefault("recent_exit_contexts", {})
+    for key in _reentry_keys_for_trade(context.get("symbol"), context.get("side")):
+        contexts[key] = context
+
+
+def _same_move_reentry_info(ai_context: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    now = datetime.utcnow()
+    contexts = state.setdefault("recent_exit_contexts", {})
+    stale_keys: List[str] = []
+    latest: Optional[Dict[str, Any]] = None
+    latest_key: Optional[str] = None
+    latest_expiry: Optional[datetime] = None
+
+    for key in _reentry_keys_for_trade(ai_context.get("symbol"), ai_context.get("side")):
+        rec = contexts.get(key)
+        if not rec:
+            continue
+        expires_at_raw = rec.get("expires_at")
+        if not expires_at_raw:
+            stale_keys.append(key)
+            continue
+        try:
+            expires_at = datetime.fromisoformat(expires_at_raw)
+        except Exception:
+            stale_keys.append(key)
+            continue
+        if expires_at <= now:
+            stale_keys.append(key)
+            continue
+        if latest_expiry is None or expires_at > latest_expiry:
+            latest = rec
+            latest_key = key
+            latest_expiry = expires_at
+
+    for key in stale_keys:
+        contexts.pop(key, None)
+
+    if latest is None or latest_expiry is None:
+        return False, {}
+
+    quality = _safe_metric(ai_context.get("quality_score"))
+    ai_edge = _safe_metric(ai_context.get("ai_edge_score"))
+    breakout = _safe_metric(ai_context.get("breakout_score"))
+    momentum = _safe_metric(ai_context.get("momentum_score"))
+
+    prev_quality = _safe_metric(latest.get("quality_score"))
+    prev_ai_edge = _safe_metric(latest.get("ai_edge_score"))
+    prev_breakout = _safe_metric(latest.get("breakout_score"))
+    prev_momentum = _safe_metric(latest.get("momentum_score"))
+
+    require_hold = bool(risk_config.get("reentry_require_breakout_hold", True))
+    start_trade_allowed = _boolish(ai_context.get("start_trade_allowed"))
+    breakout_confirmed = _boolish(ai_context.get("breakout_confirmed"))
+    momentum_confirmed = _boolish(ai_context.get("momentum_confirmed"))
+    breakout_hold_confirmed = _boolish(ai_context.get("breakout_hold_confirmed"))
+    close_back_in_range = _boolish(ai_context.get("close_back_in_range"))
+    fake_breakout_by_candle = _boolish(ai_context.get("fake_breakout_by_candle"))
+
+    fresh_breakout = (
+        start_trade_allowed is not False
+        and breakout_confirmed is not False
+        and momentum_confirmed is not False
+        and close_back_in_range is not True
+        and fake_breakout_by_candle is not True
+        and (not require_hold or breakout_hold_confirmed is not False)
+    )
+    stronger_signal = (
+        quality >= prev_quality + float(risk_config.get("reentry_min_quality_improvement", 4.0) or 4.0)
+        or ai_edge >= prev_ai_edge + float(risk_config.get("reentry_min_ai_edge_improvement", 6.0) or 6.0)
+        or breakout >= prev_breakout + float(risk_config.get("reentry_min_breakout_improvement", 8.0) or 8.0)
+        or (quality >= 92.0 and ai_edge >= 70.0 and breakout >= max(prev_breakout, 70.0))
+        or (momentum >= prev_momentum + 8.0 and ai_edge >= max(prev_ai_edge, 60.0))
+    )
+
+    blocked = not (fresh_breakout and stronger_signal)
+    detail = {
+        "blocked": blocked,
+        "reason": "SAME_MOVE_REENTRY_GUARD",
+        "cooldown_key": latest_key,
+        "previous_exit": latest,
+        "current_signal": {
+            "quality_score": quality,
+            "ai_edge_score": ai_edge,
+            "breakout_score": breakout,
+            "momentum_score": momentum,
+            "start_trade_allowed": start_trade_allowed,
+            "breakout_confirmed": breakout_confirmed,
+            "momentum_confirmed": momentum_confirmed,
+            "breakout_hold_confirmed": breakout_hold_confirmed,
+            "close_back_in_range": close_back_in_range,
+            "fake_breakout_by_candle": fake_breakout_by_candle,
+        },
+        "requires": {
+            "fresh_breakout": True,
+            "stronger_signal": True,
+        },
+        "remaining_seconds": max(0, int((latest_expiry - now).total_seconds())),
+    }
+    return blocked, detail
+
+
 def _compute_rr(entry_price: Any, target: Any, stop_loss: Any) -> float:
     try:
         entry = float(entry_price or 0)
@@ -368,21 +546,48 @@ def _ai_entry_validation(
     signal: Dict[str, Any],
     loss_brake: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, List[str], Dict[str, Any]]:
-    """Server-side AI gate: quality + confidence + RR + trend/technical alignment."""
+    """Unified quality gate aligned with paper and frontend readiness policy."""
     reasons: List[str] = []
 
-    quality = float(signal.get("quality_score") or signal.get("quality") or 0)
-    confidence = float(signal.get("confirmation_score") or signal.get("confidence") or 0)
+    quality = float(signal.get("quality_score") or signal.get("quality") or 0.0)
+    confidence = float(signal.get("confirmation_score") or signal.get("confidence") or 0.0)
+    ai_edge = float(signal.get("ai_edge_score") or 0.0)
+    breakout_score = float(signal.get("breakout_score") or 0.0)
+    momentum_score = float(signal.get("momentum_score") or 0.0)
     rr = _compute_rr(signal.get("entry_price"), signal.get("target"), signal.get("stop_loss"))
-    market_regime = str(signal.get("market_regime") or "").upper()
 
-    quality_min = 70.0
-    confidence_min = 70.0
-    rr_min = 1.1
+    signal_is_stock = signal.get("signal_type") == "stock" or signal.get("is_stock") is True
+    if signal_is_stock:
+        quality_min = 61.0
+        confidence_min = 65.0
+        ai_edge_min = 30.0
+        rr_min = 1.20
+    else:
+        quality_min = 66.0
+        confidence_min = 70.0
+        ai_edge_min = 35.0
+        rr_min = 1.30
+
+    fake_move_risk = float(signal.get("fake_move_risk") or signal.get("fake_move_risk_score") or 0.0)
+    news_risk = float(signal.get("sudden_news_risk") or signal.get("news_risk") or signal.get("news_risk_score") or 0.0)
+    liquidity_spike_risk = float(signal.get("liquidity_spike_risk") or signal.get("liquidity_spike_risk_score") or 0.0)
+    premium_distortion = float(signal.get("premium_distortion") or signal.get("premium_distortion_risk") or signal.get("premium_distortion_score") or 0.0)
+
+    market_regime = str(signal.get("market_regime") or "").upper()
+    market_bias = str(signal.get("market_bias") or signal.get("trend_direction") or "").upper()
+    timing_risk = str(signal.get("timing_risk") or (signal.get("timing_risk_profile") or {}).get("window") or "").upper()
+
+    breakout_confirmed = _boolish(signal.get("breakout_confirmed"))
+    momentum_confirmed = _boolish(signal.get("momentum_confirmed"))
+    breakout_hold_confirmed = _boolish(signal.get("breakout_hold_confirmed"))
+    start_trade_allowed = _boolish(signal.get("start_trade_allowed"))
+    start_trade_decision = str(signal.get("start_trade_decision") or "").upper()
+
     if isinstance(loss_brake, dict) and loss_brake.get("enabled"):
         quality_min += float(loss_brake.get("quality_boost") or 0)
         confidence_min += float(loss_brake.get("confidence_boost") or 0)
         rr_min += float(loss_brake.get("rr_boost") or 0)
+        ai_edge_min += float(loss_brake.get("ai_edge_boost") or 0)
         if loss_brake.get("block_new_entries"):
             reasons.append("loss_brake_hard_block")
 
@@ -390,78 +595,49 @@ def _ai_entry_validation(
         reasons.append(f"quality<{quality_min:.1f} ({quality:.1f})")
     if confidence < confidence_min:
         reasons.append(f"confidence<{confidence_min:.1f} ({confidence:.1f})")
+    if ai_edge < ai_edge_min:
+        reasons.append(f"ai_edge<{ai_edge_min:.1f} ({ai_edge:.1f})")
     if rr < rr_min:
         reasons.append(f"rr<{rr_min:.2f} ({rr:.2f})")
 
-    option_type = str(signal.get("option_type") or "").upper()
-    trend_direction = str(signal.get("trend_direction") or "").upper()
-    if trend_direction and option_type in {"CE", "PE"}:
-        trend_ok = (
-            ("UP" in trend_direction and option_type == "CE")
-            or ("DOWN" in trend_direction and option_type == "PE")
+    # Keep confirmation behavior aligned with paper route.
+    breakout_ok = (breakout_confirmed is True) or (breakout_confirmed is None and breakout_score >= 58.0)
+    momentum_ok = (momentum_confirmed is True) or (momentum_confirmed is None and momentum_score >= 58.0)
+    if not (breakout_ok and momentum_ok):
+        reasons.append(
+            f"require_both_confirmations: breakout={breakout_confirmed}/{breakout_score:.1f}, "
+            f"momentum={momentum_confirmed}/{momentum_score:.1f}"
         )
-        if not trend_ok:
-            reasons.append(f"trend_mismatch({trend_direction}->{option_type})")
 
-    tech = signal.get("technical_indicators") or {}
-    if isinstance(tech, dict) and option_type in {"CE", "PE"}:
-        rsi = float(tech.get("rsi") or 50)
-        macd = tech.get("macd") if isinstance(tech.get("macd"), dict) else {}
-        macd_cross = str(macd.get("crossover") or "").lower()
+    if breakout_hold_confirmed is False:
+        reasons.append("breakout_hold_confirmed=false")
+    if timing_risk == "HIGH":
+        reasons.append("timing_risk=HIGH")
+    if market_bias == "WEAK_BOTH" and not (quality >= 90.0 and confidence >= 92.0):
+        reasons.append("market_bias=WEAK_BOTH")
+    if fake_move_risk > 16.0:
+        reasons.append(f"fake_move_risk>16.0 ({fake_move_risk:.1f})")
+    if news_risk > 18.0:
+        reasons.append(f"news_risk>18.0 ({news_risk:.1f})")
+    if liquidity_spike_risk > 16.0:
+        reasons.append(f"liquidity_spike_risk>16.0 ({liquidity_spike_risk:.1f})")
+    if premium_distortion > 14.0:
+        reasons.append(f"premium_distortion>14.0 ({premium_distortion:.1f})")
+    if market_regime == "LOW_VOLATILITY":
+        reasons.append("market_regime=LOW_VOLATILITY")
+    if start_trade_allowed is False or start_trade_decision == "NO":
+        reasons.append("start_trade=NO")
 
-        if option_type == "CE":
-            tech_ok = (45 <= rsi <= 75) and (macd_cross in {"", "bullish"})
-        else:
-            tech_ok = (25 <= rsi <= 55) and (macd_cross in {"", "bearish"})
-
-        if not tech_ok:
-            reasons.append(f"technical_mismatch(rsi={rsi:.1f},macd={macd_cross or 'na'})")
-
-    base_reason_count = len(reasons)
     advanced = evaluate_advanced_ai_signal(signal)
     advanced["loss_brake"] = loss_brake or {"enabled": False, "stage": "OFF"}
     advanced["thresholds"] = {
         "quality_min": round(quality_min, 2),
         "confidence_min": round(confidence_min, 2),
+        "ai_edge_min": round(ai_edge_min, 2),
         "rr_min": round(rr_min, 2),
     }
-    if not advanced.get("entry_valid", False):
-        advanced_reasons = [str(r) for r in (advanced.get("entry_reasons") or [])]
-        soft_advanced_reasons = {"low_momentum", "low_ai_edge_score"}
-        
-        # Two pathways for override:
-        # 1) High conviction with ONLY soft reasons (safer path)
-        # 2) Ultra-high conviction even with mixed reasons (aggressive path for excellent trades)
-        has_only_soft = set(advanced_reasons).issubset(soft_advanced_reasons) if advanced_reasons else False
-        
-        # Ultra-high conviction: quality>=94, confidence>=90, RR>=1.25 (excellent setup)
-        ultra_high_conviction = (
-            quality >= 94.0 and 
-            confidence >= 90.0 and 
-            rr >= 1.25
-        )
-        
-        high_conviction_soft_override = (
-            len(reasons) == base_reason_count
-            and quality >= 90.0
-            and confidence >= 85.0
-            and rr >= 1.20
-            and bool(advanced_reasons)
-            and (
-                (has_only_soft and market_regime != "LOW_VOLATILITY")
-                or ultra_high_conviction
-            )
-        )
-
-        if high_conviction_soft_override:
-            advanced["entry_valid"] = True
-            advanced["override_applied"] = "HIGH_CONVICTION_SOFT_AI_GATE" if has_only_soft else "ULTRA_HIGH_CONVICTION_AI_GATE"
-        else:
-            reasons.extend([f"advanced:{r}" for r in advanced_reasons])
-
-    # Premium movement check
-    if market_regime == "LOW_VOLATILITY":
-        reasons.append("premium_movement_slow")
+    advanced["entry_valid"] = len(reasons) == 0
+    advanced["entry_reasons"] = list(reasons)
 
     return len(reasons) == 0, reasons, advanced
 
@@ -539,6 +715,131 @@ def _reset_daily_if_needed():
         state["last_loss_time"] = None
         state["trading_paused"] = False  # Reset pause flag
         state["pause_reason"] = None
+        state["daily_trades_count"] = 0  # Reset daily trade count
+        state["consecutive_sl_count"] = 0  # Reset consecutive SL count
+
+
+def _count_daily_trades() -> int:
+    """Count how many trades have been created today (live + demo)."""
+    _reset_daily_if_needed()
+    today = ist_now().date()
+    today_start = datetime.combine(today, dt_time(0, 0, 0))
+    today_end = datetime.combine(today, dt_time(23, 59, 59))
+    
+    count = 0
+    for trade in active_trades:
+        if trade.get("created_at"):
+            try:
+                created = trade["created_at"] if isinstance(trade["created_at"], datetime) else datetime.fromisoformat(trade["created_at"])
+                if today_start <= created <= today_end:
+                    count += 1
+            except Exception:
+                pass
+    for trade in history:
+        if trade.get("created_at"):
+            try:
+                created = trade["created_at"] if isinstance(trade["created_at"], datetime) else datetime.fromisoformat(trade["created_at"])
+                if today_start <= created <= today_end:
+                    count += 1
+            except Exception:
+                pass
+    
+    state["daily_trades_count"] = count
+    return count
+
+
+def _count_consecutive_sl_hits() -> int:
+    """Count consecutive SL_HIT trades from the end of today's history."""
+    _reset_daily_if_needed()
+    today = ist_now().date()
+    today_start = datetime.combine(today, dt_time(0, 0, 0))
+    
+    # Get today's closed trades, newest first
+    today_trades = []
+    for trade in history:
+        if trade.get("exit_time"):
+            try:
+                exit_dt = trade["exit_time"] if isinstance(trade["exit_time"], datetime) else datetime.fromisoformat(trade["exit_time"])
+                if exit_dt >= today_start:
+                    today_trades.append(trade)
+            except Exception:
+                pass
+    
+    # Sort by exit_time descending (newest first)
+    today_trades.sort(key=lambda t: t.get("exit_time", ""), reverse=True)
+    
+    # Count consecutive SL_HIT from the end
+    consecutive = 0
+    for trade in today_trades:
+        if str(trade.get("status", "")).upper() == "SL_HIT":
+            consecutive += 1
+        else:
+            break
+    
+    state["consecutive_sl_count"] = consecutive
+    return consecutive
+
+
+def _get_daily_pnl() -> float:
+    """Calculate today's P&L (sum of all closed trades + open P&L)."""
+    _reset_daily_if_needed()
+    today = ist_now().date()
+    today_start = datetime.combine(today, dt_time(0, 0, 0))
+    
+    pnl = 0.0
+    
+    # Add P&L from closed trades today
+    for trade in history:
+        if trade.get("exit_time"):
+            try:
+                exit_dt = trade["exit_time"] if isinstance(trade["exit_time"], datetime) else datetime.fromisoformat(trade["exit_time"])
+                if exit_dt >= today_start:
+                    pnl += float(trade.get("pnl", 0) or 0)
+            except Exception:
+                pass
+    
+    # Add unrealized P&L from open trades today
+    for trade in active_trades:
+        if trade.get("created_at"):
+            try:
+                created = trade["created_at"] if isinstance(trade["created_at"], datetime) else datetime.fromisoformat(trade["created_at"])
+                if created >= today_start:
+                    current_price = float(trade.get("current_price", trade.get("price", 0)) or 0)
+                    entry_price = float(trade.get("price", 0) or 0)
+                    qty = int(trade.get("quantity", 1) or 1)
+                    side = (trade.get("side") or "BUY").upper()
+                    if entry_price > 0 and current_price > 0:
+                        unrealized = (current_price - entry_price) * qty if side == "BUY" else (entry_price - current_price) * qty
+                        pnl += unrealized
+            except Exception:
+                pass
+    
+    return pnl
+
+
+def _should_allow_new_trade() -> Tuple[bool, Optional[str]]:
+    """Check if we should allow a new trade based on quality gates and daily limits."""
+    _reset_daily_if_needed()
+    
+    daily_trades = _count_daily_trades()
+    max_daily = int(risk_config.get("max_daily_trades", 20) or 20)
+    
+    if daily_trades >= max_daily:
+        return False, f"max_daily_trades_reached ({daily_trades}/{max_daily})"
+    
+    consecutive_sl = _count_consecutive_sl_hits()
+    sl_limit = int(risk_config.get("consecutive_sl_hit_limit", 3) or 3)
+    
+    if consecutive_sl >= sl_limit:
+        return False, f"consecutive_sl_hit_limit_reached ({consecutive_sl}/{sl_limit}) - market is choppy, pausing entries"
+    
+    daily_pnl = _get_daily_pnl()
+    daily_profit_target = float(risk_config.get("daily_profit_target", 5000.0) or 5000.0)
+    
+    if daily_pnl >= daily_profit_target:
+        return False, f"daily_profit_target_reached (₹{daily_pnl:.0f} >= ₹{daily_profit_target:.0f}) - stop for the day"
+    
+    return True, None
 
 
 def _recent_win_rate(limit: int = 20) -> Tuple[float, int]:
@@ -1118,9 +1419,11 @@ def _close_trade(trade: Dict[str, Any], exit_price: float) -> None:
         trade["pnl"] = round(pnl, 2)
         trade["pnl_percentage"] = round(pnl_percentage, 2)
 
-        # Record SL cooldown and append to history
+        # Record exit context and only apply SL cooldown to true stop-loss exits.
         exit_dt = datetime.fromisoformat(trade.get("exit_time")) if isinstance(trade.get("exit_time"), str) else datetime.utcnow()
-        _record_sl_cooldown(trade.get("symbol") or trade.get("index"), side, exit_dt)
+        if trade.get("status") == "SL_HIT":
+            _record_sl_cooldown(trade.get("symbol") or trade.get("index"), side, exit_dt)
+        _record_recent_exit_context(trade, exit_dt)
         history.append(trade.copy())
 
         # Track daily P&L and consecutive losses
@@ -1153,7 +1456,16 @@ def _close_trade(trade: Dict[str, Any], exit_price: float) -> None:
                 entry_time=entry_dt,
                 exit_time=exit_dt,
                 trading_date=exit_dt.date(),
-                meta={"support": trade.get("support"), "resistance": trade.get("resistance")},
+                meta={
+                    "support": trade.get("support"),
+                    "resistance": trade.get("resistance"),
+                    "exit_reason": trade.get("exit_reason") or trade.get("status"),
+                    "quality_score": trade.get("quality_score"),
+                    "ai_edge_score": trade.get("ai_edge_score"),
+                    "momentum_score": trade.get("momentum_score"),
+                    "breakout_score": trade.get("breakout_score"),
+                    "profit_lock_applied": trade.get("profit_lock_applied"),
+                },
             )
             db.add(report)
             db.commit()
@@ -1617,9 +1929,10 @@ async def analyze(
     quantity: Optional[int] = None,
     authorization: Optional[str] = Header(None),
     allow_auto_execute: bool = True,
+    test_bypass_market_check: bool = False,  # DEBUG: allow testing outside market hours
 ):
     # Block new analysis/trade discovery outside configured market window.
-    if not _within_trade_window():
+    if not _within_trade_window() and not test_bypass_market_check:
         market = market_status(dt_time(9, 15), dt_time(15, 30))
         raise HTTPException(
             status_code=403,
@@ -1780,13 +2093,76 @@ async def analyze(
     }
     for sig in signals:
         blocked, remaining_seconds, _ = _cooldown_info(sig.get("symbol"), sig.get("action"))
+        reentry_blocked, reentry_detail = _same_move_reentry_info(sig)
         ai_ok, ai_reasons, ai_diag = _ai_entry_validation(sig, loss_brake=loss_brake)
+        
+        # NEW: Quality gates to reduce volume to 10-20 trades/day
+        quality_score = float(sig.get("quality_score") or sig.get("quality") or 0)
+        confirmation_score = float(sig.get("confirmation_score") or sig.get("confidence") or 0)
+        ai_edge_score = float(sig.get("ai_edge_score") or ai_diag.get("ai_edge_score") or 0)
+        market_regime = ai_diag.get("market_regime") or sig.get("market_regime")
+        market_bias = str(sig.get("market_bias") or sig.get("trend_direction") or "").upper()
+        timing_risk = str(sig.get("timing_risk") or (sig.get("timing_risk_profile") or {}).get("window") or "").upper()
+        breakout_hold_confirmed = _boolish(sig.get("breakout_hold_confirmed"))
+        if breakout_hold_confirmed is None:
+            breakout_hold_confirmed = _boolish(ai_diag.get("breakout_hold_confirmed"))
+
+        # Fixed hard caps aligned with demo and frontend
+        max_fake_move_risk = 16.0
+        max_news_risk = 18.0
+        max_liquidity_spike_risk = 16.0
+        max_premium_distortion_risk = 14.0
+
+        fake_move_risk = float(sig.get("fake_move_risk") or ai_diag.get("fake_move_risk") or 0.0)
+        news_risk = float(sig.get("sudden_news_risk") or sig.get("news_risk") or ai_diag.get("sudden_news_risk") or 0.0)
+        liquidity_spike_risk = float(sig.get("liquidity_spike_risk") or ai_diag.get("liquidity_spike_risk") or 0.0)
+        premium_distortion = float(sig.get("premium_distortion") or sig.get("premium_distortion_risk") or ai_diag.get("premium_distortion_risk") or 0.0)
+        
+        enforce_daily_limits = bool(risk_config.get("enforce_daily_limits", False))
+        daily_trade_ok, daily_trade_reason = _should_allow_new_trade() if enforce_daily_limits else (True, "quality_mode_daily_limits_disabled")
+        
+        # Keep same stock/index split as demo policy
+        signal_is_stock = sig.get("signal_type") == "stock" or sig.get("is_stock") is True
+        
+        rr_value = _compute_rr(sig.get("entry_price"), sig.get("target"), sig.get("stop_loss"))
+
+        if signal_is_stock:
+            # STOCKS: Slightly more lenient than index options (same as demo)
+            quality_min = max(0.0, float(risk_config.get("quality_score_minimum", 66) or 66) - 5.0)
+            confirmation_min = max(0.0, float(risk_config.get("confirmation_score_minimum", 70) or 70) - 5.0)
+            ai_edge_min = max(0.0, float(risk_config.get("ai_edge_minimum", 35.0) or 35.0) - 5.0)
+            rr_min = max(0.0, float(risk_config.get("entry_rr_minimum", 1.30) or 1.30) - 0.10)
+            require_both_conf = True  # Still require both confirmations
+        else:
+            # INDEX OPTIONS: Strict thresholds for intraday scalping
+            quality_min = float(risk_config.get("quality_score_minimum", 66) or 66)
+            confirmation_min = float(risk_config.get("confirmation_score_minimum", 70) or 70)
+            ai_edge_min = float(risk_config.get("ai_edge_minimum", 35.0) or 35.0)
+            rr_min = float(risk_config.get("entry_rr_minimum", 1.30) or 1.30)
+            require_both_conf = bool(risk_config.get("require_both_confirmations", True))
+        require_ai_validation = bool(risk_config.get("require_ai_entry_validation", True))
+        
+        regime_filter = bool(risk_config.get("market_regime_filter", True))
+        breakout_confirmed = _boolish(sig.get("breakout_confirmed"))
+        momentum_confirmed = _boolish(sig.get("momentum_confirmed"))
+        if breakout_confirmed is None:
+            breakout_confirmed = _boolish(ai_diag.get("breakout_confirmed"))
+        if momentum_confirmed is None:
+            momentum_confirmed = _boolish(ai_diag.get("momentum_confirmed"))
+        
         if blocked:
             blocked_recommendations.append({
                 "symbol": sig.get("symbol"),
                 "side": (sig.get("action") or "BUY").upper(),
                 "wait_seconds": round(remaining_seconds, 1),
                 "reason": "SL_HIT_COOLDOWN",
+            })
+        if reentry_blocked:
+            blocked_recommendations.append({
+                "symbol": sig.get("symbol"),
+                "side": (sig.get("action") or "BUY").upper(),
+                "wait_seconds": reentry_detail.get("remaining_seconds", 0),
+                "reason": "SAME_MOVE_REENTRY_GUARD",
             })
         if not ai_ok:
             ai_rejected_recommendations.append({
@@ -1796,6 +2172,91 @@ async def analyze(
                 "details": ai_reasons,
                 "advanced": ai_diag,
             })
+        
+        # NEW: Quality gate rejection if conditions not met
+        quality_gate_rejection = None
+        if quality_score < quality_min:
+            quality_gate_rejection = f"quality_score<{quality_min} (got {quality_score:.1f})"
+        elif confirmation_score < confirmation_min:
+            quality_gate_rejection = f"confirmation_score<{confirmation_min} (got {confirmation_score:.1f})"
+        elif ai_edge_score < ai_edge_min:
+            quality_gate_rejection = f"ai_edge_score<{ai_edge_min} (got {ai_edge_score:.1f})"
+        elif rr_value < rr_min:
+            quality_gate_rejection = f"rr<{rr_min:.2f} (got {rr_value:.2f})"
+        if quality_gate_rejection is None and require_ai_validation and not ai_ok:
+            quality_gate_rejection = f"ai_validation_failed ({'; '.join(ai_reasons[:2])})"
+        if quality_gate_rejection is None and require_both_conf:
+            breakout_ok = (breakout_confirmed is True) or (breakout_confirmed is None and float(sig.get("breakout_score") or 0.0) >= 58.0)
+            momentum_ok = (momentum_confirmed is True) or (momentum_confirmed is None and float(sig.get("momentum_score") or 0.0) >= 58.0)
+            if not (breakout_ok and momentum_ok):
+                quality_gate_rejection = (
+                    f"require_both_confirmations: breakout={breakout_confirmed}/{float(sig.get('breakout_score') or 0.0):.1f}, "
+                    f"momentum={momentum_confirmed}/{float(sig.get('momentum_score') or 0.0):.1f}"
+                )
+        if quality_gate_rejection is None and breakout_hold_confirmed is False:
+            quality_gate_rejection = "breakout_hold_confirmed=false (avoid weak post-breakout entries)"
+        if quality_gate_rejection is None and timing_risk == "HIGH":
+            quality_gate_rejection = "timing_risk=HIGH"
+        if quality_gate_rejection is None and market_bias == "WEAK_BOTH" and not (quality_score >= 90.0 and confirmation_score >= 92.0):
+            quality_gate_rejection = "market_bias=WEAK_BOTH (requires very high quality override)"
+        if quality_gate_rejection is None and fake_move_risk > max_fake_move_risk:
+            quality_gate_rejection = f"fake_move_risk>{max_fake_move_risk:.1f} (got {fake_move_risk:.1f})"
+        if quality_gate_rejection is None and news_risk > max_news_risk:
+            quality_gate_rejection = f"news_risk>{max_news_risk:.1f} (got {news_risk:.1f})"
+        if quality_gate_rejection is None and liquidity_spike_risk > max_liquidity_spike_risk:
+            quality_gate_rejection = f"liquidity_spike_risk>{max_liquidity_spike_risk:.1f} (got {liquidity_spike_risk:.1f})"
+        if quality_gate_rejection is None and premium_distortion > max_premium_distortion_risk:
+            quality_gate_rejection = f"premium_distortion>{max_premium_distortion_risk:.1f} (got {premium_distortion:.1f})"
+        if quality_gate_rejection is None and regime_filter and market_regime == "LOW_VOLATILITY":
+            quality_gate_rejection = "market_regime=LOW_VOLATILITY (avoid choppy conditions)"
+        if quality_gate_rejection is None and not daily_trade_ok:
+            quality_gate_rejection = daily_trade_reason
+        
+        if quality_gate_rejection:
+            signal_type = sig.get("signal_type", sig.get("is_stock", False))
+            if signal_type == "stock" or signal_type is True:
+                signal_type = "stock"
+            else:
+                signal_type = "index"
+            
+            ai_rejected_recommendations.append({
+                "symbol": sig.get("symbol"),
+                "side": (sig.get("action") or "BUY").upper(),
+                "signal_type": signal_type,
+                "reason": "QUALITY_GATE_REJECTED",
+                "details": [quality_gate_rejection],
+                "quality_gate_details": {
+                    "quality_score": round(quality_score, 2),
+                    "quality_min": quality_min,
+                    "confirmation_score": round(confirmation_score, 2),
+                    "confirmation_min": confirmation_min,
+                    "ai_edge_score": round(ai_edge_score, 2),
+                    "ai_edge_min": ai_edge_min,
+                    "rr": round(rr_value, 2),
+                    "rr_min": rr_min,
+                    "breakout_confirmed": breakout_confirmed,
+                    "momentum_confirmed": momentum_confirmed,
+                    "breakout_hold_confirmed": breakout_hold_confirmed,
+                    "market_bias": market_bias,
+                    "timing_risk": timing_risk,
+                    "fake_move_risk": round(fake_move_risk, 2),
+                    "max_fake_move_risk": max_fake_move_risk,
+                    "news_risk": round(news_risk, 2),
+                    "max_news_risk": max_news_risk,
+                    "liquidity_spike_risk": round(liquidity_spike_risk, 2),
+                    "max_liquidity_spike_risk": max_liquidity_spike_risk,
+                    "premium_distortion": round(premium_distortion, 2),
+                    "max_premium_distortion": max_premium_distortion_risk,
+                    "market_regime": market_regime,
+                    "daily_trades_count": _count_daily_trades(),
+                    "max_daily_trades": int(risk_config.get("max_daily_trades", 20) or 20),
+                    "consecutive_sl_count": _count_consecutive_sl_hits(),
+                    "consecutive_sl_limit": int(risk_config.get("consecutive_sl_hit_limit", 3) or 3),
+                },
+            })
+            # Skip this recommendation if quality gate failed
+            continue
+        
         base_qty = int(sig.get("quantity") or 1)
         lot_step = int(sig.get("quantity") or 1)
         timing_multiplier = float(risk_profile.get("qty_multiplier") or 1.0)
@@ -1848,6 +2309,8 @@ async def analyze(
             "option_chain": option_chains[0] if option_chains else None if sig == signals[0] else None,
             "blocked_by_cooldown": blocked,
             "cooldown_wait_seconds": round(remaining_seconds, 1) if blocked else 0,
+            "blocked_by_reentry": reentry_blocked,
+            "reentry_guard": reentry_detail if reentry_blocked else None,
             "ai_valid": ai_ok,
             "ai_reasons": ai_reasons,
             "trend_confirmed": ai_diag.get("trend_confirmed"),
@@ -1879,7 +2342,10 @@ async def analyze(
             "premium_movement_detail": premium_movement_detail,
         })
     # Prefer the best AI-valid signal that is not blocked by SL cooldown.
-    ai_candidates = [r for r in recommendations if (not r.get("blocked_by_cooldown")) and r.get("ai_valid")]
+    ai_candidates = [
+        r for r in recommendations
+        if (not r.get("blocked_by_cooldown")) and (not r.get("blocked_by_reentry")) and r.get("ai_valid")
+    ]
     ai_candidates.sort(
         key=lambda r: (
             float(r.get("ai_edge_score") or 0),
@@ -2006,9 +2472,20 @@ async def analyze(
                 balance=balance,
                 quality_score=recommendation.get("quality_score"),
                 confirmation_score=recommendation.get("confirmation_score") or recommendation.get("confidence"),
+                ai_edge_score=recommendation.get("ai_edge_score"),
+                momentum_score=recommendation.get("momentum_score"),
+                breakout_score=recommendation.get("breakout_score"),
                 option_type=recommendation.get("option_type"),
                 trend_direction=recommendation.get("trend_direction"),
-                ai_edge_score=recommendation.get("ai_edge_score"),
+                trend_strength=recommendation.get("trend_strength"),
+                breakout_confirmed=recommendation.get("breakout_confirmed"),
+                momentum_confirmed=recommendation.get("momentum_confirmed"),
+                breakout_hold_confirmed=recommendation.get("breakout_hold_confirmed"),
+                close_back_in_range=recommendation.get("close_back_in_range"),
+                fake_breakout_by_candle=recommendation.get("fake_breakout_by_candle"),
+                start_trade_allowed=recommendation.get("start_trade_allowed"),
+                start_trade_decision=recommendation.get("start_trade_decision"),
+                market_regime=recommendation.get("market_regime"),
                 force_demo=force_demo,
                 authorization=authorization,
             )
@@ -2139,9 +2616,24 @@ async def execute(
     quality_score: Optional[float] = Query(None),
     confirmation_score: Optional[float] = Query(None),
     ai_edge_score: Optional[float] = Query(None),
+    momentum_score: Optional[float] = Query(None),
+    breakout_score: Optional[float] = Query(None),
     option_type: Optional[str] = Query(None),
     trend_direction: Optional[str] = Query(None),
     trend_strength: Optional[str] = Query(None),
+    breakout_confirmed: Optional[bool] = Query(None),
+    momentum_confirmed: Optional[bool] = Query(None),
+    breakout_hold_confirmed: Optional[bool] = Query(None),
+    timing_risk: Optional[str] = Query(None),
+    sudden_news_risk: Optional[float] = Query(None),
+    liquidity_spike_risk: Optional[float] = Query(None),
+    premium_distortion_risk: Optional[float] = Query(None),
+    close_back_in_range: Optional[bool] = Query(None),
+    fake_breakout_by_candle: Optional[bool] = Query(None),
+    start_trade_allowed: Optional[bool] = Query(None),
+    start_trade_decision: Optional[str] = Query(None),
+    market_bias: Optional[str] = Query(None),
+    market_regime: Optional[str] = Query(None),
     force_demo: bool = Body(False),
     authorization: Optional[str] = Header(None),
 ):
@@ -2169,9 +2661,24 @@ async def execute(
                 quality_score = payload.get("quality_score", quality_score)
                 confirmation_score = payload.get("confirmation_score", confirmation_score)
                 ai_edge_score = payload.get("ai_edge_score", ai_edge_score)
+                momentum_score = payload.get("momentum_score", momentum_score)
+                breakout_score = payload.get("breakout_score", breakout_score)
                 option_type = payload.get("option_type", option_type)
                 trend_direction = payload.get("trend_direction", trend_direction)
                 trend_strength = payload.get("trend_strength", trend_strength)
+                breakout_confirmed = payload.get("breakout_confirmed", breakout_confirmed)
+                momentum_confirmed = payload.get("momentum_confirmed", momentum_confirmed)
+                breakout_hold_confirmed = payload.get("breakout_hold_confirmed", breakout_hold_confirmed)
+                timing_risk = payload.get("timing_risk", timing_risk)
+                sudden_news_risk = payload.get("sudden_news_risk", sudden_news_risk)
+                liquidity_spike_risk = payload.get("liquidity_spike_risk", liquidity_spike_risk)
+                premium_distortion_risk = payload.get("premium_distortion_risk", premium_distortion_risk)
+                close_back_in_range = payload.get("close_back_in_range", close_back_in_range)
+                fake_breakout_by_candle = payload.get("fake_breakout_by_candle", fake_breakout_by_candle)
+                start_trade_allowed = payload.get("start_trade_allowed", start_trade_allowed)
+                start_trade_decision = payload.get("start_trade_decision", start_trade_decision)
+                market_bias = payload.get("market_bias", market_bias)
+                market_regime = payload.get("market_regime", market_regime)
         except Exception:
             # Ignore malformed/non-JSON body and continue with query/body defaults.
             pass
@@ -2249,9 +2756,26 @@ async def execute(
         "quality_score": quality_score,
         "confirmation_score": confirmation_score,
         "ai_edge_score": ai_edge_score,
+        "momentum_score": momentum_score,
+        "breakout_score": breakout_score,
         "option_type": option_type,
         "trend_direction": trend_direction,
         "trend_strength": trend_strength,
+        "breakout_confirmed": breakout_confirmed,
+        "momentum_confirmed": momentum_confirmed,
+        "breakout_hold_confirmed": breakout_hold_confirmed,
+        "timing_risk": timing_risk,
+        "sudden_news_risk": sudden_news_risk,
+        "news_risk": sudden_news_risk,
+        "liquidity_spike_risk": liquidity_spike_risk,
+        "premium_distortion_risk": premium_distortion_risk,
+        "premium_distortion": premium_distortion_risk,
+        "close_back_in_range": close_back_in_range,
+        "fake_breakout_by_candle": fake_breakout_by_candle,
+        "start_trade_allowed": start_trade_allowed,
+        "start_trade_decision": start_trade_decision,
+        "market_bias": market_bias,
+        "market_regime": market_regime,
     }
     if (not auto_demo) and any(v is not None for v in [quality_score, confirmation_score, option_type, trend_direction]):
         ai_ok, ai_reasons, _ = _ai_entry_validation(ai_context, loss_brake=loss_brake)
@@ -2456,7 +2980,7 @@ async def execute(
         existing_open = [t for t in active_trades if t.get("status") == "OPEN"]
         if existing_open and (not auto_demo):
             simultaneous_ok, simultaneous_reasons = _can_allow_additional_live_trade(ai_context)
-            if SINGLE_ACTIVE_TRADE and not simultaneous_ok:
+            if not simultaneous_ok:
                 raise HTTPException(
                     status_code=429,
                     detail={
@@ -2477,6 +3001,16 @@ async def execute(
                 },
             )
 
+        reentry_blocked, reentry_detail = _same_move_reentry_info(ai_context)
+        if reentry_blocked:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "message": "Same-move re-entry blocked until breakout is fresher or AI conviction improves.",
+                    **reentry_detail,
+                },
+            )
+
         broker_response: Dict[str, any] = {}
 
         trail_fields = _init_trailing_fields(trade.price, trade.side)
@@ -2492,10 +3026,32 @@ async def execute(
             "exchange": "NFO",
             "product": "MIS",
             "timestamp": _now(),
+            "trade_mode": "DEMO" if auto_demo else "LIVE",
             "stop_loss": derived_stop,
             "target": derived_target,
             "support": trade.support,
             "resistance": trade.resistance,
+            "quality_score": quality_score,
+            "confirmation_score": confirmation_score,
+            "ai_edge_score": ai_edge_score,
+            "momentum_score": momentum_score,
+            "breakout_score": breakout_score,
+            "option_type": option_type,
+            "trend_direction": trend_direction,
+            "trend_strength": trend_strength,
+            "breakout_confirmed": breakout_confirmed,
+            "momentum_confirmed": momentum_confirmed,
+            "breakout_hold_confirmed": breakout_hold_confirmed,
+            "timing_risk": timing_risk,
+            "sudden_news_risk": sudden_news_risk,
+            "liquidity_spike_risk": liquidity_spike_risk,
+            "premium_distortion_risk": premium_distortion_risk,
+            "close_back_in_range": close_back_in_range,
+            "fake_breakout_by_candle": fake_breakout_by_candle,
+            "start_trade_allowed": start_trade_allowed,
+            "start_trade_decision": start_trade_decision,
+            "market_bias": market_bias,
+            "market_regime": market_regime,
             **trail_fields,
         }
 
@@ -2504,17 +3060,35 @@ async def execute(
         zerodha_symbol = trade.symbol  # You may need to convert to e.g. 'BANKNIFTY24FEB48000CE'
         # Server-side multi-tick confirmation guard to reduce false entries
         underlying = _extract_underlying_symbol(trade.symbol)
+        adaptive_required_ticks = 3
+        confirmation_override = False
         try:
-            confirmed = _require_multi_tick_confirmation(underlying, trade.price, trade.side, required_ticks=3)
+            q_for_ticks = float(quality_score or 0)
+            c_for_ticks = float(confirmation_score or 0)
+            rr_for_ticks = float(_compute_rr(trade.price, trade.target, trade.stop_loss) or 0)
+            if q_for_ticks >= 85.0 and c_for_ticks >= 80.0 and rr_for_ticks >= 1.20:
+                adaptive_required_ticks = 2
+            if q_for_ticks >= 88.0 and c_for_ticks >= 82.0 and rr_for_ticks >= 1.25:
+                confirmation_override = True
+        except Exception:
+            adaptive_required_ticks = 3
+            confirmation_override = False
+        try:
+            confirmed = _require_multi_tick_confirmation(
+                underlying,
+                trade.price,
+                trade.side,
+                required_ticks=adaptive_required_ticks,
+            )
         except Exception as confirmation_error:
             print(f"[API /execute] Multi-tick confirmation failed for {trade.symbol}: {confirmation_error}")
             confirmed = False
 
-        if not confirmed and not auto_demo:
+        if not confirmed and not auto_demo and not confirmation_override:
             raise HTTPException(status_code=403, detail={
                 "message": "Trade blocked: failed multi-tick confirmation (server guard).",
                 "underlying": underlying,
-                "required_ticks": 3,
+                "required_ticks": adaptive_required_ticks,
             })
 
         # If demo mode is active or live is not armed, create a simulated/demo trade instead of placing a real order.
@@ -2668,16 +3242,18 @@ async def update_trade_price(symbol: str, price: float, authorization: Optional[
 
             if trade.get("profit_lock_applied"):
                 if side == "BUY" and price < prev_price:
-                    trade["status"] = "SL_HIT"
-                    trade["exit_reason"] = "SL_HIT"
+                    # After lock-in, first pullback is a profit-trail exit, not a hard stop-loss hit.
+                    trade["status"] = "PROFIT_TRAIL"
+                    trade["exit_reason"] = "PROFIT_TRAIL"
                     _maybe_place_exit_order(trade, price)
                     _close_trade(trade, price)
                     to_close.append(trade)
                     closed += 1
                     continue
                 if side != "BUY" and price > prev_price:
-                    trade["status"] = "SL_HIT"
-                    trade["exit_reason"] = "SL_HIT"
+                    # After lock-in, first pullback is a profit-trail exit, not a hard stop-loss hit.
+                    trade["status"] = "PROFIT_TRAIL"
+                    trade["exit_reason"] = "PROFIT_TRAIL"
                     _maybe_place_exit_order(trade, price)
                     _close_trade(trade, price)
                     to_close.append(trade)

@@ -112,12 +112,14 @@ export const config = {
       ? endpoint 
       : config.getUrl(endpoint);
 
+    const { includeAuth = true, ...restOptions } = options;
+
     const requestOptions = {
-      ...options,
+      ...restOptions,
       headers: {
         'Content-Type': 'application/json',
-        ...config.getAuthHeaders(),
-        ...options.headers,
+        ...(includeAuth ? config.getAuthHeaders() : {}),
+        ...restOptions.headers,
       },
     };
 
