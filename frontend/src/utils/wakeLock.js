@@ -4,19 +4,18 @@
  * Uses multiple strategies for maximum compatibility
  */
 
+import { dedupedConsole, errorDeduped, warnDeduped } from './consoleDeduper';
+
 let wakeLock = null;
 let keepAliveInterval = null;
 let isIntentionalWakeRelease = false;
-const wakeLockLogLastAt = new Map();
 
 const wakeLog = (level, key, message, minIntervalMs = 0) => {
-  const now = Date.now();
-  const lastAt = Number(wakeLockLogLastAt.get(key) || 0);
-  if (minIntervalMs > 0 && (now - lastAt) < minIntervalMs) {
-    return;
-  }
-  wakeLockLogLastAt.set(key, now);
-  console[level](message);
+  dedupedConsole(level, `wake:${key}`, message, {
+    burstWindowMs: Math.max(15000, minIntervalMs || 0),
+    flushDelayMs: 1000,
+    emitFirst: false,
+  });
 };
 
 /**
@@ -47,7 +46,10 @@ export const requestWakeLock = async () => {
       return false;
     }
   } catch (err) {
-    console.error('❌ Wake Lock request failed:', err);
+    errorDeduped('wake:request_failed', '❌ Wake Lock request failed', {
+      burstWindowMs: 60000,
+      flushDelayMs: 1000,
+    }, err);
     return false;
   }
 };
@@ -63,7 +65,10 @@ export const releaseWakeLock = async () => {
       wakeLock = null;
       wakeLog('log', 'wake_released_manual', '✅ Wake Lock released', 15000);
     } catch (err) {
-      console.error('Error releasing wake lock:', err);
+      errorDeduped('wake:release_failed', 'Error releasing wake lock', {
+        burstWindowMs: 60000,
+        flushDelayMs: 1000,
+      }, err);
     } finally {
       // Reset after release event has had a chance to fire.
       setTimeout(() => {
@@ -129,7 +134,10 @@ export const initializeWakeLock = async () => {
       if (!wakeLock && 'wakeLock' in navigator) {
         const relocked = await requestWakeLock();
         if (!relocked) {
-          console.warn('⚠️ Failed to restore wake lock');
+          warnDeduped('wake:restore_failed', '⚠️ Failed to restore wake lock', {
+            burstWindowMs: 30000,
+            flushDelayMs: 1000,
+          });
         }
       }
     }

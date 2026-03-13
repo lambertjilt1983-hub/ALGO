@@ -127,17 +127,20 @@ export default function Dashboard() {
           return;
         }
 
-        await axios.post('/autotrade/execute', {
+        await axios.post('/paper-trades', {
           symbol: sig.symbol,
-          price: sig.entry_price,
-          quantity: sig.quantity,
+          index_name: sig.index || sig.underlying || 'NIFTY',
           side: sig.action,
+          signal_type: sig.signal_type || 'intraday_option',
+          quantity: Number(sig.quantity || 1),
+          entry_price: Number(sig.entry_price || 0),
           stop_loss: sig.stop_loss,
           target: sig.target,
-          expiry: sig.expiry_date || sig.expiry,
-          force_demo: true,
+          strategy: sig.strategy || 'auto-demo',
+          signal_data: sig,
+          bypass_confirmation: false,
         });
-        toast.success(`Auto-trade (demo) executed for ${sig.symbol}`);
+        toast.success(`Paper trade executed for ${sig.symbol}`);
       } catch (err) {
         console.error('Auto-trade attempt failed', err);
         toast.error(err.response?.data?.detail || 'Auto-trade failed');

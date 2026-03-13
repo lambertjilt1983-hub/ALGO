@@ -171,3 +171,54 @@ def test_execute_flat_json_payload_does_not_500_and_keeps_cors(monkeypatch):
     # Regression guard: this used to crash with NameError / payload parsing mismatch.
     assert resp.status_code != 500
     assert resp.headers.get("access-control-allow-origin") == "http://localhost:3000"
+
+
+def test_live_execute_uses_stock_thresholds_and_ignores_stale_start_trade_flags(monkeypatch):
+    state["is_demo_mode"] = False
+    state["live_armed"] = True
+
+    monkeypatch.setattr("app.routes.auto_trading_simple._within_trade_window", lambda: True)
+    monkeypatch.setattr(
+        "app.routes.auto_trading_simple._loss_brake_profile",
+        lambda: {"enabled": False, "stage": "OFF", "block_new_entries": False},
+    )
+    monkeypatch.setattr("app.routes.auto_trading_simple._require_multi_tick_confirmation", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        "app.routes.auto_trading_simple.place_zerodha_order",
+        lambda **kwargs: {"success": True, "order_id": "FAKE-STOCK-1"},
+    )
+
+    app = FastAPI()
+    from app.routes.auto_trading_simple import router as at_router
+    app.include_router(at_router, prefix="/autotrade")
+    client = TestClient(app)
+
+    resp = client.post(
+        "/autotrade/execute",
+        json={
+            "symbol": "SBIN26MAR800CE",
+            "price": 100.0,
+            "balance": 50000,
+            "quantity": 1,
+            "side": "BUY",
+            "stop_loss": 99.0,
+            "target": 101.2,
+            "quality_score": 61,
+            "confirmation_score": 65,
+            "ai_edge_score": 30,
+            "breakout_score": 58,
+            "momentum_score": 58,
+            "breakout_confirmed": True,
+            "momentum_confirmed": True,
+            "breakout_hold_confirmed": True,
+            "signal_type": "stock",
+            "is_stock": True,
+            "start_trade_allowed": False,
+            "start_trade_decision": "NO",
+        },
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["success"] is True
+    assert data["is_demo_mode"] is False

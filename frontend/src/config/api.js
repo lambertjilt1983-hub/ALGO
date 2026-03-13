@@ -112,7 +112,7 @@ export const config = {
       ? endpoint 
       : config.getUrl(endpoint);
 
-    const { includeAuth = true, ...restOptions } = options;
+    const { includeAuth = true, retryTransportOnce = false, ...restOptions } = options;
 
     const requestOptions = {
       ...restOptions,
@@ -124,7 +124,7 @@ export const config = {
     };
 
     const method = String(requestOptions.method || 'GET').toUpperCase();
-    const canRetry = method === 'GET';
+    const canRetry = method === 'GET' || retryTransportOnce;
 
     try {
       return await fetch(url, requestOptions);
@@ -132,11 +132,18 @@ export const config = {
       if (!canRetry) throw error;
 
       // Retry once for intermittent transport/decode issues seen in dev (e.g. content-length mismatch).
-      await new Promise((resolve) => setTimeout(resolve, 150));
-      return await fetch(url, {
-        ...requestOptions,
-        cache: 'no-store',
-      });
+      // Wrap the retry in its own try/catch so a double-failure still returns a failed-response
+      // object instead of re-throwing (avoids redundant browser console stack traces).
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      try {
+        return await fetch(url, {
+          ...requestOptions,
+          cache: 'no-store',
+        });
+      } catch {
+        // Return a synthetic failed response so callers get ok:false without a thrown exception.
+        return new Response(null, { status: 0, statusText: 'Transport Error' });
+      }
     }
   },
 };

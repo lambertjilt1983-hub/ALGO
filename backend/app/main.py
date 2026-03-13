@@ -162,7 +162,7 @@ app.include_router(strategies.router)
 app.include_router(test_market.router)  # Test endpoint with real data
 app.include_router(market_intelligence.router)
 app.include_router(option_signals.router)
-app.include_router(auto_trading_simple.router)  # Using simplified version
+app.include_router(auto_trading_simple.router, prefix="/autotrade")  # Using simplified version
 app.include_router(token_refresh.router)  # Token refresh and validation endpoints
 app.include_router(admin.router)  # Admin-only utilities
 app.include_router(zerodha_postback.router)  # Zerodha postback endpoint

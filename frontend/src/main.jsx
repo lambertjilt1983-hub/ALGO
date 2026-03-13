@@ -2,7 +2,10 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { BrowserRouter } from 'react-router-dom';
 import App from './App';
+import { installConsoleDeduper } from './utils/consoleDeduper';
 import './index.css';
+
+installConsoleDeduper({ burstWindowMs: 60000, flushDelayMs: 1000 });
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>

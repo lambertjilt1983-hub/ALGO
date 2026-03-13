@@ -288,7 +288,52 @@ def _validate_signal_quality(
         elif abs(change_pct) > 0.5:
             quality_score += 5
             quality_factors.append("~ Moderate trend")
-        
+
+        # Factor 4: Risk/Reward ratio (0-20 points)
+        entry_val = float(signal.get("entry_price", 0) or 0)
+        target_val = float(signal.get("target", 0) or 0)
+        sl_val = float(signal.get("stop_loss", 0) or 0)
+        if entry_val > 0 and target_val > 0 and sl_val > 0:
+            profit = abs(target_val - entry_val)
+            risk = abs(entry_val - sl_val)
+            rr = profit / risk if risk > 0 else 0
+            if rr >= 1.5:
+                quality_score += 20
+                quality_factors.append(f"✓ Excellent RR ({rr:.2f}:1)")
+            elif rr >= 1.2:
+                quality_score += 15
+                quality_factors.append(f"✓ Good RR ({rr:.2f}:1)")
+            elif rr >= 1.0:
+                quality_score += 8
+                quality_factors.append(f"~ Acceptable RR ({rr:.2f}:1)")
+
+        # Factor 5: Confirmation score bonus (0-20 points)
+        conf = float(signal.get("confirmation_score", 0) or signal.get("confidence", 0))
+        if conf >= 80:
+            quality_score += 20
+            quality_factors.append(f"✓ High confirmation ({conf:.1f}%)")
+        elif conf >= 65:
+            quality_score += 12
+            quality_factors.append(f"~ Good confirmation ({conf:.1f}%)")
+        elif conf >= 55:
+            quality_score += 6
+            quality_factors.append(f"~ Moderate confirmation ({conf:.1f}%)")
+
+        # Factor 6: Trend alignment bonus (0-10 points)
+        if signal.get("trend_aligned"):
+            quality_score += 10
+            quality_factors.append("✓ Trend aligned")
+
+        # Factor 7: Structural spread bonus — reward signals with meaningful targets (0-15 points)
+        if entry_val > 0 and target_val > entry_val:
+            spread_pct = (target_val - entry_val) / entry_val * 100
+            if spread_pct >= 7:
+                quality_score += 15
+                quality_factors.append(f"✓ Good target spread ({spread_pct:.1f}%)")
+            elif spread_pct >= 4:
+                quality_score += 8
+                quality_factors.append(f"~ Moderate target spread ({spread_pct:.1f}%)")
+
         # Update signal with quality assessment
         signal["quality_score"] = min(100, quality_score)  # Cap at 100
         signal["quality_factors"] = quality_factors
@@ -1122,7 +1167,11 @@ def _apply_confirmation(signal: Dict, sentiment: Dict, trend_row: Dict | None, m
 
     scale = _clamp((1 + trend_bonus + sentiment_bonus) * mode_scale, 0.6, 1.9)
     target_points = round(base_target_points * scale, 2)
-    stop_points = round(max(10, target_points * 0.8), 2)
+    # Use an entry-percentage floor (capped at 10 pts) so cheap stock options are not
+    # burdened with a flat 10-pt stop that dwarfs their target and tanks risk/reward.
+    # For expensive options (entry > 200) the cap keeps the existing 10-pt floor.
+    min_stop_pts = min(10.0, max(1.0, entry * 0.05)) if entry > 0 else 10.0
+    stop_points = round(max(min_stop_pts, target_points * 0.8), 2)
     if entry > 0:
         stop_points = min(stop_points, max(1.0, entry * 0.85))
 

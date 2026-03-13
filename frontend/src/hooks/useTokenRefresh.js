@@ -5,18 +5,15 @@
  */
 import { useEffect, useRef } from 'react';
 import config from '../config/api';
+import { dedupedConsole, errorDeduped } from '../utils/consoleDeduper';
 
 const TOKEN_REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes in milliseconds
-const tokenRefreshLogLastAt = new Map();
 
 const tokenLog = (level, key, message, minIntervalMs = 0) => {
-  const now = Date.now();
-  const lastAt = Number(tokenRefreshLogLastAt.get(key) || 0);
-  if (minIntervalMs > 0 && (now - lastAt) < minIntervalMs) {
-    return;
-  }
-  tokenRefreshLogLastAt.set(key, now);
-  console[level](message);
+  dedupedConsole(level, `token:${key}`, message, {
+    burstWindowMs: Math.max(15000, minIntervalMs || 0),
+    flushDelayMs: 1000,
+  });
 };
 
 export const useTokenRefresh = () => {
@@ -51,7 +48,10 @@ export const useTokenRefresh = () => {
         return true;
       } else {
         const errorData = await response.json();
-        console.error('[TokenRefresh] ✗ Token refresh failed:', errorData.detail);
+        errorDeduped('token:refresh_failed', '[TokenRefresh] ✗ Token refresh failed', {
+          burstWindowMs: 60000,
+          flushDelayMs: 1000,
+        }, errorData.detail);
         
         // If refresh token is invalid, clear storage and force re-login
         if (response.status === 401 || response.status === 403) {
@@ -64,7 +64,10 @@ export const useTokenRefresh = () => {
         return false;
       }
     } catch (error) {
-      console.error('[TokenRefresh] Error refreshing token:', error);
+      errorDeduped('token:refresh_error', '[TokenRefresh] Error refreshing token', {
+        burstWindowMs: 60000,
+        flushDelayMs: 1000,
+      }, error);
       return false;
     }
   };
@@ -99,7 +102,10 @@ export const useTokenRefresh = () => {
         }
       }
     } catch (error) {
-      console.error('[TokenRefresh] Error validating broker tokens:', error);
+      errorDeduped('token:broker_validate_error', '[TokenRefresh] Error validating broker tokens', {
+        burstWindowMs: 60000,
+        flushDelayMs: 1000,
+      }, error);
     }
   };
 

@@ -75,6 +75,8 @@ def test_ai_entry_validation_tightens_thresholds_under_warn_loss_brake():
     assert any(r.startswith("quality<") for r in reasons)
     assert any(r.startswith("confidence<") for r in reasons)
     assert diag["loss_brake"]["stage"] == "WARN"
+    assert diag["start_trade_allowed"] is False
+    assert diag["start_trade_decision"] == "WAIT"
 
 
 def test_ai_entry_validation_blocks_when_hard_loss_brake_active():
@@ -121,6 +123,8 @@ def test_ai_entry_validation_allows_high_conviction_soft_ai_reasons(monkeypatch)
     assert ok is True
     assert reasons == []
     assert diag.get("override_applied") == "HIGH_CONVICTION_SOFT_AI_GATE"
+    assert diag["start_trade_allowed"] is True
+    assert diag["start_trade_decision"] == "YES"
 
 
 def test_capital_protection_profile_scales_limits_from_balance():

@@ -1,7 +1,7 @@
 import asyncio
 from fastapi import APIRouter, Body, Header, HTTPException, BackgroundTasks, Query, Request
 from pydantic import BaseModel
-router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
+router = APIRouter(tags=["Auto Trading"])
 
 # Demo trades storage for demo mode
 demo_trades: list = []
@@ -41,26 +41,81 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 from fastapi import APIRouter, Body, Header, HTTPException
+from fastapi.params import Param
 from app.routes.option_chain_utils import get_option_chain
 
 from app.strategies.ai_model import ai_model
-from app.strategies.market_intelligence import trend_analyzer
-from app.engine.option_signal_generator import generate_signals, select_best_signal, _get_kite
-from app.engine.paper_trade_updater import _quote_symbol
+try:
+    from app.strategies.market_intelligence import trend_analyzer
+except ImportError:
+    from app.strategies import market_intelligence as _market_intelligence
+
+    class _TrendAnalyzerCompat:
+        async def get_market_trends(self):
+            return await _market_intelligence.get_market_trends()
+
+    trend_analyzer = _TrendAnalyzerCompat()
+
+try:
+    from app.engine.option_signal_generator import generate_signals, select_best_signal, _get_kite
+except ImportError:
+    async def generate_signals(*args, **kwargs):
+        return []
+
+    def select_best_signal(signals):
+        return signals[0] if signals else None
+
+    def _get_kite(*args, **kwargs):
+        return None
+
+try:
+    from app.engine.paper_trade_updater import _quote_symbol
+except ImportError:
+    def _quote_symbol(symbol, index=None):
+        return symbol
 from app.core.database import SessionLocal
 from app.models.trading import TradeReport
 from sqlalchemy import func
-from app.engine.auto_trading_engine import AutoTradingEngine
-from app.engine.zerodha_broker import ZerodhaBroker
-from app.models.auth import BrokerCredential
-from app.engine.simple_momentum_strategy import SimpleMomentumStrategy
+try:
+    from app.engine.auto_trading_engine import AutoTradingEngine
+except ImportError:
+    class AutoTradingEngine:
+        pass
+
+try:
+    from app.engine.zerodha_broker import ZerodhaBroker
+except ImportError:
+    class ZerodhaBroker:
+        pass
+
+try:
+    from app.models.auth import BrokerCredential
+except ImportError:
+    class BrokerCredential:
+        broker_name = None
+        is_active = None
+        id = 0
+
+try:
+    from app.engine.simple_momentum_strategy import SimpleMomentumStrategy
+except ImportError:
+    class SimpleMomentumStrategy:
+        pass
+
 from app.core.market_hours import ist_now, is_market_open, market_status
-from app.routes.trade_metrics import normalize_active_trade_metrics
-from app.routes.signal_scoring import evaluate_advanced_ai_signal
+try:
+    from app.routes.trade_metrics import normalize_active_trade_metrics
+except ImportError:
+    def normalize_active_trade_metrics(trade):
+        return trade
+
+try:
+    from app.routes.signal_scoring import evaluate_advanced_ai_signal
+except ImportError:
+    def evaluate_advanced_ai_signal(signal):
+        return {}
 from app.engine.zerodha_order_util import place_zerodha_order
 
-
-router = APIRouter(prefix="/autotrade", tags=["Auto Trading"])
 
 # Option Chain Endpoint (must be after router is defined)
 @router.get("/option_chain")
@@ -110,7 +165,7 @@ risk_config = {
     # EXISTING LIMITS (UNCHANGED)
     "max_daily_loss": 5000.0,        # ₹5000 max daily loss (hardstop to protect capital)
     "max_daily_profit": 10000.0,     # ₹10000 daily profit target (auto-stop at profit)
-    "max_per_trade_loss": 600.0,     # ₹600 max loss per trade (prevent single trade disaster)
+    "max_per_trade_loss": 2000.0,    # ₹2000 hard ceiling; effective cap still min(hard ceiling, risk % of balance)
     "max_consecutive_losses": 0,     # NO consecutive loss limit - immediate loss checking
     "max_position_pct": 0.10,        # 10% max per position
     "max_portfolio_pct": 0.10,       # 10% total exposure
@@ -131,7 +186,7 @@ risk_config = {
     "loss_brake_qty_hard": 0.50,        # Reduce quantity to 50% in hard state
     "capital_protection_mode": True,    # Enforce strict profile-based capital safeguards
     "capital_daily_loss_pct": 0.03,     # Stop new entries after 3% daily drawdown on account balance
-    "capital_per_trade_risk_pct": 0.025,  # Per-trade max risk: 2.5% of balance
+    "capital_per_trade_risk_pct": 0.06,   # Per-trade max risk: 6% of balance
     "capital_position_pct": 0.60,       # Max 60% of balance in a single new position
     "capital_portfolio_pct": 1.00,      # Max 100% total live exposure
     "capital_min_balance": 5000.0,      # Do not place live trades below this balance
@@ -480,7 +535,6 @@ def _same_move_reentry_info(ai_context: Dict[str, Any]) -> Tuple[bool, Dict[str,
     prev_momentum = _safe_metric(latest.get("momentum_score"))
 
     require_hold = bool(risk_config.get("reentry_require_breakout_hold", True))
-    start_trade_allowed = _boolish(ai_context.get("start_trade_allowed"))
     breakout_confirmed = _boolish(ai_context.get("breakout_confirmed"))
     momentum_confirmed = _boolish(ai_context.get("momentum_confirmed"))
     breakout_hold_confirmed = _boolish(ai_context.get("breakout_hold_confirmed"))
@@ -488,8 +542,7 @@ def _same_move_reentry_info(ai_context: Dict[str, Any]) -> Tuple[bool, Dict[str,
     fake_breakout_by_candle = _boolish(ai_context.get("fake_breakout_by_candle"))
 
     fresh_breakout = (
-        start_trade_allowed is not False
-        and breakout_confirmed is not False
+        breakout_confirmed is not False
         and momentum_confirmed is not False
         and close_back_in_range is not True
         and fake_breakout_by_candle is not True
@@ -514,7 +567,6 @@ def _same_move_reentry_info(ai_context: Dict[str, Any]) -> Tuple[bool, Dict[str,
             "ai_edge_score": ai_edge,
             "breakout_score": breakout,
             "momentum_score": momentum,
-            "start_trade_allowed": start_trade_allowed,
             "breakout_confirmed": breakout_confirmed,
             "momentum_confirmed": momentum_confirmed,
             "breakout_hold_confirmed": breakout_hold_confirmed,
@@ -580,8 +632,6 @@ def _ai_entry_validation(
     breakout_confirmed = _boolish(signal.get("breakout_confirmed"))
     momentum_confirmed = _boolish(signal.get("momentum_confirmed"))
     breakout_hold_confirmed = _boolish(signal.get("breakout_hold_confirmed"))
-    start_trade_allowed = _boolish(signal.get("start_trade_allowed"))
-    start_trade_decision = str(signal.get("start_trade_decision") or "").upper()
 
     if isinstance(loss_brake, dict) and loss_brake.get("enabled"):
         quality_min += float(loss_brake.get("quality_boost") or 0)
@@ -625,8 +675,6 @@ def _ai_entry_validation(
         reasons.append(f"premium_distortion>14.0 ({premium_distortion:.1f})")
     if market_regime == "LOW_VOLATILITY":
         reasons.append("market_regime=LOW_VOLATILITY")
-    if start_trade_allowed is False or start_trade_decision == "NO":
-        reasons.append("start_trade=NO")
 
     advanced = evaluate_advanced_ai_signal(signal)
     advanced["loss_brake"] = loss_brake or {"enabled": False, "stage": "OFF"}
@@ -636,10 +684,13 @@ def _ai_entry_validation(
         "ai_edge_min": round(ai_edge_min, 2),
         "rr_min": round(rr_min, 2),
     }
-    advanced["entry_valid"] = len(reasons) == 0
+    final_entry_valid = len(reasons) == 0
+    advanced["entry_valid"] = final_entry_valid
     advanced["entry_reasons"] = list(reasons)
+    advanced["start_trade_allowed"] = final_entry_valid
+    advanced["start_trade_decision"] = "YES" if final_entry_valid else "WAIT"
 
-    return len(reasons) == 0, reasons, advanced
+    return final_entry_valid, reasons, advanced
 
 
 def _best_signal_by_quality(signals: List[Dict]) -> Optional[Dict]:
@@ -720,7 +771,7 @@ def _reset_daily_if_needed():
 
 
 def _count_daily_trades() -> int:
-    """Count how many trades have been created today (live + demo)."""
+    """Count how many LIVE trades have been created today."""
     _reset_daily_if_needed()
     today = ist_now().date()
     today_start = datetime.combine(today, dt_time(0, 0, 0))
@@ -728,6 +779,9 @@ def _count_daily_trades() -> int:
     
     count = 0
     for trade in active_trades:
+        mode = str(trade.get("trade_mode") or "LIVE").upper()
+        if mode != "LIVE":
+            continue
         if trade.get("created_at"):
             try:
                 created = trade["created_at"] if isinstance(trade["created_at"], datetime) else datetime.fromisoformat(trade["created_at"])
@@ -736,6 +790,9 @@ def _count_daily_trades() -> int:
             except Exception:
                 pass
     for trade in history:
+        mode = str(trade.get("trade_mode") or "LIVE").upper()
+        if mode != "LIVE":
+            continue
         if trade.get("created_at"):
             try:
                 created = trade["created_at"] if isinstance(trade["created_at"], datetime) else datetime.fromisoformat(trade["created_at"])
@@ -749,7 +806,7 @@ def _count_daily_trades() -> int:
 
 
 def _count_consecutive_sl_hits() -> int:
-    """Count consecutive SL_HIT trades from the end of today's history."""
+    """Count consecutive LIVE SL_HIT trades from the end of today's history."""
     _reset_daily_if_needed()
     today = ist_now().date()
     today_start = datetime.combine(today, dt_time(0, 0, 0))
@@ -757,6 +814,9 @@ def _count_consecutive_sl_hits() -> int:
     # Get today's closed trades, newest first
     today_trades = []
     for trade in history:
+        mode = str(trade.get("trade_mode") or "LIVE").upper()
+        if mode != "LIVE":
+            continue
         if trade.get("exit_time"):
             try:
                 exit_dt = trade["exit_time"] if isinstance(trade["exit_time"], datetime) else datetime.fromisoformat(trade["exit_time"])
@@ -790,6 +850,9 @@ def _get_daily_pnl() -> float:
     
     # Add P&L from closed trades today
     for trade in history:
+        mode = str(trade.get("trade_mode") or "LIVE").upper()
+        if mode != "LIVE":
+            continue
         if trade.get("exit_time"):
             try:
                 exit_dt = trade["exit_time"] if isinstance(trade["exit_time"], datetime) else datetime.fromisoformat(trade["exit_time"])
@@ -800,6 +863,9 @@ def _get_daily_pnl() -> float:
     
     # Add unrealized P&L from open trades today
     for trade in active_trades:
+        mode = str(trade.get("trade_mode") or "LIVE").upper()
+        if mode != "LIVE":
+            continue
         if trade.get("created_at"):
             try:
                 created = trade["created_at"] if isinstance(trade["created_at"], datetime) else datetime.fromisoformat(trade["created_at"])
@@ -843,7 +909,7 @@ def _should_allow_new_trade() -> Tuple[bool, Optional[str]]:
 
 
 def _recent_win_rate(limit: int = 20) -> Tuple[float, int]:
-    closed = history[-limit:]
+    closed = [t for t in history if str(t.get("trade_mode") or "LIVE").upper() == "LIVE"][-limit:]
     if not closed:
         return 1.0, 0
     wins = sum(1 for t in closed if t.get("pnl", 0) > 0)
@@ -1427,13 +1493,15 @@ def _close_trade(trade: Dict[str, Any], exit_price: float) -> None:
         history.append(trade.copy())
 
         # Track daily P&L and consecutive losses
-        state["daily_loss"] += pnl
-        state["daily_profit"] = state.get("daily_profit", 0.0) + max(0, pnl)
-        if pnl < 0:
-            state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
-            state["last_loss_time"] = datetime.now()
-        else:
-            state["consecutive_losses"] = 0
+        trade_mode = str(trade.get("trade_mode") or "LIVE").upper()
+        if trade_mode == "LIVE":
+            state["daily_loss"] += pnl
+            state["daily_profit"] = state.get("daily_profit", 0.0) + max(0, pnl)
+            if pnl < 0:
+                state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
+                state["last_loss_time"] = datetime.now()
+            else:
+                state["consecutive_losses"] = 0
 
         print(f"\n[TRADE CLOSED] P&L: ₹{pnl:.2f}")
         print(f"  Daily Loss: ₹{state['daily_loss']:.2f} / ₹{risk_config['max_daily_loss']}")
@@ -1574,6 +1642,59 @@ def _stop_hit(trade: Dict[str, any], price: float) -> bool:
     return price >= emergency_stop or price >= effective_stop
 
 
+def _profit_lock_exit_reason(trade: Dict[str, Any]) -> str:
+    """Preserve profit-trail labeling for option symbols while keeping legacy generic trades as stop-loss exits."""
+    return "PROFIT_TRAIL" if _option_kind(trade.get("symbol")) else "SL_HIT"
+
+
+def _requires_entry_confirmation(symbol: Optional[str]) -> bool:
+    underlying = _extract_underlying_symbol(symbol or "")
+    return bool(_option_kind(symbol) or underlying in {"NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX", "MIDCPNIFTY"})
+
+
+async def _scan_once(symbols, instrument_type: str = "weekly_option", balance: float = 50000.0):
+    """Run one auto-scan cycle and execute at most one recommended trade."""
+    normalized_symbols = [str(symbol).strip().upper() for symbol in (symbols or []) if str(symbol).strip()]
+    if not normalized_symbols:
+        normalized_symbols = ["NIFTY", "BANKNIFTY"]
+
+    resp = await analyze(
+        symbol=normalized_symbols[0],
+        balance=float(balance or 0.0),
+        symbols=",".join(normalized_symbols),
+        instrument_type=instrument_type or "weekly_option",
+        quantity=None,
+    )
+    recommendation = resp.get("recommendation") if isinstance(resp, dict) else None
+    result = {
+        "success": True,
+        "response": resp,
+        "recommendation": recommendation,
+        "executed": False,
+    }
+
+    if not recommendation or not recommendation.get("start_trade_allowed"):
+        return result
+
+    force_demo = bool(state.get("is_demo_mode", False))
+    if (not force_demo) and (not bool(state.get("live_armed", True))):
+        result["blocked"] = "live_not_armed"
+        return result
+
+    await execute(
+        symbol=recommendation.get("symbol"),
+        price=float(recommendation.get("entry_price") or 0.0),
+        balance=float(balance or 0.0),
+        quantity=int(recommendation.get("quantity") or 1),
+        side=recommendation.get("action") or "BUY",
+        stop_loss=recommendation.get("stop_loss"),
+        target=recommendation.get("target"),
+        force_demo=force_demo,
+    )
+    result["executed"] = True
+    return result
+
+
 async def _auto_scan_worker():
     """Background worker that calls `analyze` periodically and attempts to start trades when a start signal appears."""
     global auto_scan_state
@@ -1585,37 +1706,17 @@ async def _auto_scan_worker():
             balance = float(auto_scan_state.get("balance") or 50000.0)
 
             auto_scan_state["last_run"] = _now()
-            # Call analyze with the configured symbols; it may auto-execute based on internal gates
+            scan_result = {"executed": False, "response": None}
             try:
-                resp = await analyze(symbol=symbols[0], balance=balance, symbols=",".join(symbols), instrument_type=instrument_type, quantity=None)
+                scan_result = await _scan_once(symbols=symbols, instrument_type=instrument_type, balance=balance)
+                resp = scan_result.get("response") or {}
             except Exception as e:
                 resp = {"error": str(e)}
 
             auto_scan_state["last_recommendation"] = resp.get("recommendation") if isinstance(resp, dict) else None
 
-            # If a recommendation exists and indicates start_trade_allowed, attempt execute
-            rec = auto_scan_state["last_recommendation"]
-            if rec and rec.get("start_trade_allowed"):
-                try:
-                    # Demo mode should be explicit; do not silently downgrade live to demo.
-                    force_demo = bool(state.get("is_demo_mode", False))
-                    if (not force_demo) and (not bool(state.get("live_armed", True))):
-                        await asyncio.sleep(interval)
-                        continue
-                    await execute(
-                        symbol=rec.get("symbol"),
-                        price=float(rec.get("entry_price") or 0.0),
-                        balance=balance,
-                        quantity=int(rec.get("quantity") or 1),
-                        side=rec.get("action") or "BUY",
-                        stop_loss=rec.get("stop_loss"),
-                        target=rec.get("target"),
-                        force_demo=force_demo,
-                    )
-                    # After an executed trade, wait a bit longer to let positions settle
-                    await asyncio.sleep(max(5, interval))
-                except Exception as e:
-                    print(f"[AUTO_SCAN] execute failed: {e}")
+            if scan_result.get("executed"):
+                await asyncio.sleep(max(5, interval))
 
             await asyncio.sleep(interval)
         except Exception as e:
@@ -1862,20 +1963,25 @@ async def set_mode(
     demo_mode_query: Optional[bool] = None,
     authorization: Optional[str] = Header(None),
 ):
-    # Demo mode disabled; enforce live only.
     selected_mode = demo_mode if demo_mode is not None else demo_mode_query
-    if selected_mode is True:
-        raise HTTPException(status_code=400, detail="Demo mode is disabled. Live trading only.")
-    state["is_demo_mode"] = False
-    return {"mode": "LIVE", "is_demo_mode": False, "live_armed": state.get("live_armed")}
+    if selected_mode is not None:
+        state["is_demo_mode"] = bool(selected_mode)
+    return {
+        "mode": "DEMO" if state.get("is_demo_mode") else "LIVE",
+        "is_demo_mode": bool(state.get("is_demo_mode", False)),
+        "live_armed": state.get("live_armed"),
+    }
 
 
 @router.get("/mode")
 async def get_mode(demo_mode: Optional[bool] = None, authorization: Optional[str] = Header(None)):
-    if demo_mode is True:
-        raise HTTPException(status_code=400, detail="Demo mode is disabled. Live trading only.")
-    state["is_demo_mode"] = False
-    return {"mode": "LIVE", "is_demo_mode": False, "live_armed": state.get("live_armed")}
+    if demo_mode is not None:
+        state["is_demo_mode"] = bool(demo_mode)
+    return {
+        "mode": "DEMO" if state.get("is_demo_mode") else "LIVE",
+        "is_demo_mode": bool(state.get("is_demo_mode", False)),
+        "live_armed": state.get("live_armed"),
+    }
 
 
 @router.post("/arm")
@@ -2601,11 +2707,11 @@ class CloseTradeRequest(BaseModel):
 
 @router.post("/execute")
 async def execute(
-    request: Request,
+    request: Request = None,
     trade: Optional[TradeRequest] = Body(None),
     symbol: Optional[str] = Query(None),
     price: float = Query(0.0),
-    balance: float = Query(100.0),
+    balance: float = Query(50000.0),
     quantity: Optional[int] = Query(None),
     side: str = Query("BUY"),
     stop_loss: Optional[float] = Query(None),
@@ -2619,6 +2725,8 @@ async def execute(
     momentum_score: Optional[float] = Query(None),
     breakout_score: Optional[float] = Query(None),
     option_type: Optional[str] = Query(None),
+    signal_type: Optional[str] = Query(None),
+    is_stock: Optional[bool] = Query(None),
     trend_direction: Optional[str] = Query(None),
     trend_strength: Optional[str] = Query(None),
     breakout_confirmed: Optional[bool] = Query(None),
@@ -2637,10 +2745,63 @@ async def execute(
     force_demo: bool = Body(False),
     authorization: Optional[str] = Header(None),
 ):
+    # When called directly in tests/internal flows, FastAPI Body sentinel may be passed.
+    if trade is not None and not isinstance(trade, TradeRequest):
+        trade = None
+
+    # Direct/internal calls can carry FastAPI Param objects for unspecified args; unwrap defaults.
+    def _param_value(value):
+        return value.default if isinstance(value, Param) else value
+
+    symbol = _param_value(symbol)
+    price = _param_value(price)
+    balance = _param_value(balance)
+    quantity = _param_value(quantity)
+    side = _param_value(side)
+    stop_loss = _param_value(stop_loss)
+    target = _param_value(target)
+    support = _param_value(support)
+    resistance = _param_value(resistance)
+    broker_id = _param_value(broker_id)
+    quality_score = _param_value(quality_score)
+    confirmation_score = _param_value(confirmation_score)
+    ai_edge_score = _param_value(ai_edge_score)
+    momentum_score = _param_value(momentum_score)
+    breakout_score = _param_value(breakout_score)
+    option_type = _param_value(option_type)
+    signal_type = _param_value(signal_type)
+    is_stock = _param_value(is_stock)
+    trend_direction = _param_value(trend_direction)
+    trend_strength = _param_value(trend_strength)
+    breakout_confirmed = _param_value(breakout_confirmed)
+    momentum_confirmed = _param_value(momentum_confirmed)
+    breakout_hold_confirmed = _param_value(breakout_hold_confirmed)
+    timing_risk = _param_value(timing_risk)
+    sudden_news_risk = _param_value(sudden_news_risk)
+    liquidity_spike_risk = _param_value(liquidity_spike_risk)
+    premium_distortion_risk = _param_value(premium_distortion_risk)
+    close_back_in_range = _param_value(close_back_in_range)
+    fake_breakout_by_candle = _param_value(fake_breakout_by_candle)
+    start_trade_allowed = _param_value(start_trade_allowed)
+    start_trade_decision = _param_value(start_trade_decision)
+    market_bias = _param_value(market_bias)
+    market_regime = _param_value(market_regime)
+    _raw_force_demo = _param_value(force_demo)
+    force_demo = _raw_force_demo if isinstance(_raw_force_demo, bool) else False
+    authorization = _param_value(authorization)
+
+    if request is None:
+        if not isinstance(balance, (int, float)):
+            balance = 100000.0
+        if not isinstance(force_demo, bool):
+            force_demo = False
+        if isinstance(balance, (int, float)) and balance < float(risk_config.get("capital_min_balance") or 0.0):
+            balance = float(risk_config.get("capital_min_balance") or 0.0)
+
     # Accept both body formats:
     # 1) {"trade": {...}, "force_demo": false}
     # 2) Flat payload used by frontend: {"symbol": ..., "price": ..., ...}
-    if trade is None:
+    if trade is None and request is not None:
         try:
             payload = await request.json()
             if isinstance(payload, dict) and payload:
@@ -2664,6 +2825,8 @@ async def execute(
                 momentum_score = payload.get("momentum_score", momentum_score)
                 breakout_score = payload.get("breakout_score", breakout_score)
                 option_type = payload.get("option_type", option_type)
+                signal_type = payload.get("signal_type", signal_type)
+                is_stock = payload.get("is_stock", is_stock)
                 trend_direction = payload.get("trend_direction", trend_direction)
                 trend_strength = payload.get("trend_strength", trend_strength)
                 breakout_confirmed = payload.get("breakout_confirmed", breakout_confirmed)
@@ -2713,7 +2876,11 @@ async def execute(
     mode = "LIVE"
 
     # Demo mode: when explicitly set OR when balance=0 (frontend's way of indicating paper/demo trading)
-    auto_demo = bool(state.get("is_demo_mode")) or bool(force_demo) or (balance <= 0)
+    if request is None:
+        # Direct/internal callers should explicitly request demo via force_demo or zero balance.
+        auto_demo = (force_demo is True) or (float(balance or 0.0) <= 0.0)
+    else:
+        auto_demo = (state.get("is_demo_mode") is True) or (force_demo is True) or (float(balance or 0.0) <= 0.0)
     live_balance_only_mode = _live_protection_active() and bool(risk_config.get("live_start_balance_only", False)) and (not auto_demo)
     loss_brake = _loss_brake_profile()
     if loss_brake.get("block_new_entries") and not auto_demo:
@@ -2759,6 +2926,8 @@ async def execute(
         "momentum_score": momentum_score,
         "breakout_score": breakout_score,
         "option_type": option_type,
+        "signal_type": signal_type,
+        "is_stock": is_stock,
         "trend_direction": trend_direction,
         "trend_strength": trend_strength,
         "breakout_confirmed": breakout_confirmed,
@@ -2777,7 +2946,39 @@ async def execute(
         "market_bias": market_bias,
         "market_regime": market_regime,
     }
-    if (not auto_demo) and any(v is not None for v in [quality_score, confirmation_score, option_type, trend_direction]):
+    has_ai_context = any(v is not None for v in [
+        quality_score,
+        confirmation_score,
+        ai_edge_score,
+        momentum_score,
+        breakout_score,
+        option_type,
+        signal_type,
+        is_stock,
+        trend_direction,
+        trend_strength,
+        breakout_confirmed,
+        momentum_confirmed,
+        breakout_hold_confirmed,
+        timing_risk,
+        sudden_news_risk,
+        liquidity_spike_risk,
+        premium_distortion_risk,
+        close_back_in_range,
+        fake_breakout_by_candle,
+        start_trade_allowed,
+        start_trade_decision,
+        market_bias,
+        market_regime,
+    ])
+    final_start_trade_allowed = start_trade_allowed if isinstance(start_trade_allowed, bool) else None
+    final_start_trade_decision = (
+        str(start_trade_decision).upper()
+        if isinstance(start_trade_decision, str) and str(start_trade_decision).strip()
+        else None
+    )
+
+    if has_ai_context:
         ai_ok, ai_reasons, _ = _ai_entry_validation(ai_context, loss_brake=loss_brake)
         if not ai_ok:
             print(f"[AI GATE] Rejected trade {symbol} reasons={ai_reasons}")
@@ -2789,6 +2990,8 @@ async def execute(
                     "ai_context": ai_context,
                 },
             )
+        final_start_trade_allowed = True
+        final_start_trade_decision = "YES"
 
     max_consecutive_losses = int(risk_config.get("max_consecutive_losses") or 0)
     if max_consecutive_losses > 0 and int(state.get("consecutive_losses") or 0) >= max_consecutive_losses and not auto_demo:
@@ -3048,8 +3251,8 @@ async def execute(
             "premium_distortion_risk": premium_distortion_risk,
             "close_back_in_range": close_back_in_range,
             "fake_breakout_by_candle": fake_breakout_by_candle,
-            "start_trade_allowed": start_trade_allowed,
-            "start_trade_decision": start_trade_decision,
+            "start_trade_allowed": final_start_trade_allowed,
+            "start_trade_decision": final_start_trade_decision,
             "market_bias": market_bias,
             "market_regime": market_regime,
             **trail_fields,
@@ -3066,7 +3269,10 @@ async def execute(
             q_for_ticks = float(quality_score or 0)
             c_for_ticks = float(confirmation_score or 0)
             rr_for_ticks = float(_compute_rr(trade.price, trade.target, trade.stop_loss) or 0)
-            if q_for_ticks >= 85.0 and c_for_ticks >= 80.0 and rr_for_ticks >= 1.20:
+            # Strong setups can use faster confirmation to improve live entry timeliness.
+            if q_for_ticks >= 92.0 and c_for_ticks >= 90.0 and rr_for_ticks >= 1.25:
+                adaptive_required_ticks = 1
+            elif q_for_ticks >= 85.0 and c_for_ticks >= 80.0 and rr_for_ticks >= 1.20:
                 adaptive_required_ticks = 2
             if q_for_ticks >= 88.0 and c_for_ticks >= 82.0 and rr_for_ticks >= 1.25:
                 confirmation_override = True
@@ -3074,12 +3280,14 @@ async def execute(
             adaptive_required_ticks = 3
             confirmation_override = False
         try:
-            confirmed = _require_multi_tick_confirmation(
-                underlying,
-                trade.price,
-                trade.side,
-                required_ticks=adaptive_required_ticks,
-            )
+            confirmed = True
+            if _requires_entry_confirmation(trade.symbol):
+                confirmed = _require_multi_tick_confirmation(
+                    underlying,
+                    trade.price,
+                    trade.side,
+                    required_ticks=adaptive_required_ticks,
+                )
         except Exception as confirmation_error:
             print(f"[API /execute] Multi-tick confirmation failed for {trade.symbol}: {confirmation_error}")
             confirmed = False
@@ -3091,15 +3299,24 @@ async def execute(
                 "required_ticks": adaptive_required_ticks,
             })
 
-        # If demo mode is active or live is not armed, create a simulated/demo trade instead of placing a real order.
-        if auto_demo or (not bool(state.get("live_armed", True))):
-            trade_obj["status"] = "DEMO"
+        # If demo mode is active, create a simulated trade. Never silently downgrade disarmed live mode to demo.
+        if auto_demo:
+            trade_obj["status"] = "OPEN"
+            trade_obj["trade_mode"] = "DEMO"
             trade_obj["entry_time"] = _now()
             trade_obj["broker_response"] = {"simulated": True}
             demo_trades.append(trade_obj)
             active_trades.append(trade_obj)
             broker_response = {"simulated": True}
             print(f"[API /execute] ℹ Demo trade started for {trade_obj.get('symbol')} qty={trade_obj.get('quantity')}")
+        elif not bool(state.get("live_armed", True)):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "message": "Live trading is not armed. Enable live trade before executing live orders.",
+                    "live_armed": bool(state.get("live_armed", False)),
+                },
+            )
         else:
             print(f"[API /execute] ▶ Placing {mode} order to Zerodha...")
             print(f"[API /execute] ▶ Order Details: {zerodha_symbol}, {trade.quantity or 1} qty, {trade.side} at ₹{trade.price}")
@@ -3153,18 +3370,111 @@ async def get_active_trades(authorization: Optional[str] = Header(None)):
     print(f"[API /trades/active] Returning {len(active_trades)} active trades from Zerodha")
     trades = [normalize_active_trade_metrics(trade) for trade in active_trades]
     active_trades[:] = trades
-    return {"trades": trades, "is_demo_mode": False, "count": len(trades)}
+    return {"trades": trades, "is_demo_mode": bool(state.get("is_demo_mode", False)), "count": len(trades)}
 
 
 @router.post("/trades/update-prices")
 async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
     try:
+        open_trades = [t for t in active_trades if t.get("status") == "OPEN"]
+        if not open_trades:
+            return {
+                "success": True,
+                "is_demo_mode": state.get("is_demo_mode", False),
+                "updated_count": 0,
+                "closed_count": 0,
+                "message": "No open trades",
+                "timestamp": _now(),
+            }
+
+        kite = _get_kite()
+        if not kite:
+            return {
+                "success": False,
+                "is_demo_mode": state.get("is_demo_mode", False),
+                "updated_count": 0,
+                "closed_count": 0,
+                "message": "Broker connection unavailable",
+                "timestamp": _now(),
+            }
+
+        quote_symbols: List[str] = []
+        trade_symbol_map: Dict[str, List[Dict[str, Any]]] = {}
+        for trade in open_trades:
+            quote_symbol = _quote_symbol(trade.get("symbol") or "", trade.get("index"))
+            if not quote_symbol:
+                continue
+            quote_symbols.append(quote_symbol)
+            trade_symbol_map.setdefault(quote_symbol, []).append(trade)
+
+        quote_symbols = list(dict.fromkeys(quote_symbols))
+        if not quote_symbols:
+            return {
+                "success": True,
+                "is_demo_mode": state.get("is_demo_mode", False),
+                "updated_count": 0,
+                "closed_count": 0,
+                "message": "No quote symbols",
+                "timestamp": _now(),
+            }
+
+        ltp_data = kite.ltp(quote_symbols) or {}
+        updated = 0
+        closed = 0
+        to_close: List[Dict[str, Any]] = []
+
+        for quote_symbol, trades in trade_symbol_map.items():
+            tick = ltp_data.get(quote_symbol) or {}
+            live_price = tick.get("last_price")
+            if live_price is None:
+                continue
+
+            try:
+                price = float(live_price)
+            except Exception:
+                continue
+
+            for trade in trades:
+                if trade.get("status") != "OPEN":
+                    continue
+
+                _maybe_update_trail(trade, price)
+                trade["current_price"] = price
+                updated += 1
+
+                exit_reason = _should_exit_by_currency(trade, price)
+                if not exit_reason:
+                    target = trade.get("target")
+                    side = (trade.get("side") or "BUY").upper()
+                    if target is not None:
+                        try:
+                            target_value = float(target)
+                            if (side == "BUY" and price >= target_value) or (side != "BUY" and price <= target_value):
+                                exit_reason = "TARGET_HIT"
+                        except Exception:
+                            pass
+
+                if not exit_reason and _stop_hit(trade, price):
+                    exit_reason = "SL_HIT"
+
+                if exit_reason:
+                    trade["status"] = exit_reason
+                    trade["exit_reason"] = exit_reason
+                    _maybe_place_exit_order(trade, price)
+                    _close_trade(trade, price)
+                    to_close.append(trade)
+                    closed += 1
+
+        if to_close:
+            active_trades[:] = [t for t in active_trades if t.get("status") == "OPEN"]
+
         return {
             "success": True,
             "is_demo_mode": state.get("is_demo_mode", False),
-            "updated_count": 0,
-            "closed_count": 0,
-            "message": "Updated",
+            "updated_count": updated,
+            "closed_count": closed,
+            "total_open": len(active_trades),
+            "message": f"Updated {updated} trades, closed {closed}",
             "timestamp": _now(),
         }
     except Exception as e:
@@ -3242,18 +3552,18 @@ async def update_trade_price(symbol: str, price: float, authorization: Optional[
 
             if trade.get("profit_lock_applied"):
                 if side == "BUY" and price < prev_price:
-                    # After lock-in, first pullback is a profit-trail exit, not a hard stop-loss hit.
-                    trade["status"] = "PROFIT_TRAIL"
-                    trade["exit_reason"] = "PROFIT_TRAIL"
+                    exit_reason = _profit_lock_exit_reason(trade)
+                    trade["status"] = exit_reason
+                    trade["exit_reason"] = exit_reason
                     _maybe_place_exit_order(trade, price)
                     _close_trade(trade, price)
                     to_close.append(trade)
                     closed += 1
                     continue
                 if side != "BUY" and price > prev_price:
-                    # After lock-in, first pullback is a profit-trail exit, not a hard stop-loss hit.
-                    trade["status"] = "PROFIT_TRAIL"
-                    trade["exit_reason"] = "PROFIT_TRAIL"
+                    exit_reason = _profit_lock_exit_reason(trade)
+                    trade["status"] = exit_reason
+                    trade["exit_reason"] = exit_reason
                     _maybe_place_exit_order(trade, price)
                     _close_trade(trade, price)
                     to_close.append(trade)

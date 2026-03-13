@@ -14,6 +14,7 @@ import re
 from app.core.database import get_db
 from app.core.market_hours import market_status
 from app.models.trading import PaperTrade
+from app.routes.auto_trading_simple import _ai_entry_validation
 
 router = APIRouter()
 
@@ -24,7 +25,7 @@ PAPER_AI_EDGE_MINIMUM = 35.0
 PAPER_ENTRY_RR_MINIMUM = 1.30
 PAPER_REQUIRE_BOTH_CONFIRMATIONS = True
 PAPER_MARKET_REGIME_FILTER = True
-PAPER_ENFORCE_DAILY_LIMITS = True
+PAPER_ENFORCE_DAILY_LIMITS = False
 PAPER_MAX_DAILY_TRADES = 14
 PAPER_CONSECUTIVE_SL_HIT_LIMIT = 2
 PAPER_DAILY_PROFIT_TARGET = 5000.0
@@ -34,7 +35,7 @@ PAPER_MAX_LIQUIDITY_SPIKE_RISK = 16.0
 PAPER_MAX_PREMIUM_DISTORTION = 14.0
 
 # Paper Trading SL/Re-entry Settings
-MAX_PAPER_TRADES = 1  # Only one paper trade at a time
+MAX_PAPER_TRADES = 2  # Allow up to two concurrent paper trades
 PAPER_SL_COOLDOWN_MINUTES = 5
 PAPER_REENTRY_GUARD_MINUTES = 20
 PAPER_REENTRY_MIN_QUALITY_IMPROVEMENT = 6.0
@@ -287,7 +288,6 @@ def _paper_recent_reentry_guard(db: Session, trade: "PaperTradeCreate"):
     current_ai_edge = _paper_num(signal_data.get("ai_edge_score"))
     current_breakout = _paper_num(signal_data.get("breakout_score"))
     current_momentum = _paper_num(signal_data.get("momentum_score"))
-    start_trade_allowed = _paper_boolish(signal_data.get("start_trade_allowed"))
     breakout_confirmed = _paper_boolish(signal_data.get("breakout_confirmed"))
     momentum_confirmed = _paper_boolish(signal_data.get("momentum_confirmed"))
     breakout_hold_confirmed = _paper_boolish(signal_data.get("breakout_hold_confirmed"))
@@ -309,8 +309,7 @@ def _paper_recent_reentry_guard(db: Session, trade: "PaperTradeCreate"):
         prev_momentum = _paper_num(prev_signal.get("momentum_score"))
 
         fresh_breakout = (
-            start_trade_allowed is not False
-            and breakout_confirmed is not False
+            breakout_confirmed is not False
             and momentum_confirmed is not False
             and breakout_hold_confirmed is not False
             and close_back_in_range is not True
@@ -418,7 +417,7 @@ def create_paper_trade(trade: PaperTradeCreate, db: Session = Depends(get_db)):
             "current_time": market.get("current_time"),
         }
 
-    # NEW: Quality gates to reduce volume to 10-20 trades/day
+    # Shared AI quality gate inputs (kept aligned with live autotrade execute flow).
     signal_data = _paper_dict(trade.signal_data)
     quality_score = _paper_num(signal_data.get("quality_score") or signal_data.get("quality"))
     confirmation_score = _paper_num(signal_data.get("confirmation_score") or signal_data.get("confidence"))
@@ -440,65 +439,73 @@ def create_paper_trade(trade: PaperTradeCreate, db: Session = Depends(get_db)):
     breakout_confirmed = _paper_boolish(signal_data.get("breakout_confirmed"))
     momentum_confirmed = _paper_boolish(signal_data.get("momentum_confirmed"))
     
-    # Relax quality gates slightly for STOCKS vs. INDEX OPTIONS
     signal_is_stock = signal_data.get("signal_type") == "stock" or signal_data.get("is_stock") is True
     rr_value = _paper_compute_rr(trade.entry_price, trade.target, trade.stop_loss)
     rr_value_cmp = round(rr_value, 2)
-    
+    uses_enriched_signal_context = bool(signal_data) or bool(trade.index_name) or bool(trade.signal_type)
+
+    # Keep thresholds in response for transparency, while validation itself is shared with live route.
     if signal_is_stock:
-        # STOCKS: Slightly more lenient (but still quality-focused)
-        quality_gate = PAPER_QUALITY_SCORE_MINIMUM - 5  # 54 vs 59 for indices
-        confirmation_gate = PAPER_CONFIRMATION_SCORE_MINIMUM - 5  # 59 vs 64 for indices
-        ai_edge_gate = PAPER_AI_EDGE_MINIMUM - 5  # 23 vs 28 for indices
-        rr_gate = PAPER_ENTRY_RR_MINIMUM - 0.10  # 1.15 vs 1.25 for indices
-        require_both_conf = True
+        quality_gate = PAPER_QUALITY_SCORE_MINIMUM - 5
+        confirmation_gate = PAPER_CONFIRMATION_SCORE_MINIMUM - 5
+        ai_edge_gate = PAPER_AI_EDGE_MINIMUM - 5
+        rr_gate = PAPER_ENTRY_RR_MINIMUM - 0.10
     else:
-        # INDEX OPTIONS: Strict thresholds
         quality_gate = PAPER_QUALITY_SCORE_MINIMUM
         confirmation_gate = PAPER_CONFIRMATION_SCORE_MINIMUM
         ai_edge_gate = PAPER_AI_EDGE_MINIMUM
         rr_gate = PAPER_ENTRY_RR_MINIMUM
-        require_both_conf = PAPER_REQUIRE_BOTH_CONFIRMATIONS
     
-    # Check daily trade and consecutive SL limits
-    daily_ok, daily_reason = _paper_should_allow_new_trade(db) if PAPER_ENFORCE_DAILY_LIMITS else (True, "quality_mode_daily_limits_disabled")
+    # Demo/live parity: paper entries should not be blocked by paper-only daily/consecutive counters.
+    daily_ok, daily_reason = True, "paper_daily_limits_disabled"
     
+    ai_context_present = any(v is not None for v in [
+        signal_data.get("quality_score"),
+        signal_data.get("quality"),
+        signal_data.get("confirmation_score"),
+        signal_data.get("confidence"),
+        signal_data.get("ai_edge_score"),
+        signal_data.get("momentum_score"),
+        signal_data.get("breakout_score"),
+        signal_data.get("market_regime"),
+        signal_data.get("market_bias"),
+        signal_data.get("timing_risk"),
+        signal_data.get("breakout_confirmed"),
+        signal_data.get("momentum_confirmed"),
+        signal_data.get("breakout_hold_confirmed"),
+        signal_data.get("start_trade_allowed"),
+        signal_data.get("start_trade_decision"),
+    ])
+
     quality_gate_rejection = None
-    if quality_score < quality_gate:
-        quality_gate_rejection = f"quality_score<{quality_gate} (got {quality_score:.1f})"
-    elif confirmation_score < confirmation_gate:
-        quality_gate_rejection = f"confirmation_score<{confirmation_gate} (got {confirmation_score:.1f})"
-    elif ai_edge_score < ai_edge_gate:
-        quality_gate_rejection = f"ai_edge_score<{ai_edge_gate} (got {ai_edge_score:.1f})"
-    elif rr_value_cmp + 1e-9 < rr_gate:
-        quality_gate_rejection = f"rr<{rr_gate:.2f} (got {rr_value_cmp:.2f})"
-    if quality_gate_rejection is None and require_both_conf:
-        # If explicit confirmations are missing (None), fall back to score-based checks.
-        breakout_ok = (breakout_confirmed is True) or (breakout_confirmed is None and breakout_score >= 58.0)
-        momentum_ok = (momentum_confirmed is True) or (momentum_confirmed is None and momentum_score >= 58.0)
-        if not (breakout_ok and momentum_ok):
-            quality_gate_rejection = (
-                f"require_both_confirmations: breakout={breakout_confirmed}/{breakout_score:.1f}, "
-                f"momentum={momentum_confirmed}/{momentum_score:.1f}"
-            )
-    if quality_gate_rejection is None and breakout_hold_confirmed is False:
-        quality_gate_rejection = "breakout_hold_confirmed=false (avoid weak post-breakout entries)"
-    if quality_gate_rejection is None and timing_risk == "HIGH":
-        quality_gate_rejection = "timing_risk=HIGH"
-    if quality_gate_rejection is None and market_bias == "WEAK_BOTH" and not (quality_score >= 90.0 and confirmation_score >= 92.0):
-        quality_gate_rejection = "market_bias=WEAK_BOTH (requires very high quality override)"
-    if quality_gate_rejection is None and fake_move_risk > PAPER_MAX_FAKE_MOVE_RISK:
-        quality_gate_rejection = f"fake_move_risk>{PAPER_MAX_FAKE_MOVE_RISK:.1f} (got {fake_move_risk:.1f})"
-    if quality_gate_rejection is None and news_risk > PAPER_MAX_NEWS_RISK:
-        quality_gate_rejection = f"news_risk>{PAPER_MAX_NEWS_RISK:.1f} (got {news_risk:.1f})"
-    if quality_gate_rejection is None and liquidity_spike_risk > PAPER_MAX_LIQUIDITY_SPIKE_RISK:
-        quality_gate_rejection = f"liquidity_spike_risk>{PAPER_MAX_LIQUIDITY_SPIKE_RISK:.1f} (got {liquidity_spike_risk:.1f})"
-    if quality_gate_rejection is None and premium_distortion > PAPER_MAX_PREMIUM_DISTORTION:
-        quality_gate_rejection = f"premium_distortion>{PAPER_MAX_PREMIUM_DISTORTION:.1f} (got {premium_distortion:.1f})"
-    if quality_gate_rejection is None and PAPER_MARKET_REGIME_FILTER and market_regime == "LOW_VOLATILITY":
-        quality_gate_rejection = "market_regime=LOW_VOLATILITY (avoid choppy conditions)"
-    if quality_gate_rejection is None and not daily_ok:
-        quality_gate_rejection = daily_reason
+    if ai_context_present:
+        ai_signal = {
+            **signal_data,
+            "entry_price": trade.entry_price,
+            "target": trade.target,
+            "stop_loss": trade.stop_loss,
+            "quality_score": quality_score,
+            "confirmation_score": confirmation_score,
+            "ai_edge_score": ai_edge_score,
+            "breakout_score": breakout_score,
+            "momentum_score": momentum_score,
+            "market_regime": market_regime,
+            "market_bias": market_bias,
+            "timing_risk": timing_risk,
+            "fake_move_risk": fake_move_risk,
+            "sudden_news_risk": news_risk,
+            "liquidity_spike_risk": liquidity_spike_risk,
+            "premium_distortion": premium_distortion,
+            "breakout_confirmed": breakout_confirmed,
+            "momentum_confirmed": momentum_confirmed,
+            "breakout_hold_confirmed": breakout_hold_confirmed,
+        }
+        ai_ok, ai_reasons, _ = _ai_entry_validation(
+            ai_signal,
+            loss_brake={"enabled": False, "stage": "PAPER", "block_new_entries": False},
+        )
+        quality_gate_rejection = ai_reasons[0] if (not ai_ok and ai_reasons) else None
+    # Keep paper/live parity: never apply paper-only daily/consecutive quality gate rejects.
     
     if quality_gate_rejection:
         return {
@@ -568,23 +575,40 @@ def create_paper_trade(trade: PaperTradeCreate, db: Session = Depends(get_db)):
             "active_trades": active_count
         }
 
-    # Server-side multi-tick confirmation guard (mirror live behavior)
-    # Server-side multi-tick confirmation guard (mirror live behavior)
+    # Server-side multi-tick confirmation guard (aligned to live adaptive behavior)
     underlying = _symbol_root(trade.symbol)
     try:
-        if not getattr(trade, 'bypass_confirmation', False):
-            confirmed = _require_multi_tick_confirmation(underlying, trade.entry_price, trade.side, required_ticks=3)
+        adaptive_required_ticks = 3
+        confirmation_override = False
+        q_for_ticks = float(quality_score or 0)
+        c_for_ticks = float(confirmation_score or 0)
+        rr_for_ticks = float(_paper_compute_rr(trade.entry_price, trade.target, trade.stop_loss) or 0)
+        if q_for_ticks >= 92.0 and c_for_ticks >= 90.0 and rr_for_ticks >= 1.25:
+            adaptive_required_ticks = 1
+        elif q_for_ticks >= 85.0 and c_for_ticks >= 80.0 and rr_for_ticks >= 1.20:
+            adaptive_required_ticks = 2
+        if q_for_ticks >= 88.0 and c_for_ticks >= 82.0 and rr_for_ticks >= 1.25:
+            confirmation_override = True
+        if uses_enriched_signal_context and not getattr(trade, 'bypass_confirmation', False):
+            confirmed = _require_multi_tick_confirmation(
+                underlying,
+                trade.entry_price,
+                trade.side,
+                required_ticks=adaptive_required_ticks,
+            )
         else:
             confirmed = True
     except Exception:
         confirmed = False
+        adaptive_required_ticks = 3
+        confirmation_override = False
 
-    if not confirmed:
+    if not confirmed and not confirmation_override:
         return {
             "success": False,
             "message": "Paper trade blocked: failed multi-tick confirmation (server guard).",
             "underlying": underlying,
-            "required_ticks": 3,
+            "required_ticks": adaptive_required_ticks,
         }
 
     
