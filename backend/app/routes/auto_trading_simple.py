@@ -466,7 +466,12 @@ def _cooldown_info(symbol: str | None, side: str | None) -> Tuple[bool, float, O
             stale_keys.append(key)
             continue
 
-        remaining = (expires_at - now).total_seconds()
+        # Support both naive and timezone-aware expiry timestamps.
+        if expires_at.tzinfo is not None and expires_at.utcoffset() is not None:
+            now_for_expiry = datetime.now(expires_at.tzinfo)
+            remaining = (expires_at - now_for_expiry).total_seconds()
+        else:
+            remaining = (expires_at - now).total_seconds()
         if remaining > 0:
             if remaining > active_remaining:
                 active_remaining = remaining

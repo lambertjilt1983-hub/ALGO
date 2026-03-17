@@ -82,6 +82,9 @@ def test_live_trade_execution_and_update(monkeypatch):
     state["is_demo_mode"] = False
     state["live_armed"] = True
 
+    # keep test deterministic regardless of wall-clock market hours
+    monkeypatch.setattr("app.routes.auto_trading_simple._within_trade_window", lambda: True)
+
     # monkeypatch Zerodha order placement to avoid real API calls
     monkeypatch.setattr(
         "app.routes.auto_trading_simple.place_zerodha_order",
@@ -96,7 +99,27 @@ def test_live_trade_execution_and_update(monkeypatch):
     # execute a live trade (will actually append via patched order)
     resp = client.post(
         "/autotrade/execute",
-        json={"symbol": "LIVE1", "price": 200.0, "quantity": 1, "side": "BUY"},
+        json={
+            "symbol": "SBIN26MAR800CE",
+            "price": 100.0,
+            "balance": 50000,
+            "quantity": 1,
+            "side": "BUY",
+            "stop_loss": 99.0,
+            "target": 101.4,
+            "quality_score": 67,
+            "confirmation_score": 71,
+            "ai_edge_score": 37,
+            "breakout_score": 62,
+            "momentum_score": 62,
+            "breakout_confirmed": True,
+            "momentum_confirmed": True,
+            "breakout_hold_confirmed": True,
+            "signal_type": "stock",
+            "is_stock": True,
+            "start_trade_allowed": False,
+            "start_trade_decision": "NO",
+        },
     )
     assert resp.status_code == 200
     data = resp.json()
@@ -108,19 +131,19 @@ def test_live_trade_execution_and_update(monkeypatch):
     resp2 = client.get("/autotrade/trades/active")
     assert resp2.json()["count"] == 1
     tr = resp2.json()["trades"][0]
-    assert tr["symbol"] == "LIVE1"
-    assert tr["current_price"] == 200.0
+    assert tr["symbol"] == "SBIN26MAR800CE"
+    assert tr["current_price"] == 100.0
 
     # price update
-    client.post("/autotrade/trades/price", params={"symbol": "LIVE1", "price": 210.0})
+    client.post("/autotrade/trades/price", params={"symbol": "SBIN26MAR800CE", "price": 101.2})
     resp3 = client.get("/autotrade/trades/active")
-    assert resp3.json()["trades"][0]["current_price"] == 210.0
+    assert resp3.json()["trades"][0]["current_price"] == 101.2
 
     # close it by forcing price below stop (stop default=195)
-    client.post("/autotrade/trades/price", params={"symbol": "LIVE1", "price": 190.0})
+    client.post("/autotrade/trades/price", params={"symbol": "SBIN26MAR800CE", "price": 98.5})
     resp4 = client.get("/autotrade/trades/active")
     assert resp4.json()["count"] == 0
-    assert history and history[-1]["symbol"] == "LIVE1"
+    assert history and history[-1]["symbol"] == "SBIN26MAR800CE"
     assert history[-1]["status"] in ("SL_HIT", "CLOSED")
 
 
@@ -173,7 +196,26 @@ def test_execute_flat_json_payload_does_not_500_and_keeps_cors(monkeypatch):
     assert resp.headers.get("access-control-allow-origin") == "http://localhost:3000"
 
 
+def test_main_origin_normalization_strips_trailing_slash():
+    from app.main import _build_allowed_origins, _normalize_origin
+
+    class DummySettings:
+        ALLOWED_ORIGINS = "https://algo-theta-nine.vercel.app/, https://algo-mlcb.onrender.com/"
+        FRONTEND_URL = "https://algo-theta-nine.vercel.app/"
+        FRONTEND_ALT_URL = "https://algo-theta-nine.vercel.app/"
+
+    allowed = _build_allowed_origins(DummySettings())
+
+    assert _normalize_origin("https://algo-theta-nine.vercel.app/") == "https://algo-theta-nine.vercel.app"
+    assert "https://algo-theta-nine.vercel.app" in allowed
+    assert "https://algo-theta-nine.vercel.app/" not in allowed
+
+
 def test_live_execute_uses_stock_thresholds_and_ignores_stale_start_trade_flags(monkeypatch):
+    active_trades.clear()
+    history.clear()
+    state["symbol_cooldowns"] = {}
+    state["recent_exit_contexts"] = {}
     state["is_demo_mode"] = False
     state["live_armed"] = True
 

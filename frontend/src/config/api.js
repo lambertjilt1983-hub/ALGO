@@ -4,10 +4,16 @@
 const getApiBaseUrl = () => {
   // Priority 1: Environment variable (set via .env file or runtime)
   if (import.meta.env.VITE_API_URL) {
-    return import.meta.env.VITE_API_URL;
+    return String(import.meta.env.VITE_API_URL).trim().replace(/\/+$/, '');
   }
   // Local-only mode.
   return `http://127.0.0.1:8000`;
+};
+
+const normalizeEndpoint = (endpoint) => {
+  const value = String(endpoint || '').trim();
+  if (!value) return '';
+  return value.startsWith('/') ? value : `/${value}`;
 };
 
 const getWebSocketUrl = () => {
@@ -95,7 +101,7 @@ export const config = {
   
   // Helper to build full URL
   getUrl: (endpoint, params = {}) => {
-    let url = `${config.API_BASE_URL}${endpoint}`;
+    let url = `${config.API_BASE_URL}${normalizeEndpoint(endpoint)}`;
     
     // Add query parameters if provided
     if (Object.keys(params).length > 0) {
