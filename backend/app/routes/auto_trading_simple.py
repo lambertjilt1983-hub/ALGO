@@ -26,6 +26,8 @@ async def auto_close_trades_task():
 # Start background task on startup
 @router.on_event("startup")
 async def start_auto_close_trades():
+    _sync_active_trades_from_db()
+    _sync_history_from_db(limit=500)
     asyncio.create_task(auto_close_trades_task())
 """Auto Trading Engine wired to live market data (no mocks)."""
 
@@ -33,6 +35,7 @@ import math
 import time
 import asyncio
 import re
+import uuid
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, time as dt_time
@@ -74,7 +77,7 @@ except ImportError:
     def _quote_symbol(symbol, index=None):
         return symbol
 from app.core.database import SessionLocal
-from app.models.trading import TradeReport
+from app.models.trading import TradeReport, ActiveTrade
 from sqlalchemy import func
 try:
     from app.engine.auto_trading_engine import AutoTradingEngine
@@ -283,11 +286,167 @@ async def reset_state(authorization: Optional[str] = Header(None)):
     state["daily_date"] = datetime.now().date()
     active_trades.clear()
     history.clear()
+    db = SessionLocal()
+    try:
+        db.query(ActiveTrade).delete()
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
     return {"success": True, "message": "State reset: daily_loss=0, active_trades/history cleared."}
 
 
 def _now() -> str:
     return ist_now().isoformat()
+
+
+def _sync_active_trades_from_db() -> None:
+    """Load active OPEN trades from DB into in-memory state for runtime logic."""
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(ActiveTrade)
+            .filter(ActiveTrade.status == "OPEN")
+            .order_by(ActiveTrade.updated_at.asc())
+            .all()
+        )
+        loaded: List[Dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row.payload or {})
+            payload.setdefault("trade_uid", row.trade_uid)
+            payload.setdefault("symbol", row.symbol)
+            payload.setdefault("side", row.side)
+            payload.setdefault("status", row.status)
+            payload.setdefault("trade_mode", row.trade_mode)
+            if row.entry_time and not payload.get("entry_time"):
+                payload["entry_time"] = row.entry_time.isoformat()
+            loaded.append(payload)
+        active_trades[:] = loaded
+    except Exception as e:
+        print(f"[ACTIVE_TRADES_SYNC] Failed to load active trades from DB: {e}")
+    finally:
+        db.close()
+
+
+def _sync_history_from_db(limit: int = 500) -> None:
+    """Warm in-memory history from persistent trade reports."""
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(TradeReport)
+            .order_by(TradeReport.exit_time.desc())
+            .limit(max(1, int(limit or 500)))
+            .all()
+        )
+        loaded: List[Dict[str, Any]] = []
+        for row in reversed(rows):
+            meta = dict(row.meta or {})
+            loaded.append(
+                {
+                    "id": row.id,
+                    "symbol": row.symbol,
+                    "side": row.side,
+                    "quantity": row.quantity,
+                    "entry_price": row.entry_price,
+                    "exit_price": row.exit_price,
+                    "pnl": row.pnl,
+                    "pnl_percentage": row.pnl_percentage,
+                    "strategy": row.strategy,
+                    "status": row.status,
+                    "entry_time": row.entry_time.isoformat() if row.entry_time else None,
+                    "exit_time": row.exit_time.isoformat() if row.exit_time else None,
+                    "trading_date": row.trading_date,
+                    "trade_mode": str(meta.get("trade_mode") or "LIVE").upper(),
+                    **meta,
+                }
+            )
+        history[:] = loaded
+    except Exception as e:
+        print(f"[HISTORY_SYNC] Failed to load trade history from DB: {e}")
+    finally:
+        db.close()
+
+
+def _upsert_active_trade_record(trade: Dict[str, Any]) -> None:
+    """Persist or update an open trade snapshot in DB."""
+    if not isinstance(trade, dict):
+        return
+    trade_uid = str(trade.get("trade_uid") or "").strip()
+    if not trade_uid:
+        trade_uid = uuid.uuid4().hex
+        trade["trade_uid"] = trade_uid
+
+    db = SessionLocal()
+    try:
+        row = db.query(ActiveTrade).filter(ActiveTrade.trade_uid == trade_uid).first()
+
+        entry_time_raw = trade.get("entry_time")
+        if isinstance(entry_time_raw, str):
+            try:
+                entry_time = datetime.fromisoformat(entry_time_raw)
+            except Exception:
+                entry_time = datetime.utcnow()
+        elif isinstance(entry_time_raw, datetime):
+            entry_time = entry_time_raw
+        else:
+            entry_time = datetime.utcnow()
+            trade["entry_time"] = entry_time.isoformat()
+
+        payload = dict(trade)
+        if row is None:
+            row = ActiveTrade(
+                trade_uid=trade_uid,
+                symbol=str(trade.get("symbol") or ""),
+                side=str(trade.get("side") or "BUY").upper(),
+                status=str(trade.get("status") or "OPEN").upper(),
+                trade_mode=str(trade.get("trade_mode") or "LIVE").upper(),
+                entry_time=entry_time,
+                payload=payload,
+            )
+            db.add(row)
+        else:
+            row.symbol = str(trade.get("symbol") or row.symbol or "")
+            row.side = str(trade.get("side") or row.side or "BUY").upper()
+            row.status = str(trade.get("status") or row.status or "OPEN").upper()
+            row.trade_mode = str(trade.get("trade_mode") or row.trade_mode or "LIVE").upper()
+            row.entry_time = entry_time or row.entry_time
+            row.payload = payload
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[ACTIVE_TRADES_SYNC] Failed to upsert active trade: {e}")
+    finally:
+        db.close()
+
+
+def _delete_active_trade_record(trade: Dict[str, Any]) -> None:
+    """Remove closed trade snapshot from DB."""
+    db = SessionLocal()
+    try:
+        trade_uid = str((trade or {}).get("trade_uid") or "").strip()
+        if trade_uid:
+            db.query(ActiveTrade).filter(ActiveTrade.trade_uid == trade_uid).delete()
+        else:
+            symbol = str((trade or {}).get("symbol") or "")
+            entry_time_raw = (trade or {}).get("entry_time")
+            entry_time = None
+            if isinstance(entry_time_raw, str):
+                try:
+                    entry_time = datetime.fromisoformat(entry_time_raw)
+                except Exception:
+                    entry_time = None
+            query = db.query(ActiveTrade).filter(ActiveTrade.symbol == symbol)
+            if entry_time is not None:
+                query = query.filter(ActiveTrade.entry_time == entry_time)
+            query.delete()
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[ACTIVE_TRADES_SYNC] Failed to delete active trade: {e}")
+    finally:
+        db.close()
 
 
 def _live_protection_active() -> bool:
@@ -1635,6 +1794,7 @@ def _close_trade(trade: Dict[str, Any], exit_price: float) -> None:
             )
             db.add(report)
             db.commit()
+            _delete_active_trade_record(trade)
         except Exception as e:
             print(f"Warning: failed to persist trade report: {e}")
         finally:
@@ -3538,6 +3698,7 @@ async def execute(
             trade_obj["broker_response"] = {"simulated": True}
             demo_trades.append(trade_obj)
             active_trades.append(trade_obj)
+            _upsert_active_trade_record(trade_obj)
             broker_response = {"simulated": True}
             print(f"[API /execute] ℹ Demo trade started for {trade_obj.get('symbol')} qty={trade_obj.get('quantity')}")
         elif not bool(state.get("live_armed", True)):
@@ -3573,6 +3734,7 @@ async def execute(
                 print(f"[API /execute] ✓ Zerodha order ACCEPTED - Order ID: {real_order.get('order_id', 'N/A')}")
                 broker_response = real_order
                 active_trades.append(trade_obj)
+                _upsert_active_trade_record(trade_obj)
             else:
                 print(f"[API /execute] ✗ Zerodha order REJECTED - Error: {real_order.get('error', 'Unknown')}")
                 return {
@@ -3598,6 +3760,7 @@ async def execute(
 
 @router.get("/trades/active")
 async def get_active_trades(authorization: Optional[str] = Header(None)):
+    _sync_active_trades_from_db()
     print(f"[API /trades/active] Returning {len(active_trades)} active trades from Zerodha")
     trades = [normalize_active_trade_metrics(trade) for trade in active_trades]
     active_trades[:] = trades
@@ -3671,6 +3834,7 @@ async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
 
                 _maybe_update_trail(trade, price)
                 trade["current_price"] = price
+                _upsert_active_trade_record(trade)
                 updated += 1
 
                 exit_reason = _should_exit_by_currency(trade, price)
@@ -3762,6 +3926,7 @@ async def update_trade_price(symbol: str, price: float, authorization: Optional[
             prev_price = float(trade.get("current_price") or trade.get("price") or price)
             _maybe_update_trail(trade, price)
             trade["current_price"] = price
+            _upsert_active_trade_record(trade)
             updated += 1
 
             try:
@@ -3852,11 +4017,43 @@ async def get_trade_history(
     authorization: Optional[str] = Header(None),
 ):
     selected_mode = str(mode or "LIVE").strip().upper()
-    if selected_mode in {"LIVE", "DEMO"}:
-        rows = [t for t in history if str(t.get("trade_mode") or "LIVE").upper() == selected_mode]
-    else:
-        rows = list(history)
-    trades = rows[-limit:]
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(TradeReport)
+            .order_by(TradeReport.exit_time.desc())
+            .limit(max(1, int(limit or 50)) * 5)
+            .all()
+        )
+    finally:
+        db.close()
+
+    normalized_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        meta = dict(row.meta or {})
+        row_mode = str(meta.get("trade_mode") or "LIVE").upper()
+        if selected_mode in {"LIVE", "DEMO"} and row_mode != selected_mode:
+            continue
+        normalized_rows.append(
+            {
+                "id": row.id,
+                "symbol": row.symbol,
+                "side": row.side,
+                "quantity": row.quantity,
+                "entry_price": row.entry_price,
+                "exit_price": row.exit_price,
+                "pnl": row.pnl,
+                "pnl_percentage": row.pnl_percentage,
+                "strategy": row.strategy,
+                "status": row.status,
+                "entry_time": row.entry_time.isoformat() if row.entry_time else None,
+                "exit_time": row.exit_time.isoformat() if row.exit_time else None,
+                "trade_mode": row_mode,
+                **meta,
+            }
+        )
+
+    trades = list(reversed(normalized_rows[: max(1, int(limit or 50))]))
     return {
         "trades": trades,
         "total_profit": sum(t.get("pnl", 0) for t in trades),

@@ -89,6 +89,22 @@ class TradeReport(Base):
     meta = Column(JSON, nullable=True)
 
 
+class ActiveTrade(Base):
+    """Persistent open-trade snapshot so active trades survive process restarts."""
+    __tablename__ = "active_trades"
+
+    id = Column(Integer, primary_key=True, index=True)
+    trade_uid = Column(String, unique=True, index=True)
+    symbol = Column(String, index=True)
+    side = Column(String, index=True)
+    status = Column(String, default="OPEN", index=True)
+    trade_mode = Column(String, default="LIVE", index=True)
+    entry_time = Column(DateTime, nullable=True, index=True)
+    payload = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class PaperTrade(Base):
     """Paper trading log to track signal performance without real execution."""
     __tablename__ = "paper_trades"
