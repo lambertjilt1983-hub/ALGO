@@ -24,6 +24,47 @@ import logging
 import importlib.util
 from pathlib import Path
 
+
+def _normalize_origin(origin: str | None) -> str:
+    if not origin:
+        return ""
+    return str(origin).strip().rstrip("/")
+
+
+def _build_allowed_origins(settings) -> list[str]:
+    allowed_origins = [
+        normalized
+        for normalized in (_normalize_origin(origin) for origin in settings.ALLOWED_ORIGINS.split(","))
+        if normalized
+    ]
+    placeholder_hosts = {
+        "https://yourdomain.com",
+        "https://www.yourdomain.com",
+    }
+
+    if not allowed_origins or placeholder_hosts.intersection(allowed_origins):
+        allowed_origins = [
+            normalized
+            for normalized in (
+                _normalize_origin(settings.FRONTEND_URL),
+                _normalize_origin(settings.FRONTEND_ALT_URL),
+            )
+            if normalized
+        ]
+
+    if any(h in _normalize_origin(settings.FRONTEND_URL) for h in ("localhost", "127.0.0.1")) or os.getenv("ENV_FILE") == "env.local":
+        for host in ("http://localhost:3000", "http://localhost:8000"):
+            normalized_host = _normalize_origin(host)
+            if normalized_host not in allowed_origins:
+                allowed_origins.append(normalized_host)
+
+    for host in ("http://localhost:3000", "http://localhost:3001", "http://localhost:8000"):
+        normalized_host = _normalize_origin(host)
+        if normalized_host not in allowed_origins:
+            allowed_origins.append(normalized_host)
+
+    return allowed_origins
+
 def _check_required_dependencies(logger: logging.Logger) -> None:
     requirements_path = Path(__file__).resolve().parent.parent / "requirements.txt"
     if not requirements_path.exists():
@@ -97,28 +138,7 @@ app = FastAPI(
 
 # CORS middleware
 settings = get_settings()
-allowed_origins = [origin.strip() for origin in settings.ALLOWED_ORIGINS.split(",") if origin.strip()]
-placeholder_hosts = {"https://yourdomain.com", "https://www.yourdomain.com"}
-# Ensure localhost is always allowed during development
-if (not allowed_origins or placeholder_hosts.intersection(allowed_origins)):
-    # Fallback to known frontend URLs when env var still has placeholders.
-    allowed_origins = [
-        settings.FRONTEND_URL,
-        settings.FRONTEND_ALT_URL,
-    ]
-
-# Add localhost automatically if running locally and not already present
-if any(h in settings.FRONTEND_URL for h in ("localhost", "127.0.0.1")) or os.getenv("ENV_FILE") == "env.local":
-    if "http://localhost:3000" not in allowed_origins:
-        allowed_origins.append("http://localhost:3000")
-    if "http://localhost:8000" not in allowed_origins:
-        allowed_origins.append("http://localhost:8000")
-
-
-# make sure localhost is always allowed in dev (safe to include in prod too)
-for host in ("http://localhost:3000", "http://localhost:3001", "http://localhost:8000"):
-    if host not in allowed_origins:
-        allowed_origins.append(host)
+allowed_origins = _build_allowed_origins(settings)
 
 print(f"[STARTUP] CORS allowed origins: {allowed_origins}")
 
@@ -150,7 +170,7 @@ async def log_cors_request(request, call_next):
             content={"detail": f"Unhandled server error: {e.__class__.__name__}"},
         )
 
-    origin = request.headers.get("origin")
+    origin = _normalize_origin(request.headers.get("origin"))
     if origin and origin in allowed_origins:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
