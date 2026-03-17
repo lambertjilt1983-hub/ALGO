@@ -150,17 +150,22 @@ MIN_WIN_SAMPLE = 8          # minimum closed trades before applying win-rate gat
 # Risk controls (can be made configurable later)
 risk_config = {
     # QUALITY GATES (NEW) - Reduce trade volume to 10-20 high-quality trades/day
-    "quality_score_minimum": 66,             # Align with demo index baseline
-    "confirmation_score_minimum": 70,        # Ultra-strict confirmation gate
-    "ai_edge_minimum": 35.0,                 # Align with demo index baseline
-    "entry_rr_minimum": 1.30,                # Align with demo index baseline
-    "require_ai_entry_validation": False,    # Keep quality gate identical to paper/frontend baseline
+    "quality_score_minimum": 72,             # Stricter baseline after 5Y OOS underperformance
+    "confirmation_score_minimum": 76,        # Raise conviction threshold to reduce weak setups
+    "ai_edge_minimum": 42.0,                 # Require stronger AI edge for both live/demo parity
+    "entry_rr_minimum": 1.45,                # Favor fewer but better reward-to-risk entries
+    "require_ai_entry_validation": True,     # Enforce shared AI validation for all entries
     "require_both_confirmations": True,      # BOTH breakout_confirmed AND momentum_confirmed (not just one)
     "market_regime_filter": True,            # Skip trades in LOW_VOLATILITY or CHOPPY regimes
     "enforce_daily_limits": True,            # Align with demo daily discipline
-    "max_daily_trades": 14,                  # Align with demo max daily trades
+    "max_daily_trades": 10,                  # Tighter daily cap to reduce churn in choppy sessions
     "consecutive_sl_hit_limit": 2,           # Align with demo consecutive SL guard
     "daily_profit_target": 5000.0,           # Reduce position size or stop after ₹5k profit
+    "max_fake_move_risk": 14.0,              # Reject fragile breakout structure earlier
+    "max_news_risk": 16.0,                   # Avoid elevated event risk entries
+    "max_liquidity_spike_risk": 14.0,        # Avoid unstable premium spikes
+    "max_premium_distortion": 12.0,          # Avoid distorted premium behavior
+    "confirmation_fallback_score": 62.0,     # Stricter fallback when explicit confirmation flag missing
     
     # EXISTING LIMITS (UNCHANGED)
     "max_daily_loss": 5000.0,        # ₹5000 max daily loss (hardstop to protect capital)
@@ -194,6 +199,7 @@ risk_config = {
     "allow_simultaneous_live_trades": True,  # Permit concurrent live trades when setup is strong
     "max_simultaneous_live_trades": 3,
     "max_simultaneous_live_trades": 3,       # Hard cap for concurrent live trades
+    "max_simultaneous_demo_trades": 2,       # Hard cap for concurrent demo entries
     "simultaneous_min_quality": 82.0,        # Additional trade requires solid quality
     "simultaneous_min_confidence": 72.0,     # Additional trade requires healthy confidence
     "simultaneous_min_ai_edge": 40.0,        # Additional trade requires minimum positive AI edge
@@ -292,13 +298,16 @@ def _has_live_balance_for_trade(balance: float, capital_required: float) -> bool
     """Live-mode start gate: allow trade when available balance can fund it."""
     bal = max(0.0, float(balance or 0.0))
     req = max(0.0, float(capital_required or 0.0))
-    in_use = max(0.0, float(_capital_in_use() or 0.0))
+    in_use = max(0.0, float(_capital_in_use("LIVE") or 0.0))
     return req > 0 and (in_use + req) <= bal
 
 
 def _can_allow_additional_live_trade(candidate: Optional[Dict[str, Any]]) -> Tuple[bool, List[str]]:
     """Allow concurrent live trade only for ultra-high-quality, diversified signals."""
-    open_trades = [t for t in active_trades if t.get("status") == "OPEN"]
+    open_trades = [
+        t for t in active_trades
+        if t.get("status") == "OPEN" and str(t.get("trade_mode") or "LIVE").upper() == "LIVE"
+    ]
     if not open_trades:
         return True, []
 
@@ -319,9 +328,9 @@ def _can_allow_additional_live_trade(candidate: Optional[Dict[str, Any]]) -> Tup
         reasons.append("missing_candidate_context")
         return False, reasons
 
-    quality = float(candidate.get("quality_score") or candidate.get("quality") or 0.0)
-    confidence = float(candidate.get("confirmation_score") or candidate.get("confidence") or 0.0)
-    ai_edge = float(candidate.get("ai_edge_score") or 0.0)
+    quality = _safe_metric(candidate.get("quality_score"), _safe_metric(candidate.get("quality"), 0.0))
+    confidence = _safe_metric(candidate.get("confirmation_score"), _safe_metric(candidate.get("confidence"), 0.0))
+    ai_edge = _safe_metric(candidate.get("ai_edge_score"), 0.0)
 
     q_min = float(risk_config.get("simultaneous_min_quality") or 82.0)
     c_min = float(risk_config.get("simultaneous_min_confidence") or 72.0)
@@ -337,13 +346,26 @@ def _can_allow_additional_live_trade(candidate: Optional[Dict[str, Any]]) -> Tup
     if bool(risk_config.get("simultaneous_require_different_root", True)):
         cand_root = _symbol_root(str(candidate.get("symbol") or ""))
         if cand_root:
-            open_roots = {
-                _symbol_root(str(t.get("symbol") or ""))
-                for t in open_trades
-                if _symbol_root(str(t.get("symbol") or ""))
-            }
-            if cand_root in open_roots:
-                reasons.append(f"same_root_blocked({cand_root})")
+            cand_kind = _option_kind(str(candidate.get("symbol") or ""))
+            cand_side = str(candidate.get("side") or "BUY").upper()
+            for t in open_trades:
+                open_root = _symbol_root(str(t.get("symbol") or ""))
+                if open_root != cand_root:
+                    continue
+
+                open_kind = _option_kind(str(t.get("symbol") or ""))
+                open_side = str(t.get("side") or "BUY").upper()
+
+                # Allow same-root hedged pair (CE + PE) when direction is aligned.
+                hedged_pair_allowed = (
+                    cand_kind in {"CE", "PE"}
+                    and open_kind in {"CE", "PE"}
+                    and cand_kind != open_kind
+                    and cand_side == open_side
+                )
+                if not hedged_pair_allowed:
+                    reasons.append(f"same_root_blocked({cand_root})")
+                    break
 
     return len(reasons) == 0, reasons
 
@@ -594,6 +616,13 @@ def _compute_rr(entry_price: Any, target: Any, stop_loss: Any) -> float:
         return 0.0
 
 
+def _normalize_side(value: Any, default: str = "BUY") -> str:
+    text = str(value or default).strip().upper()
+    if text in {"BUY", "SELL"}:
+        return text
+    return str(default).strip().upper()
+
+
 def _ai_entry_validation(
     signal: Dict[str, Any],
     loss_brake: Optional[Dict[str, Any]] = None,
@@ -601,24 +630,29 @@ def _ai_entry_validation(
     """Unified quality gate aligned with paper and frontend readiness policy."""
     reasons: List[str] = []
 
-    quality = float(signal.get("quality_score") or signal.get("quality") or 0.0)
-    confidence = float(signal.get("confirmation_score") or signal.get("confidence") or 0.0)
-    ai_edge = float(signal.get("ai_edge_score") or 0.0)
-    breakout_score = float(signal.get("breakout_score") or 0.0)
-    momentum_score = float(signal.get("momentum_score") or 0.0)
+    quality = _safe_metric(signal.get("quality_score"), _safe_metric(signal.get("quality"), 0.0))
+    confidence = _safe_metric(signal.get("confirmation_score"), _safe_metric(signal.get("confidence"), 0.0))
+    ai_edge = _safe_metric(signal.get("ai_edge_score"), 0.0)
+    breakout_score = _safe_metric(signal.get("breakout_score"), 0.0)
+    momentum_score = _safe_metric(signal.get("momentum_score"), 0.0)
     rr = _compute_rr(signal.get("entry_price"), signal.get("target"), signal.get("stop_loss"))
+
+    base_quality_min = float(risk_config.get("quality_score_minimum", 72) or 72)
+    base_confidence_min = float(risk_config.get("confirmation_score_minimum", 76) or 76)
+    base_ai_edge_min = float(risk_config.get("ai_edge_minimum", 42.0) or 42.0)
+    base_rr_min = float(risk_config.get("entry_rr_minimum", 1.45) or 1.45)
 
     signal_is_stock = signal.get("signal_type") == "stock" or signal.get("is_stock") is True
     if signal_is_stock:
-        quality_min = 61.0
-        confidence_min = 65.0
-        ai_edge_min = 30.0
-        rr_min = 1.20
+        quality_min = max(0.0, base_quality_min - 5.0)
+        confidence_min = max(0.0, base_confidence_min - 5.0)
+        ai_edge_min = max(0.0, base_ai_edge_min - 5.0)
+        rr_min = max(0.0, base_rr_min - 0.10)
     else:
-        quality_min = 66.0
-        confidence_min = 70.0
-        ai_edge_min = 35.0
-        rr_min = 1.30
+        quality_min = base_quality_min
+        confidence_min = base_confidence_min
+        ai_edge_min = base_ai_edge_min
+        rr_min = base_rr_min
 
     fake_move_risk = float(signal.get("fake_move_risk") or signal.get("fake_move_risk_score") or 0.0)
     news_risk = float(signal.get("sudden_news_risk") or signal.get("news_risk") or signal.get("news_risk_score") or 0.0)
@@ -650,9 +684,11 @@ def _ai_entry_validation(
     if rr < rr_min:
         reasons.append(f"rr<{rr_min:.2f} ({rr:.2f})")
 
+    confirmation_fallback_score = float(risk_config.get("confirmation_fallback_score", 62.0) or 62.0)
+
     # Keep confirmation behavior aligned with paper route.
-    breakout_ok = (breakout_confirmed is True) or (breakout_confirmed is None and breakout_score >= 58.0)
-    momentum_ok = (momentum_confirmed is True) or (momentum_confirmed is None and momentum_score >= 58.0)
+    breakout_ok = (breakout_confirmed is True) or (breakout_confirmed is None and breakout_score >= confirmation_fallback_score)
+    momentum_ok = (momentum_confirmed is True) or (momentum_confirmed is None and momentum_score >= confirmation_fallback_score)
     if not (breakout_ok and momentum_ok):
         reasons.append(
             f"require_both_confirmations: breakout={breakout_confirmed}/{breakout_score:.1f}, "
@@ -665,16 +701,21 @@ def _ai_entry_validation(
         reasons.append("timing_risk=HIGH")
     if market_bias == "WEAK_BOTH" and not (quality >= 90.0 and confidence >= 92.0):
         reasons.append("market_bias=WEAK_BOTH")
-    if fake_move_risk > 16.0:
-        reasons.append(f"fake_move_risk>16.0 ({fake_move_risk:.1f})")
-    if news_risk > 18.0:
-        reasons.append(f"news_risk>18.0 ({news_risk:.1f})")
-    if liquidity_spike_risk > 16.0:
-        reasons.append(f"liquidity_spike_risk>16.0 ({liquidity_spike_risk:.1f})")
-    if premium_distortion > 14.0:
-        reasons.append(f"premium_distortion>14.0 ({premium_distortion:.1f})")
-    if market_regime == "LOW_VOLATILITY":
-        reasons.append("market_regime=LOW_VOLATILITY")
+    max_fake_move_risk = float(risk_config.get("max_fake_move_risk", 14.0) or 14.0)
+    max_news_risk = float(risk_config.get("max_news_risk", 16.0) or 16.0)
+    max_liquidity_spike_risk = float(risk_config.get("max_liquidity_spike_risk", 14.0) or 14.0)
+    max_premium_distortion = float(risk_config.get("max_premium_distortion", 12.0) or 12.0)
+
+    if fake_move_risk > max_fake_move_risk:
+        reasons.append(f"fake_move_risk>{max_fake_move_risk:.1f} ({fake_move_risk:.1f})")
+    if news_risk > max_news_risk:
+        reasons.append(f"news_risk>{max_news_risk:.1f} ({news_risk:.1f})")
+    if liquidity_spike_risk > max_liquidity_spike_risk:
+        reasons.append(f"liquidity_spike_risk>{max_liquidity_spike_risk:.1f} ({liquidity_spike_risk:.1f})")
+    if premium_distortion > max_premium_distortion:
+        reasons.append(f"premium_distortion>{max_premium_distortion:.1f} ({premium_distortion:.1f})")
+    if market_regime in {"LOW_VOLATILITY", "CHOPPY"}:
+        reasons.append(f"market_regime={market_regime}")
 
     advanced = evaluate_advanced_ai_signal(signal)
     advanced["loss_brake"] = loss_brake or {"enabled": False, "stage": "OFF"}
@@ -924,10 +965,17 @@ def _win_rate_ok() -> bool:
     return rate >= MIN_WIN_RATE
 
 
-def _capital_in_use() -> float:
+def _capital_in_use(mode: Optional[str] = None) -> float:
+    mode_filter = str(mode or "").upper()
     total = 0.0
     for t in active_trades:
         if t.get("status") == "OPEN":
+            trade_mode = str(t.get("trade_mode") or "LIVE").upper()
+            if mode_filter in {"LIVE", "DEMO", "PAPER"}:
+                if mode_filter == "LIVE" and trade_mode != "LIVE":
+                    continue
+                if mode_filter in {"DEMO", "PAPER"} and trade_mode not in {"DEMO", "PAPER"}:
+                    continue
             qty = t.get("quantity") or 0
             price = t.get("price") or 0
             total += price * qty
@@ -1528,10 +1576,24 @@ def _close_trade(trade: Dict[str, Any], exit_price: float) -> None:
                     "support": trade.get("support"),
                     "resistance": trade.get("resistance"),
                     "exit_reason": trade.get("exit_reason") or trade.get("status"),
+                    "entry_price": trade.get("price") or trade.get("entry_price"),
+                    "target": trade.get("target"),
+                    "stop_loss": trade.get("stop_loss"),
                     "quality_score": trade.get("quality_score"),
+                    "confirmation_score": trade.get("confirmation_score") or trade.get("confidence"),
                     "ai_edge_score": trade.get("ai_edge_score"),
                     "momentum_score": trade.get("momentum_score"),
                     "breakout_score": trade.get("breakout_score"),
+                    "breakout_confirmed": trade.get("breakout_confirmed"),
+                    "momentum_confirmed": trade.get("momentum_confirmed"),
+                    "breakout_hold_confirmed": trade.get("breakout_hold_confirmed"),
+                    "timing_risk": trade.get("timing_risk"),
+                    "market_bias": trade.get("market_bias") or trade.get("trend_direction"),
+                    "market_regime": trade.get("market_regime"),
+                    "fake_move_risk": trade.get("fake_move_risk"),
+                    "news_risk": trade.get("news_risk") or trade.get("sudden_news_risk"),
+                    "liquidity_spike_risk": trade.get("liquidity_spike_risk"),
+                    "premium_distortion": trade.get("premium_distortion") or trade.get("premium_distortion_risk"),
                     "profit_lock_applied": trade.get("profit_lock_applied"),
                 },
             )
@@ -1835,7 +1897,7 @@ def _signal_from_index(symbol: str, data: Dict[str, any], instrument_type: str, 
 
     capital_cap = balance * risk_config["max_position_pct"]
     portfolio_cap = balance * risk_config.get("max_portfolio_pct", 1.0)
-    capital_in_use = _capital_in_use()
+    capital_in_use = _capital_in_use("DEMO" if state.get("is_demo_mode", False) else "LIVE")
     remaining_cap = portfolio_cap - capital_in_use
     lot_size = instruments["lot_size"]
     min_cost = unit_price * lot_size
@@ -1987,6 +2049,8 @@ async def get_mode(demo_mode: Optional[bool] = None, authorization: Optional[str
 @router.post("/arm")
 async def arm_live_trading(armed: bool = True, authorization: Optional[str] = Header(None)):
     state["live_armed"] = armed
+    # Keep mode mutually exclusive: arming live forces LIVE mode, disarming reverts to DEMO mode.
+    state["is_demo_mode"] = not armed
     return {"live_armed": state["live_armed"], "is_demo_mode": state["is_demo_mode"]}
 
 
@@ -1994,12 +2058,14 @@ async def arm_live_trading(armed: bool = True, authorization: Optional[str] = He
 async def status(authorization: Optional[str] = Header(None)):
     active = active_trades
     win_rate, win_sample = _recent_win_rate()
-    capital_in_use = _capital_in_use()
+    capital_in_use = _capital_in_use("DEMO" if state.get("is_demo_mode", False) else "LIVE")
     market = market_status(dt_time(9, 15), dt_time(15, 30))
     print("[DEBUG] /autotrade/status market_status:", market, flush=True)
     payload = {
-        "enabled": True,
+        "enabled": bool(state.get("live_armed", True)),
+        "live_armed": bool(state.get("live_armed", True)),
         "is_demo_mode": state["is_demo_mode"],
+        "mode": "DEMO" if state.get("is_demo_mode") else "LIVE",
         "active_trades_count": len(active),
         "win_rate": round(win_rate * 100, 2),
         "win_sample": win_sample,
@@ -2213,11 +2279,12 @@ async def analyze(
         if breakout_hold_confirmed is None:
             breakout_hold_confirmed = _boolish(ai_diag.get("breakout_hold_confirmed"))
 
-        # Fixed hard caps aligned with demo and frontend
-        max_fake_move_risk = 16.0
-        max_news_risk = 18.0
-        max_liquidity_spike_risk = 16.0
-        max_premium_distortion_risk = 14.0
+        # Fixed hard caps aligned with shared risk config
+        max_fake_move_risk = float(risk_config.get("max_fake_move_risk", 14.0) or 14.0)
+        max_news_risk = float(risk_config.get("max_news_risk", 16.0) or 16.0)
+        max_liquidity_spike_risk = float(risk_config.get("max_liquidity_spike_risk", 14.0) or 14.0)
+        max_premium_distortion_risk = float(risk_config.get("max_premium_distortion", 12.0) or 12.0)
+        confirmation_fallback_score = float(risk_config.get("confirmation_fallback_score", 62.0) or 62.0)
 
         fake_move_risk = float(sig.get("fake_move_risk") or ai_diag.get("fake_move_risk") or 0.0)
         news_risk = float(sig.get("sudden_news_risk") or sig.get("news_risk") or ai_diag.get("sudden_news_risk") or 0.0)
@@ -2234,17 +2301,17 @@ async def analyze(
 
         if signal_is_stock:
             # STOCKS: Slightly more lenient than index options (same as demo)
-            quality_min = max(0.0, float(risk_config.get("quality_score_minimum", 66) or 66) - 5.0)
-            confirmation_min = max(0.0, float(risk_config.get("confirmation_score_minimum", 70) or 70) - 5.0)
-            ai_edge_min = max(0.0, float(risk_config.get("ai_edge_minimum", 35.0) or 35.0) - 5.0)
-            rr_min = max(0.0, float(risk_config.get("entry_rr_minimum", 1.30) or 1.30) - 0.10)
+            quality_min = max(0.0, float(risk_config.get("quality_score_minimum", 72) or 72) - 5.0)
+            confirmation_min = max(0.0, float(risk_config.get("confirmation_score_minimum", 76) or 76) - 5.0)
+            ai_edge_min = max(0.0, float(risk_config.get("ai_edge_minimum", 42.0) or 42.0) - 5.0)
+            rr_min = max(0.0, float(risk_config.get("entry_rr_minimum", 1.45) or 1.45) - 0.10)
             require_both_conf = True  # Still require both confirmations
         else:
             # INDEX OPTIONS: Strict thresholds for intraday scalping
-            quality_min = float(risk_config.get("quality_score_minimum", 66) or 66)
-            confirmation_min = float(risk_config.get("confirmation_score_minimum", 70) or 70)
-            ai_edge_min = float(risk_config.get("ai_edge_minimum", 35.0) or 35.0)
-            rr_min = float(risk_config.get("entry_rr_minimum", 1.30) or 1.30)
+            quality_min = float(risk_config.get("quality_score_minimum", 72) or 72)
+            confirmation_min = float(risk_config.get("confirmation_score_minimum", 76) or 76)
+            ai_edge_min = float(risk_config.get("ai_edge_minimum", 42.0) or 42.0)
+            rr_min = float(risk_config.get("entry_rr_minimum", 1.45) or 1.45)
             require_both_conf = bool(risk_config.get("require_both_confirmations", True))
         require_ai_validation = bool(risk_config.get("require_ai_entry_validation", True))
         
@@ -2292,8 +2359,8 @@ async def analyze(
         if quality_gate_rejection is None and require_ai_validation and not ai_ok:
             quality_gate_rejection = f"ai_validation_failed ({'; '.join(ai_reasons[:2])})"
         if quality_gate_rejection is None and require_both_conf:
-            breakout_ok = (breakout_confirmed is True) or (breakout_confirmed is None and float(sig.get("breakout_score") or 0.0) >= 58.0)
-            momentum_ok = (momentum_confirmed is True) or (momentum_confirmed is None and float(sig.get("momentum_score") or 0.0) >= 58.0)
+            breakout_ok = (breakout_confirmed is True) or (breakout_confirmed is None and float(sig.get("breakout_score") or 0.0) >= confirmation_fallback_score)
+            momentum_ok = (momentum_confirmed is True) or (momentum_confirmed is None and float(sig.get("momentum_score") or 0.0) >= confirmation_fallback_score)
             if not (breakout_ok and momentum_ok):
                 quality_gate_rejection = (
                     f"require_both_confirmations: breakout={breakout_confirmed}/{float(sig.get('breakout_score') or 0.0):.1f}, "
@@ -2313,8 +2380,8 @@ async def analyze(
             quality_gate_rejection = f"liquidity_spike_risk>{max_liquidity_spike_risk:.1f} (got {liquidity_spike_risk:.1f})"
         if quality_gate_rejection is None and premium_distortion > max_premium_distortion_risk:
             quality_gate_rejection = f"premium_distortion>{max_premium_distortion_risk:.1f} (got {premium_distortion:.1f})"
-        if quality_gate_rejection is None and regime_filter and market_regime == "LOW_VOLATILITY":
-            quality_gate_rejection = "market_regime=LOW_VOLATILITY (avoid choppy conditions)"
+        if quality_gate_rejection is None and regime_filter and market_regime in {"LOW_VOLATILITY", "CHOPPY"}:
+            quality_gate_rejection = f"market_regime={market_regime} (avoid unstable/choppy conditions)"
         if quality_gate_rejection is None and not daily_trade_ok:
             quality_gate_rejection = daily_trade_reason
         
@@ -2508,7 +2575,7 @@ async def analyze(
     except Exception as e:
         print(f"[LOGGING ERROR] Could not log recommendation: {e}")
 
-    capital_in_use = _capital_in_use()
+    capital_in_use = _capital_in_use("LIVE" if protection_active else "DEMO")
     capital_profile = _capital_protection_profile(balance)
     if not protection_active:
         capital_profile["enabled"] = False
@@ -2757,7 +2824,7 @@ async def execute(
     price = _param_value(price)
     balance = _param_value(balance)
     quantity = _param_value(quantity)
-    side = _param_value(side)
+    side = _normalize_side(_param_value(side), default="BUY")
     stop_loss = _param_value(stop_loss)
     target = _param_value(target)
     support = _param_value(support)
@@ -2805,6 +2872,14 @@ async def execute(
         try:
             payload = await request.json()
             if isinstance(payload, dict) and payload:
+                def _to_float_or_default(value, default_value):
+                    try:
+                        if value is None:
+                            return default_value
+                        return float(value)
+                    except Exception:
+                        return default_value
+
                 force_demo = bool(payload.get("force_demo", force_demo))
                 symbol = payload.get("symbol", symbol)
                 if payload.get("price") is not None:
@@ -2813,11 +2888,11 @@ async def execute(
                     balance = float(payload.get("balance"))
                 if payload.get("quantity") is not None:
                     quantity = int(payload.get("quantity"))
-                side = payload.get("side", side)
-                stop_loss = payload.get("stop_loss", stop_loss)
-                target = payload.get("target", target)
-                support = payload.get("support", support)
-                resistance = payload.get("resistance", resistance)
+                side = _normalize_side(payload.get("side", side), default=side)
+                stop_loss = _to_float_or_default(payload.get("stop_loss", stop_loss), stop_loss)
+                target = _to_float_or_default(payload.get("target", target), target)
+                support = _to_float_or_default(payload.get("support", support), support)
+                resistance = _to_float_or_default(payload.get("resistance", resistance), resistance)
                 broker_id = int(payload.get("broker_id", broker_id))
                 quality_score = payload.get("quality_score", quality_score)
                 confirmation_score = payload.get("confirmation_score", confirmation_score)
@@ -2852,7 +2927,7 @@ async def execute(
         price = float(trade.price or price or 0.0)
         balance = float(trade.balance or balance or 0.0)
         quantity = trade.quantity
-        side = trade.side or side
+        side = _normalize_side(trade.side or side, default=side)
         stop_loss = trade.stop_loss
         target = trade.target
         support = trade.support
@@ -2875,12 +2950,19 @@ async def execute(
 
     mode = "LIVE"
 
-    # Demo mode: when explicitly set OR when balance=0 (frontend's way of indicating paper/demo trading)
+    # Demo mode policy:
+    # - Internal/direct callers can still force demo via force_demo or balance=0.
+    # - For API requests, active LIVE mode must never silently fall back to demo.
+    #   This keeps modes mutually exclusive: LIVE => only live execution path.
     if request is None:
-        # Direct/internal callers should explicitly request demo via force_demo or zero balance.
         auto_demo = (force_demo is True) or (float(balance or 0.0) <= 0.0)
     else:
-        auto_demo = (state.get("is_demo_mode") is True) or (force_demo is True) or (float(balance or 0.0) <= 0.0)
+        explicit_demo = (state.get("is_demo_mode") is True) or (force_demo is True)
+        if explicit_demo:
+            auto_demo = True
+        else:
+            auto_demo = False
+    mode = "DEMO" if auto_demo else "LIVE"
     live_balance_only_mode = _live_protection_active() and bool(risk_config.get("live_start_balance_only", False)) and (not auto_demo)
     loss_brake = _loss_brake_profile()
     if loss_brake.get("block_new_entries") and not auto_demo:
@@ -2898,7 +2980,7 @@ async def execute(
             price=price,
             balance=balance,
             quantity=quantity,
-            side=side,
+            side=_normalize_side(side, default="BUY"),
             stop_loss=stop_loss,
             target=target,
             support=support,
@@ -2914,7 +2996,9 @@ async def execute(
             },
         )
 
-    # Optional server-side AI enforcement when metadata is provided.
+    trade.side = _normalize_side(trade.side, default="BUY")
+
+    # Server-side AI enforcement for all LIVE executions.
     ai_context = {
         "symbol": symbol,
         "entry_price": price,
@@ -2978,6 +3062,23 @@ async def execute(
         else None
     )
 
+    if not auto_demo and not has_ai_context:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Live trade request missing AI context required for server-side quality gate.",
+                "required_fields": [
+                    "quality_score",
+                    "confirmation_score",
+                    "ai_edge_score",
+                    "momentum_score",
+                    "breakout_score",
+                    "market_bias",
+                    "market_regime",
+                ],
+            },
+        )
+
     if has_ai_context:
         ai_ok, ai_reasons, _ = _ai_entry_validation(ai_context, loss_brake=loss_brake)
         if not ai_ok:
@@ -3029,6 +3130,13 @@ async def execute(
             else:
                 derived_stop = computed_stop
     elif derived_stop is None:
+        if trade.side.upper() == "BUY":
+            derived_stop = round(trade.price * (1 - pct), 2)
+        else:
+            derived_stop = round(trade.price * (1 + pct), 2)
+
+    # Defensive fallback: ensure stop is numeric before risk calculations.
+    if not isinstance(derived_stop, (int, float)):
         if trade.side.upper() == "BUY":
             derived_stop = round(trade.price * (1 - pct), 2)
         else:
@@ -3111,15 +3219,24 @@ async def execute(
         stop_points = abs(trade.price - derived_stop)
     
     # Validate max loss amount
-    qty = trade.quantity or 1
+    qty = int(trade.quantity or 1)
     potential_loss = stop_points * qty
-    max_loss_allowed = risk_config.get("max_per_trade_loss", 650)
+    hard_loss_cap = float(risk_config.get("max_per_trade_loss", 650) or 650)
+    balance_risk_cap = float(trade.balance or balance or 0.0) * float(risk_config.get("capital_per_trade_risk_pct") or 0.0)
+    max_loss_allowed = min(hard_loss_cap, balance_risk_cap) if balance_risk_cap > 0 else hard_loss_cap
     
     if potential_loss > max_loss_allowed and not auto_demo:
-        raise HTTPException(
-            status_code=403,
-            detail=f"Potential loss ₹{potential_loss:.2f} exceeds limit ₹{max_loss_allowed}. Reduce qty or tighten stop."
-        )
+        safe_qty = int(math.floor(max_loss_allowed / stop_points)) if stop_points > 0 else qty
+        if safe_qty >= 1:
+            qty = safe_qty
+            trade.quantity = safe_qty
+            potential_loss = stop_points * qty
+            print(f"[RISK CONTROL] Qty auto-reduced to {qty} to keep max loss within ₹{max_loss_allowed:.2f}")
+        else:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Potential loss ₹{potential_loss:.2f} exceeds limit ₹{max_loss_allowed:.2f} even at minimum qty 1. Tighten stop."
+            )
 
     capital_required = round(float(trade.price or 0.0) * float(qty or 0), 2)
     live_balance_value = float(trade.balance or balance or 0.0)
@@ -3141,7 +3258,7 @@ async def execute(
                 "message": "Insufficient available balance for live trade.",
                 "required": capital_required,
                 "balance": round(live_balance_value, 2),
-                "capital_in_use": round(float(_capital_in_use() or 0.0), 2),
+                "capital_in_use": round(float(_capital_in_use("LIVE") or 0.0), 2),
             },
         )
 
@@ -3150,7 +3267,7 @@ async def execute(
         capital_profile,
         capital_required=capital_required,
         potential_loss=float(potential_loss or 0.0),
-        capital_in_use=float(_capital_in_use() or 0.0),
+        capital_in_use=float(_capital_in_use("LIVE") or 0.0),
     )
     if guard_reasons and not auto_demo:
         raise HTTPException(
@@ -3177,11 +3294,40 @@ async def execute(
             derived_target = round(trade.price * (1 - pct * (TARGET_PCT / STOP_PCT)), 2)
 
     async with execute_lock:
-        if len(active_trades) >= MAX_TRADES and not auto_demo:
-            raise HTTPException(status_code=429, detail="Max active trades reached")
-
         existing_open = [t for t in active_trades if t.get("status") == "OPEN"]
-        if existing_open and (not auto_demo):
+        existing_live_open = [t for t in existing_open if str(t.get("trade_mode") or "LIVE").upper() == "LIVE"]
+
+        if len(existing_live_open) >= MAX_TRADES and not auto_demo:
+            raise HTTPException(status_code=429, detail="Max active live trades reached")
+
+        if auto_demo:
+            demo_open = [t for t in existing_open if str(t.get("trade_mode") or "").upper() in {"DEMO", "PAPER"}]
+            max_demo_concurrent = max(1, int(risk_config.get("max_simultaneous_demo_trades") or 2))
+            if len(demo_open) >= max_demo_concurrent:
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "message": "Concurrent demo trade blocked by max demo cap.",
+                        "reasons": [f"max_simultaneous_demo_reached({len(demo_open)}>={max_demo_concurrent})"],
+                    },
+                )
+
+            # Prevent duplicate same-root same-side demo entries while an open one exists.
+            cand_root = _extract_underlying_symbol(trade.symbol)
+            cand_side = str(trade.side or "BUY").upper()
+            for open_trade in demo_open:
+                open_root = _extract_underlying_symbol(open_trade.get("symbol"))
+                open_side = str(open_trade.get("side") or "BUY").upper()
+                if open_root == cand_root and open_side == cand_side:
+                    raise HTTPException(
+                        status_code=429,
+                        detail={
+                            "message": "Concurrent demo trade blocked on same root/side.",
+                            "reasons": [f"same_root_demo_blocked({cand_root}:{cand_side})"],
+                        },
+                    )
+
+        if existing_live_open and (not auto_demo):
             simultaneous_ok, simultaneous_reasons = _can_allow_additional_live_trade(ai_context)
             if not simultaneous_ok:
                 raise HTTPException(
@@ -3610,10 +3756,20 @@ async def debug_source():
 
 
 @router.get("/trades/history")
-async def get_trade_history(limit: int = 50, authorization: Optional[str] = Header(None)):
+async def get_trade_history(
+    limit: int = 50,
+    mode: str = "LIVE",
+    authorization: Optional[str] = Header(None),
+):
+    selected_mode = str(mode or "LIVE").strip().upper()
+    if selected_mode in {"LIVE", "DEMO"}:
+        rows = [t for t in history if str(t.get("trade_mode") or "LIVE").upper() == selected_mode]
+    else:
+        rows = list(history)
+    trades = rows[-limit:]
     return {
-        "trades": history[-limit:],
-        "total_profit": sum(t.get("pnl", 0) for t in history[-limit:]),
+        "trades": trades,
+        "total_profit": sum(t.get("pnl", 0) for t in trades),
     }
 
 
@@ -3621,6 +3777,7 @@ async def get_trade_history(limit: int = 50, authorization: Optional[str] = Head
 async def trade_report(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    mode: str = "LIVE",
     limit: int = 500,
     authorization: Optional[str] = Header(None),
 ):
@@ -3630,7 +3787,16 @@ async def trade_report(
     end_dt = datetime.fromisoformat(end_date).date() if end_date else today
 
     # Example: Use in-memory history (replace with DB query as needed)
-    filtered = [t for t in history if start_dt <= (t.get("trading_date") or today) <= end_dt]
+    selected_mode = str(mode or "LIVE").strip().upper()
+    filtered = [
+        t
+        for t in history
+        if start_dt <= (t.get("trading_date") or today) <= end_dt
+        and (
+            selected_mode not in {"LIVE", "DEMO"}
+            or str(t.get("trade_mode") or "LIVE").upper() == selected_mode
+        )
+    ]
     trades = filtered[-limit:]
     total_pnl = sum((t.get("pnl") or 0) for t in trades)
     wins = sum(1 for t in trades if (t.get("pnl") or 0) > 0)
@@ -3669,11 +3835,11 @@ async def market_indices():
     
     payload = [
         {
-            "symbol": sym, 
-            "price": data.get("current"), 
+            "symbol": sym,
+            "price": data.get("current"),
             "change_pct": data.get("change_percent"),
             "trend": data.get("trend"),
-            "source": "zerodha_live"
+            "source": "zerodha_live",
         }
         for sym, data in indices.items()
     ]

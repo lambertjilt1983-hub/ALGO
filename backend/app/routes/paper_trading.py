@@ -19,20 +19,20 @@ from app.routes.auto_trading_simple import _ai_entry_validation
 router = APIRouter()
 
 # Paper Trading Quality Gates (NEW)
-PAPER_QUALITY_SCORE_MINIMUM = 66
-PAPER_CONFIRMATION_SCORE_MINIMUM = 70
-PAPER_AI_EDGE_MINIMUM = 35.0
-PAPER_ENTRY_RR_MINIMUM = 1.30
+PAPER_QUALITY_SCORE_MINIMUM = 72
+PAPER_CONFIRMATION_SCORE_MINIMUM = 76
+PAPER_AI_EDGE_MINIMUM = 42.0
+PAPER_ENTRY_RR_MINIMUM = 1.45
 PAPER_REQUIRE_BOTH_CONFIRMATIONS = True
 PAPER_MARKET_REGIME_FILTER = True
 PAPER_ENFORCE_DAILY_LIMITS = False
-PAPER_MAX_DAILY_TRADES = 14
+PAPER_MAX_DAILY_TRADES = 10
 PAPER_CONSECUTIVE_SL_HIT_LIMIT = 2
 PAPER_DAILY_PROFIT_TARGET = 5000.0
-PAPER_MAX_FAKE_MOVE_RISK = 16.0
-PAPER_MAX_NEWS_RISK = 18.0
-PAPER_MAX_LIQUIDITY_SPIKE_RISK = 16.0
-PAPER_MAX_PREMIUM_DISTORTION = 14.0
+PAPER_MAX_FAKE_MOVE_RISK = 14.0
+PAPER_MAX_NEWS_RISK = 16.0
+PAPER_MAX_LIQUIDITY_SPIKE_RISK = 14.0
+PAPER_MAX_PREMIUM_DISTORTION = 12.0
 
 # Paper Trading SL/Re-entry Settings
 MAX_PAPER_TRADES = 2  # Allow up to two concurrent paper trades
@@ -676,8 +676,8 @@ def get_active_paper_trades(db: Session = Depends(get_db)):
 
 @router.get("/paper-trades/history")
 def get_paper_trade_history(
-    days: int = 7,
-    limit: int = 100,
+    days: int = 1,
+    limit: int = 50,
     db: Session = Depends(get_db)
 ):
     """Get closed paper trades history"""

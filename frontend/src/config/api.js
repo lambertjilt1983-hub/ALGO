@@ -15,6 +15,13 @@ const getWebSocketUrl = () => {
   return baseUrl.replace('http', 'ws').replace('https', 'wss');
 };
 
+const getAltLoopbackUrl = (url) => {
+  if (typeof url !== 'string') return null;
+  if (url.includes('://localhost:')) return url.replace('://localhost:', '://127.0.0.1:');
+  if (url.includes('://127.0.0.1:')) return url.replace('://127.0.0.1:', '://localhost:');
+  return null;
+};
+
 // Export centralized configuration
 export const config = {
   API_BASE_URL: getApiBaseUrl(),
@@ -141,6 +148,15 @@ export const config = {
           cache: 'no-store',
         });
       } catch {
+        const altUrl = getAltLoopbackUrl(url);
+        if (altUrl) {
+          try {
+            return await fetch(altUrl, {
+              ...requestOptions,
+              cache: 'no-store',
+            });
+          } catch {}
+        }
         // Return a synthetic failed response so callers get ok:false without a thrown exception.
         return new Response(null, { status: 0, statusText: 'Transport Error' });
       }

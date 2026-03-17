@@ -202,12 +202,12 @@ def test_live_execute_uses_stock_thresholds_and_ignores_stale_start_trade_flags(
             "quantity": 1,
             "side": "BUY",
             "stop_loss": 99.0,
-            "target": 101.2,
-            "quality_score": 61,
-            "confirmation_score": 65,
-            "ai_edge_score": 30,
-            "breakout_score": 58,
-            "momentum_score": 58,
+            "target": 101.4,
+            "quality_score": 67,
+            "confirmation_score": 71,
+            "ai_edge_score": 37,
+            "breakout_score": 62,
+            "momentum_score": 62,
             "breakout_confirmed": True,
             "momentum_confirmed": True,
             "breakout_hold_confirmed": True,
@@ -222,3 +222,42 @@ def test_live_execute_uses_stock_thresholds_and_ignores_stale_start_trade_flags(
     data = resp.json()
     assert data["success"] is True
     assert data["is_demo_mode"] is False
+
+
+def test_live_execute_rejects_missing_ai_context(monkeypatch):
+    state["is_demo_mode"] = False
+    state["live_armed"] = True
+
+    monkeypatch.setattr("app.routes.auto_trading_simple._within_trade_window", lambda: True)
+    monkeypatch.setattr(
+        "app.routes.auto_trading_simple._loss_brake_profile",
+        lambda: {"enabled": False, "stage": "OFF", "block_new_entries": False},
+    )
+    monkeypatch.setattr("app.routes.auto_trading_simple._require_multi_tick_confirmation", lambda *args, **kwargs: True)
+
+    app = FastAPI()
+    from app.routes.auto_trading_simple import router as at_router
+    app.include_router(at_router, prefix="/autotrade")
+    client = TestClient(app)
+
+    # Minimal live payload (no AI metadata) must be rejected by server-side gate.
+    resp = client.post(
+        "/autotrade/execute",
+        json={
+            "symbol": "LIVE_NO_AI_1",
+            "price": 200.0,
+            "balance": 50000,
+            "quantity": 1,
+            "side": "BUY",
+            "stop_loss": 195.0,
+            "target": 210.0,
+            "broker_id": 1,
+        },
+    )
+
+    assert resp.status_code == 422
+    data = resp.json()
+    detail = data.get("detail") if isinstance(data, dict) else {}
+    assert isinstance(detail, dict)
+    assert "missing ai context" in str(detail.get("message", "")).lower()
+    assert "required_fields" in detail

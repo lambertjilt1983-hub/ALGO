@@ -55,13 +55,24 @@ def place_zerodha_order(symbol, quantity, side, order_type="MARKET", product="MI
     
     kite = KiteConnect(api_key=api_key)
     kite.set_access_token(access_token)
+
+    normalized_side = str(side or "").strip().upper()
+    if normalized_side not in {"BUY", "SELL"}:
+        return {
+            "success": False,
+            "error": f"Invalid transaction side '{side}'. Expected BUY or SELL.",
+        }
+
+    transaction_type = (
+        kite.TRANSACTION_TYPE_BUY if normalized_side == "BUY" else kite.TRANSACTION_TYPE_SELL
+    )
     
     try:
         order_id = kite.place_order(
             variety=kite.VARIETY_REGULAR,
             exchange=exchange,
             tradingsymbol=symbol,
-            transaction_type=kite.TRANSACTION_TYPE_BUY if side.upper() == "BUY" else kite.TRANSACTION_TYPE_SELL,
+            transaction_type=transaction_type,
             quantity=quantity,
             order_type=order_type,
             product=product

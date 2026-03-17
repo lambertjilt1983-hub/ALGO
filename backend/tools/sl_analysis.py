@@ -5,7 +5,7 @@ Run with: PYTHONPATH=backend python backend/tools/sl_analysis.py
 This script prints a short report (SL hit rate, avg SL loss, per-symbol breakdown,
 hour-of-day analysis, and correlation with signal metrics if available).
 """
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 from collections import defaultdict, Counter
 
@@ -18,7 +18,7 @@ except Exception as e:
 
 
 def get_recent_closed_trades(session, days=30):
-    since = datetime.utcnow() - timedelta(days=days)
+    since = datetime.now(timezone.utc) - timedelta(days=days)
     # Try both live TradeReport and paper PaperTrade
     trades = []
     try:
@@ -44,6 +44,24 @@ def safe_get(obj, key, default=None):
             return default
 
 
+def parse_dt(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except Exception:
+            return None
+    return None
+
+
+def is_simulated_symbol(symbol: str) -> bool:
+    s = str(symbol or '').upper()
+    return s.startswith('SIM:') or 'TEST' in s
+
+
 def analyze(trades):
     total = len(trades)
     if total == 0:
@@ -53,6 +71,7 @@ def analyze(trades):
     sl_hits = [t for t in trades if str(safe_get(t, 'status') or '').upper() == 'SL_HIT']
     target_hits = [t for t in trades if str(safe_get(t, 'status') or '').upper() == 'TARGET_HIT']
     manual = [t for t in trades if str(safe_get(t, 'status') or '').upper() in ('MANUAL_CLOSE','CLOSED','EXPIRED')]
+    real_trades = [t for t in trades if not is_simulated_symbol(safe_get(t, 'symbol') or safe_get(t, 'trade_symbol'))]
 
     def pnl_of(t):
         p = safe_get(t, 'pnl')
@@ -75,11 +94,7 @@ def analyze(trades):
         exit_time = safe_get(t, 'exit_time')
         if exit_time is None:
             continue
-        if isinstance(exit_time, str):
-            try:
-                exit_time = datetime.fromisoformat(exit_time)
-            except Exception:
-                exit_time = None
+        exit_time = parse_dt(exit_time)
         if exit_time:
             hour = exit_time.hour
             by_hour[hour] += 1
@@ -117,6 +132,8 @@ def analyze(trades):
     report = {
         'period_days': 30,
         'total_closed_trades': total,
+        'real_closed_trades': len(real_trades),
+        'simulated_or_test_trades': total - len(real_trades),
         'sl_hits': sl_count,
         'sl_rate_pct': round(sl_rate,2),
         'avg_sl_loss': round(avg_sl_loss,2),

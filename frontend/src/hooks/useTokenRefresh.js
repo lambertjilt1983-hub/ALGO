@@ -18,9 +18,17 @@ const tokenLog = (level, key, message, minIntervalMs = 0) => {
 
 export const useTokenRefresh = () => {
   const refreshTimerRef = useRef(null);
+  const tokenBackoffUntilRef = useRef(0);
 
   const refreshAccessToken = async () => {
     try {
+      if (typeof document !== 'undefined' && document.hidden) {
+        return false;
+      }
+      if (Date.now() < Number(tokenBackoffUntilRef.current || 0)) {
+        return false;
+      }
+
       const refreshToken = localStorage.getItem('refresh_token');
       
       if (!refreshToken) {
@@ -30,15 +38,23 @@ export const useTokenRefresh = () => {
 
       tokenLog('log', 'refresh_attempt', '[TokenRefresh] Attempting to refresh access token...', 60000);
 
-      const response = await fetch(`${config.API_BASE_URL}/auth/refresh?refresh_token=${encodeURIComponent(refreshToken)}`, {
+      const response = await config.authFetch(`${config.API_BASE_URL}/auth/refresh?refresh_token=${encodeURIComponent(refreshToken)}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
+        retryTransportOnce: true,
+        cache: 'no-store',
       });
 
       if (response.ok) {
-        const data = await response.json();
+        let data = null;
+        try {
+          data = await response.json();
+        } catch {
+          tokenBackoffUntilRef.current = Date.now() + 20000;
+          return false;
+        }
         
         // Update access token in localStorage
         localStorage.setItem('access_token', data.access_token);
@@ -47,7 +63,10 @@ export const useTokenRefresh = () => {
         
         return true;
       } else {
-        const errorData = await response.json();
+        let errorData = {};
+        try {
+          errorData = await response.json();
+        } catch {}
         errorDeduped('token:refresh_failed', '[TokenRefresh] ✗ Token refresh failed', {
           burstWindowMs: 60000,
           flushDelayMs: 1000,
@@ -74,6 +93,13 @@ export const useTokenRefresh = () => {
 
   const validateBrokerToken = async () => {
     try {
+      if (typeof document !== 'undefined' && document.hidden) {
+        return;
+      }
+      if (Date.now() < Number(tokenBackoffUntilRef.current || 0)) {
+        return;
+      }
+
       const accessToken = localStorage.getItem('access_token');
       
       if (!accessToken) {
@@ -81,14 +107,22 @@ export const useTokenRefresh = () => {
       }
 
       // Check broker token status
-      const response = await fetch(`${config.API_BASE_URL}/api/tokens/validate-all`, {
+      const response = await config.authFetch(`${config.API_BASE_URL}/api/tokens/validate-all`, {
         headers: {
           'Authorization': `Bearer ${accessToken}`,
         },
+        retryTransportOnce: true,
+        cache: 'no-store',
       });
 
       if (response.ok) {
-        const data = await response.json();
+        let data = null;
+        try {
+          data = await response.json();
+        } catch {
+          tokenBackoffUntilRef.current = Date.now() + 20000;
+          return;
+        }
         const results = data.results || [];
         
         // Check if any broker tokens need re-authentication
@@ -102,6 +136,7 @@ export const useTokenRefresh = () => {
         }
       }
     } catch (error) {
+      tokenBackoffUntilRef.current = Date.now() + 20000;
       errorDeduped('token:broker_validate_error', '[TokenRefresh] Error validating broker tokens', {
         burstWindowMs: 60000,
         flushDelayMs: 1000,

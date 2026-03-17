@@ -1,7 +1,9 @@
 import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
+import traceback
 from app.routes import auth, broker, orders, strategies, market_intelligence, auto_trading_simple, test_market, token_refresh, admin, option_signals, zerodha_postback, paper_trading
 from app.core.database import Base, engine, SessionLocal
 from app.core.config import get_settings
@@ -127,6 +129,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# GZip compression – reduces large responses (e.g. trade history) avoiding dev proxy Content-Length mismatch errors
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # Logging middleware for debugging CORS issues
 @app.middleware("http")
@@ -138,6 +142,8 @@ async def log_cors_request(request, call_next):
     try:
         response = await call_next(request)
     except Exception as e:
+        print(f"[UNHANDLED ERROR] {request.method} {request.url.path}: {e.__class__.__name__}: {e}")
+        traceback.print_exc()
         # Keep error responses CORS-readable for the frontend, even when downstream raises.
         response = JSONResponse(
             status_code=500,
