@@ -1,0 +1,9 @@
+﻿{
+  "symbol":"DEMO_TEST",
+  "price":100,
+  "quantity":1,
+  "side":"BUY",
+  "stop_loss":95,
+  "target":110,
+  "force_demo": true
+}

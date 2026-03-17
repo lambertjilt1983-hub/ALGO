@@ -38,6 +38,11 @@ class Backtester:
         symbol: str = "TEST"
     ) -> BacktestMetrics:
         """Run backtest on historical data"""
+
+        # Reset run state so repeated invocations on the same instance are clean.
+        self.current_capital = self.initial_capital
+        self.positions = {}
+        self.trades = []
         
         if not self.strategy.validate_data(data):
             logger.log_error("Invalid data for backtesting", {"symbol": symbol})
@@ -86,7 +91,7 @@ class Backtester:
                     "exit_time": data.index[i]
                 })
                 
-                self.current_capital += position["quantity"] * current_price + pnl
+                self.current_capital += position["quantity"] * current_price
                 del self.positions[symbol]
             
             # Check stop loss and take profit
@@ -106,7 +111,7 @@ class Backtester:
                         "exit_time": data.index[i],
                         "reason": "stop_loss"
                     })
-                    self.current_capital += position["quantity"] * current_price + pnl
+                    self.current_capital += position["quantity"] * current_price
                     del self.positions[symbol]
                 
                 elif position["take_profit"] and current_price >= position["take_profit"]:
@@ -123,7 +128,7 @@ class Backtester:
                         "exit_time": data.index[i],
                         "reason": "take_profit"
                     })
-                    self.current_capital += position["quantity"] * current_price + pnl
+                    self.current_capital += position["quantity"] * current_price
                     del self.positions[symbol]
             
             equity_curve.append(self.current_capital)
@@ -142,7 +147,7 @@ class Backtester:
                 "entry_time": position["entry_time"],
                 "exit_time": data.index[-1]
             })
-            self.current_capital += position["quantity"] * last_price + pnl
+            self.current_capital += position["quantity"] * last_price
         
         # Calculate metrics
         metrics = self._calculate_metrics(equity_curve)

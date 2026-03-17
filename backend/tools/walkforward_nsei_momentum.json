@@ -1,0 +1,462 @@
+{
+  "generated_at": "2026-03-13T10:56:33.940329Z",
+  "strategy": "momentum",
+  "symbol": "^NSEI",
+  "data": {
+    "bars": 1236,
+    "start": "2021-03-15 00:00:00",
+    "end": "2026-03-13 00:00:00",
+    "source": "yfinance:^NSEI",
+    "interval": "1d"
+  },
+  "walkforward": {
+    "train_bars": 252,
+    "test_bars": 63,
+    "step_bars": 63,
+    "windows": [
+      {
+        "window": 1,
+        "train_start": "2021-03-15 00:00:00",
+        "train_end": "2022-03-21 00:00:00",
+        "test_start": "2022-03-22 00:00:00",
+        "test_end": "2022-06-21 00:00:00",
+        "best_params": {
+          "period": 5,
+          "threshold": 0.01
+        },
+        "train": {
+          "total_return": -0.9452727375567653,
+          "sharpe_ratio": 3.037884456457773,
+          "max_drawdown": -0.9522675641251511,
+          "win_rate": 0.5454545454545454,
+          "total_trades": 11
+        },
+        "test": {
+          "total_return": -0.01936087754941691,
+          "sharpe_ratio": 3.906747646681528,
+          "max_drawdown": -0.9521264039911678,
+          "win_rate": 0.5,
+          "total_trades": 4,
+          "losing_trades": 2,
+          "winning_trades": 2,
+          "sl_like_loss_rate": 0.5,
+          "trades_near_events": 0
+        }
+      },
+      {
+        "window": 2,
+        "train_start": "2021-06-17 00:00:00",
+        "train_end": "2022-06-21 00:00:00",
+        "test_start": "2022-06-22 00:00:00",
+        "test_end": "2022-09-21 00:00:00",
+        "best_params": {
+          "period": 5,
+          "threshold": 0.01
+        },
+        "train": {
+          "total_return": 0.10660307547765945,
+          "sharpe_ratio": 3.3589625186672767,
+          "max_drawdown": -0.9521264039911678,
+          "win_rate": 0.5,
+          "total_trades": 12
+        },
+        "test": {
+          "total_return": 0.06267207098238926,
+          "sharpe_ratio": 3.3616916240938224,
+          "max_drawdown": -0.95,
+          "win_rate": 0.6666666666666666,
+          "total_trades": 3,
+          "losing_trades": 1,
+          "winning_trades": 2,
+          "sl_like_loss_rate": 0.3333333333333333,
+          "trades_near_events": 0
+        }
+      },
+      {
+        "window": 3,
+        "train_start": "2021-09-17 00:00:00",
+        "train_end": "2022-09-21 00:00:00",
+        "test_start": "2022-09-22 00:00:00",
+        "test_end": "2022-12-22 00:00:00",
+        "best_params": {
+          "period": 5,
+          "threshold": 0.01
+        },
+        "train": {
+          "total_return": 0.0985518068490435,
+          "sharpe_ratio": 3.6420037661962734,
+          "max_drawdown": -0.9521264039911675,
+          "win_rate": 0.5,
+          "total_trades": 14
+        },
+        "test": {
+          "total_return": 0.04319218147149033,
+          "sharpe_ratio": 2.7243902665598485,
+          "max_drawdown": -0.9507148006058492,
+          "win_rate": 0.5,
+          "total_trades": 2,
+          "losing_trades": 1,
+          "winning_trades": 1,
+          "sl_like_loss_rate": 0.5,
+          "trades_near_events": 0
+        }
+      },
+      {
+        "window": 4,
+        "train_start": "2021-12-20 00:00:00",
+        "train_end": "2022-12-22 00:00:00",
+        "test_start": "2022-12-23 00:00:00",
+        "test_end": "2023-03-23 00:00:00",
+        "best_params": {
+          "period": 5,
+          "threshold": 0.01
+        },
+        "train": {
+          "total_return": 0.18492719320476536,
+          "sharpe_ratio": 3.360438341375334,
+          "max_drawdown": -0.9521264039911678,
+          "win_rate": 0.5,
+          "total_trades": 12
+        },
+        "test": {
+          "total_return": -0.9532296655786888,
+          "sharpe_ratio": 3.8476433387382185,
+          "max_drawdown": -0.9532296655786888,
+          "win_rate": 0.0,
+          "total_trades": 5,
+          "losing_trades": 5,
+          "winning_trades": 0,
+          "sl_like_loss_rate": 1.0,
+          "trades_near_events": 0
+        }
+      },
+      {
+        "window": 5,
+        "train_start": "2022-03-22 00:00:00",
+        "train_end": "2023-03-23 00:00:00",
+        "test_start": "2023-03-24 00:00:00",
+        "test_end": "2023-06-27 00:00:00",
+        "best_params": {
+          "period": 5,
+          "threshold": 0.01
+        },
+        "train": {
+          "total_return": -0.9484024661896171,
+          "sharpe_ratio": 3.4869901438895856,
+          "max_drawdown": -0.9532296655786889,
+          "win_rate": 0.35714285714285715,
+          "total_trades": 14
+        },
+        "test": {
+          "total_return": -0.9493818890451314,
+          "sharpe_ratio": 1.8098425773178388,
+          "max_drawdown": -0.95,
+          "win_rate": 1.0,
+          "total_trades": 2,
+          "losing_trades": 0,
+          "winning_trades": 2,
+          "sl_like_loss_rate": 0.0,
+          "trades_near_events": 0
+        }
+      },
+      {
+        "window": 6,
+        "train_start": "2022-06-22 00:00:00",
+        "train_end": "2023-06-27 00:00:00",
+        "test_start": "2023-06-28 00:00:00",
+        "test_end": "2023-09-27 00:00:00",
+        "best_params": {
+          "period": 5,
+          "threshold": 0.01
+        },
+        "train": {
+          "total_return": -0.9467947161051147,
+          "sharpe_ratio": 3.038070504331652,
+          "max_drawdown": -0.9532296655786892,
+          "win_rate": 0.45454545454545453,
+          "total_trades": 11
+        },
+        "test": {
+          "total_return": 0.01839323643926109,
+          "sharpe_ratio": 2.7243162012787554,
+          "max_drawdown": -0.95,
+          "win_rate": 1.0,
+          "total_trades": 2,
+          "losing_trades": 0,
+          "winning_trades": 2,
+          "sl_like_loss_rate": 0.0,
+          "trades_near_events": 0
+        }
+      },
+      {
+        "window": 7,
+        "train_start": "2022-09-22 00:00:00",
+        "train_end": "2023-09-27 00:00:00",
+        "test_start": "2023-09-28 00:00:00",
+        "test_end": "2024-01-01 00:00:00",
+        "best_params": {
+          "period": 5,
+          "threshold": 0.01
+        },
+        "train": {
+          "total_return": 0.111371768055594,
+          "sharpe_ratio": 2.892972489761545,
+          "max_drawdown": -0.9532296655786889,
+          "win_rate": 0.4444444444444444,
+          "total_trades": 9
+        },
+        "test": {
+          "total_return": -0.9506442374266407,
+          "sharpe_ratio": 1.804191066322169,
+          "max_drawdown": -0.9506442374266407,
+          "win_rate": 0.5,
+          "total_trades": 2,
+          "losing_trades": 1,
+          "winning_trades": 1,
+          "sl_like_loss_rate": 0.5,
+          "trades_near_events": 0
+        }
+      },
+      {
+        "window": 8,
+        "train_start": "2022-12-23 00:00:00",
+        "train_end": "2024-01-01 00:00:00",
+        "test_start": "2024-01-02 00:00:00",
+        "test_end": "2024-04-04 00:00:00",
+        "best_params": {
+          "period": 5,
+          "threshold": 0.01
+        },
+        "train": {
+          "total_return": -0.9474185082201123,
+          "sharpe_ratio": 2.703042687929279,
+          "max_drawdown": -0.9532296655786888,
+          "win_rate": 0.4444444444444444,
+          "total_trades": 9
+        },
+        "test": {
+          "total_return": -0.9513524586264047,
+          "sharpe_ratio": 3.293815524440177,
+          "max_drawdown": -0.9513524586264047,
+          "win_rate": 0.5,
+          "total_trades": 4,
+          "losing_trades": 2,
+          "winning_trades": 2,
+          "sl_like_loss_rate": 0.5,
+          "trades_near_events": 0
+        }
+      },
+      {
+        "window": 9,
+        "train_start": "2023-03-24 00:00:00",
+        "train_end": "2024-04-04 00:00:00",
+        "test_start": "2024-04-05 00:00:00",
+        "test_end": "2024-07-09 00:00:00",
+        "best_params": {
+          "period": 5,
+          "threshold": 0.01
+        },
+        "train": {
+          "total_return": -0.9396687876162662,
+          "sharpe_ratio": 2.7047769994163735,
+          "max_drawdown": -0.9513524586264048,
+          "win_rate": 0.6666666666666666,
+          "total_trades": 9
+        },
+        "test": {
+          "total_return": -0.9528473881272381,
+          "sharpe_ratio": 3.29001391326683,
+          "max_drawdown": -0.9528473881272381,
+          "win_rate": 0.5,
+          "total_trades": 4,
+          "losing_trades": 2,
+          "winning_trades": 2,
+          "sl_like_loss_rate": 0.5,
+          "trades_near_events": 0
+        }
+      },
+      {
+        "window": 10,
+        "train_start": "2023-06-28 00:00:00",
+        "train_end": "2024-07-09 00:00:00",
+        "test_start": "2024-07-10 00:00:00",
+        "test_end": "2024-10-09 00:00:00",
+        "best_params": {
+          "period": 5,
+          "threshold": 0.01
+        },
+        "train": {
+          "total_return": -0.9481020088246468,
+          "sharpe_ratio": 3.1920896997445225,
+          "max_drawdown": -0.9538295953952693,
+          "win_rate": 0.5833333333333334,
+          "total_trades": 12
+        },
+        "test": {
+          "total_return": -0.029528920669519284,
+          "sharpe_ratio": 3.9060773588827282,
+          "max_drawdown": -0.9522239318472833,
+          "win_rate": 0.25,
+          "total_trades": 4,
+          "losing_trades": 3,
+          "winning_trades": 1,
+          "sl_like_loss_rate": 0.75,
+          "trades_near_events": 0
+        }
+      },
+      {
+        "window": 11,
+        "train_start": "2023-09-28 00:00:00",
+        "train_end": "2024-10-09 00:00:00",
+        "test_start": "2024-10-10 00:00:00",
+        "test_end": "2025-01-09 00:00:00",
+        "best_params": {
+          "period": 5,
+          "threshold": 0.01
+        },
+        "train": {
+          "total_return": 0.07055401693242326,
+          "sharpe_ratio": 3.501015285735312,
+          "max_drawdown": -0.9538295953952696,
+          "win_rate": 0.46153846153846156,
+          "total_trades": 13
+        },
+        "test": {
+          "total_return": -0.009411571974286635,
+          "sharpe_ratio": 2.721387241643319,
+          "max_drawdown": -0.95,
+          "win_rate": 0.5,
+          "total_trades": 2,
+          "losing_trades": 1,
+          "winning_trades": 1,
+          "sl_like_loss_rate": 0.5,
+          "trades_near_events": 0
+        }
+      },
+      {
+        "window": 12,
+        "train_start": "2024-01-02 00:00:00",
+        "train_end": "2025-01-09 00:00:00",
+        "test_start": "2025-01-10 00:00:00",
+        "test_end": "2025-04-11 00:00:00",
+        "best_params": {
+          "period": 5,
+          "threshold": 0.01
+        },
+        "train": {
+          "total_return": -0.05180463760074926,
+          "sharpe_ratio": 3.640001885386569,
+          "max_drawdown": -0.9538295953952693,
+          "win_rate": 0.42857142857142855,
+          "total_trades": 14
+        },
+        "test": {
+          "total_return": -0.013413057674223674,
+          "sharpe_ratio": 3.357828448657551,
+          "max_drawdown": -0.951912763646406,
+          "win_rate": 0.3333333333333333,
+          "total_trades": 3,
+          "losing_trades": 2,
+          "winning_trades": 1,
+          "sl_like_loss_rate": 0.6666666666666666,
+          "trades_near_events": 0
+        }
+      },
+      {
+        "window": 13,
+        "train_start": "2024-04-05 00:00:00",
+        "train_end": "2025-04-11 00:00:00",
+        "test_start": "2025-04-15 00:00:00",
+        "test_end": "2025-07-14 00:00:00",
+        "best_params": {
+          "period": 5,
+          "threshold": 0.01
+        },
+        "train": {
+          "total_return": -0.04462193963105572,
+          "sharpe_ratio": 3.500887338347392,
+          "max_drawdown": -0.9536776993744476,
+          "win_rate": 0.38461538461538464,
+          "total_trades": 13
+        },
+        "test": {
+          "total_return": -0.03356519386962071,
+          "sharpe_ratio": 3.9064716969529107,
+          "max_drawdown": -0.9517466202952827,
+          "win_rate": 0.25,
+          "total_trades": 4,
+          "losing_trades": 3,
+          "winning_trades": 1,
+          "sl_like_loss_rate": 0.75,
+          "trades_near_events": 0
+        }
+      },
+      {
+        "window": 14,
+        "train_start": "2024-07-10 00:00:00",
+        "train_end": "2025-07-14 00:00:00",
+        "test_start": "2025-07-15 00:00:00",
+        "test_end": "2025-10-14 00:00:00",
+        "best_params": {
+          "period": 5,
+          "threshold": 0.01
+        },
+        "train": {
+          "total_return": -0.058584075382216834,
+          "sharpe_ratio": 3.640727300519763,
+          "max_drawdown": -0.9543781367399792,
+          "win_rate": 0.35714285714285715,
+          "total_trades": 14
+        },
+        "test": {
+          "total_return": -0.9497121819207721,
+          "sharpe_ratio": 2.6480504275740917,
+          "max_drawdown": -0.9503148567660918,
+          "win_rate": 0.6666666666666666,
+          "total_trades": 3,
+          "losing_trades": 1,
+          "winning_trades": 2,
+          "sl_like_loss_rate": 0.3333333333333333,
+          "trades_near_events": 0
+        }
+      },
+      {
+        "window": 15,
+        "train_start": "2024-10-10 00:00:00",
+        "train_end": "2025-10-14 00:00:00",
+        "test_start": "2025-10-15 00:00:00",
+        "test_end": "2026-01-14 00:00:00",
+        "best_params": {
+          "period": 5,
+          "threshold": 0.01
+        },
+        "train": {
+          "total_return": -0.9505695706217997,
+          "sharpe_ratio": 3.1934287023076022,
+          "max_drawdown": -0.9531633060590805,
+          "win_rate": 0.5,
+          "total_trades": 12
+        },
+        "test": {
+          "total_return": -0.010740101119355968,
+          "sharpe_ratio": 2.7219196323277264,
+          "max_drawdown": -0.9505389096298187,
+          "win_rate": 0.5,
+          "total_trades": 2,
+          "losing_trades": 1,
+          "winning_trades": 1,
+          "sl_like_loss_rate": 0.5,
+          "trades_near_events": 0
+        }
+      }
+    ],
+    "summary": {
+      "windows": 15,
+      "avg_test_win_rate": 0.5111,
+      "avg_test_sharpe": 3.0683,
+      "avg_test_return": -0.3799,
+      "total_test_trades": 46,
+      "weighted_test_win_rate": 0.4565
+    }
+  }
+}

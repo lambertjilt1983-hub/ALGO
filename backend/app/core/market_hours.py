@@ -136,6 +136,22 @@ def market_status(start: time, end: time, now: datetime | None = None) -> dict:
     if current.tzinfo is None:
         current = current.replace(tzinfo=_market_tz())
 
+    current_time = current.time()
+    if current_time < start:
+        return {
+            "is_open": False,
+            "reason": "Before market open",
+            "current_date": current.date().isoformat(),
+            "current_time": current_time.strftime("%H:%M"),
+        }
+    if current_time > end:
+        return {
+            "is_open": False,
+            "reason": "After market close",
+            "current_date": current.date().isoformat(),
+            "current_time": current_time.strftime("%H:%M"),
+        }
+
     nse_open = _nse_market_open()
     if nse_open is True:
         return {

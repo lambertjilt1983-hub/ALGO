@@ -1,0 +1,90 @@
+[
+    {
+        "ticker":  "^NSEBANK",
+        "strategy":  "rsi",
+        "windows":  15,
+        "avg_test_win_rate":  0.4333,
+        "weighted_test_win_rate":  0.7,
+        "avg_test_return":  -0.1791,
+        "avg_test_sharpe":  0.6178,
+        "total_test_trades":  10,
+        "report":  "backend/tools/walkforward_nsebank_rsi.json"
+    },
+    {
+        "ticker":  "^NSEBANK",
+        "strategy":  "momentum",
+        "windows":  15,
+        "avg_test_win_rate":  0.5933,
+        "weighted_test_win_rate":  0.5106,
+        "avg_test_return":  -0.4954,
+        "avg_test_sharpe":  3.0299,
+        "total_test_trades":  47,
+        "report":  "backend/tools/walkforward_nsebank_momentum.json"
+    },
+    {
+        "ticker":  "^NSEI",
+        "strategy":  "momentum",
+        "windows":  15,
+        "avg_test_win_rate":  0.5111,
+        "weighted_test_win_rate":  0.4565,
+        "avg_test_return":  -0.3799,
+        "avg_test_sharpe":  3.0683,
+        "total_test_trades":  46,
+        "report":  "backend/tools/walkforward_nsei_momentum.json"
+    },
+    {
+        "ticker":  "^NSEBANK",
+        "strategy":  "ma_crossover",
+        "windows":  15,
+        "avg_test_win_rate":  0.4178,
+        "weighted_test_win_rate":  0.4516,
+        "avg_test_return":  -0.3184,
+        "avg_test_sharpe":  2.1196,
+        "total_test_trades":  31,
+        "report":  "backend/tools/walkforward_nsebank_ma_crossover.json"
+    },
+    {
+        "ticker":  "^NSEI",
+        "strategy":  "rsi",
+        "windows":  15,
+        "avg_test_win_rate":  0.1667,
+        "weighted_test_win_rate":  0.4286,
+        "avg_test_return":  -0.2484,
+        "avg_test_sharpe":  -0.0271,
+        "total_test_trades":  7,
+        "report":  "backend/tools/walkforward_nsei_rsi.json"
+    },
+    {
+        "ticker":  "^NSEI",
+        "strategy":  "ma_crossover",
+        "windows":  15,
+        "avg_test_win_rate":  0.3956,
+        "weighted_test_win_rate":  0.3902,
+        "avg_test_return":  -0.1947,
+        "avg_test_sharpe":  2.6386,
+        "total_test_trades":  41,
+        "report":  "backend/tools/walkforward_nsei_ma_crossover.json"
+    },
+    {
+        "ticker":  "^NSEBANK",
+        "strategy":  "intraday_professional",
+        "windows":  15,
+        "avg_test_win_rate":  0.2459,
+        "weighted_test_win_rate":  0.0294,
+        "avg_test_return":  -0.2533,
+        "avg_test_sharpe":  1.2827,
+        "total_test_trades":  238,
+        "report":  "backend/tools/walkforward_nsebank_intraday_professional.json"
+    },
+    {
+        "ticker":  "^NSEI",
+        "strategy":  "intraday_professional",
+        "windows":  15,
+        "avg_test_win_rate":  0.2111,
+        "weighted_test_win_rate":  0.0204,
+        "avg_test_return":  -0.2593,
+        "avg_test_sharpe":  0.9173,
+        "total_test_trades":  245,
+        "report":  "backend/tools/walkforward_nsei_intraday_professional.json"
+    }
+]

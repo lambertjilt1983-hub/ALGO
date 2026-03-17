@@ -225,12 +225,12 @@ export default function BrokersPage() {
 
                   <div className="space-y-2 text-sm text-gray-600">
                     <p><strong>API Key:</strong> {broker.api_key_preview || 'Hidden'}</p>
-                    <p><strong>Added:</strong> {new Date(broker.created_at).toLocaleDateString()}</p>
+                    <p><strong>Added:</strong> {formatTimeIST(broker.created_at)}</p>
                     {broker.last_used && (
-                      <p><strong>Last Used:</strong> {new Date(broker.last_used).toLocaleString()}</p>
+                      <p><strong>Last Used:</strong> {formatTimeIST(broker.last_used)}</p>
                     )}
                     {broker.token_expiry && (
-                      <p><strong>Token Expiry:</strong> {new Date(broker.token_expiry).toLocaleString()}</p>
+                      <p><strong>Token Expiry:</strong> {formatTimeIST(broker.token_expiry)}</p>
                     )}
                   </div>
 

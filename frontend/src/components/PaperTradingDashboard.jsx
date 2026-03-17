@@ -1,6 +1,32 @@
 import React, { useState, useEffect } from 'react';
 import config from '../config/api';
 
+// Helper function to format dates in IST timezone
+// Append 'Z' for timezone-naive strings so they parse as UTC instead of
+// being treated as local time (prevents 5:30‑hour misalignment in IST).
+const formatTimeIST = (dateString) => {
+  if (!dateString) return '--';
+  try {
+    let s = dateString;
+    if (!/[Zz]|[+-]\d{2}:?\d{2}/.test(s)) {
+      s = s + 'Z';
+    }
+    const date = new Date(s);
+    return date.toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    });
+  } catch {
+    return dateString;
+  }
+};
+
 const PaperTradingDashboard = () => {
   const [activeTrades, setActiveTrades] = useState([]);
   const [tradeHistory, setTradeHistory] = useState([]);
@@ -82,6 +108,15 @@ const PaperTradingDashboard = () => {
     setLoading(false);
   };
 
+  // Refresh active trades and history WITHOUT showing loading state (for background updates)
+  const refreshTradesQuietly = async () => {
+    await Promise.all([
+      fetchActiveTrades(),
+      fetchTradeHistory(),
+      fetchPerformance()
+    ]);
+  };
+
   // Update prices for all open trades
   const updatePrices = async () => {
     try {
@@ -90,8 +125,8 @@ const PaperTradingDashboard = () => {
       });
       const data = await response.json();
       if (data.success) {
-        // Refresh data after price update
-        await loadData();
+        // Refresh trade data without showing loading state
+        await refreshTradesQuietly();
       }
     } catch (error) {
       console.error('Failed to update prices:', error);
@@ -422,7 +457,7 @@ const PaperTradingDashboard = () => {
                       })()}
                     </td>
                     <td style={{ padding: '12px', fontSize: '12px', color: '#718096' }}>
-                      {trade.entry_time ? new Date(trade.entry_time).toLocaleString() : '--'}
+                      {formatTimeIST(trade.entry_time)}
                     </td>
                     <td style={{ padding: '12px', textAlign: 'center' }}>
                       <button
@@ -545,10 +580,10 @@ const PaperTradingDashboard = () => {
                       {trade.pnl_percentage ? (trade.pnl_percentage > 0 ? '+' : '') + trade.pnl_percentage.toFixed(2) + '%' : '--'}
                     </td>
                     <td style={{ padding: '12px', fontSize: '12px', color: '#718096' }}>
-                      {trade.entry_time ? new Date(trade.entry_time).toLocaleString() : '--'}
+                      {formatTimeIST(trade.entry_time)}
                     </td>
                     <td style={{ padding: '12px', fontSize: '12px', color: '#718096' }}>
-                      {trade.exit_time ? new Date(trade.exit_time).toLocaleString() : '--'}
+                      {formatTimeIST(trade.exit_time)}
                     </td>
                     <td style={{ padding: '12px', textAlign: 'center' }}>
                       <button

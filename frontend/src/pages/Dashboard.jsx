@@ -4,6 +4,26 @@ import { Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, Re
 import { ordersAPI, strategiesAPI, marketAPI } from '../api/client';
 import toast from 'react-hot-toast';
 
+// Helper function to format dates in IST timezone
+const formatTimeIST = (dateString) => {
+  if (!dateString) return '--';
+  try {
+    const date = new Date(dateString);
+    return date.toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    });
+  } catch {
+    return dateString;
+  }
+};
+
 export default function Dashboard() {
   const [orders, setOrders] = useState([]);
   const [strategies, setStrategies] = useState([]);
@@ -88,25 +108,46 @@ export default function Dashboard() {
 
   useEffect(() => {
     // Auto-trade for signals with confidence > 80 if no active trade
-    if (!activeTrade && signals.length > 0) {
-      const highConf = signals.filter(s => s.confidence > 80);
-      if (highConf.length > 0) {
-        const sig = highConf[0];
-        axios.post('/autotrade/execute', {
+    const tryAutoExecute = async () => {
+      if (activeTrade || signals.length === 0) return;
+      const highConf = signals.filter((s) => s.confidence > 80);
+      if (highConf.length === 0) return;
+      const sig = highConf[0];
+      try {
+        // Verify server-side autotrade status before executing
+        const statusResp = await axios.get('/autotrade/status');
+        const status = statusResp.data || {};
+        if (!status.enabled) {
+          console.warn('Autotrade disabled on server; skipping execute');
+          return;
+        }
+        // Only auto-execute in demo mode by default to avoid accidental live orders
+        if (!status.is_demo_mode) {
+          console.warn('Autotrade live mode not armed; skipping execute');
+          return;
+        }
+
+        await axios.post('/paper-trades', {
           symbol: sig.symbol,
-          price: sig.entry_price,
-          quantity: sig.quantity,
+          index_name: sig.index || sig.underlying || 'NIFTY',
           side: sig.action,
+          signal_type: sig.signal_type || 'intraday_option',
+          quantity: Number(sig.quantity || 1),
+          entry_price: Number(sig.entry_price || 0),
           stop_loss: sig.stop_loss,
           target: sig.target,
-          expiry: sig.expiry_date || sig.expiry,
-        }).then(() => {
-          toast.success(`Auto-trade executed for ${sig.symbol}`);
-        }).catch(() => {
-          toast.error('Auto-trade failed');
+          strategy: sig.strategy || 'auto-demo',
+          signal_data: sig,
+          bypass_confirmation: false,
         });
+        toast.success(`Paper trade executed for ${sig.symbol}`);
+      } catch (err) {
+        console.error('Auto-trade attempt failed', err);
+        toast.error(err.response?.data?.detail || 'Auto-trade failed');
       }
-    }
+    };
+
+    tryAutoExecute();
   }, [signals, activeTrade]);
 
   const chartData = [
@@ -288,7 +329,7 @@ export default function Dashboard() {
                     </span>
                   </td>
                   <td className="px-6 py-4 text-sm text-gray-600">
-                    {new Date(strategy.created_at).toLocaleDateString()}
+                    {formatTimeIST(strategy.created_at)}
                   </td>
                 </tr>
               ))}

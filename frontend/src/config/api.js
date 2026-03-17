@@ -6,19 +6,20 @@ const getApiBaseUrl = () => {
   if (import.meta.env.VITE_API_URL) {
     return import.meta.env.VITE_API_URL;
   }
-  // Priority 2: Auto-detect based on hostname
-  const hostname = window.location.hostname;
-  // Production detection
-  if (hostname !== 'localhost' && hostname !== '127.0.0.1') {
-    return `https://algo-trade-backend.up.railway.app`;
-  }
-  // For development, fallback to Railway backend or local dev server if needed
-  return `https://algo-trade-backend.up.railway.app`;
+  // Local-only mode.
+  return `http://127.0.0.1:8000`;
 };
 
 const getWebSocketUrl = () => {
   const baseUrl = getApiBaseUrl();
   return baseUrl.replace('http', 'ws').replace('https', 'wss');
+};
+
+const getAltLoopbackUrl = (url) => {
+  if (typeof url !== 'string') return null;
+  if (url.includes('://localhost:')) return url.replace('://localhost:', '://127.0.0.1:');
+  if (url.includes('://127.0.0.1:')) return url.replace('://127.0.0.1:', '://localhost:');
+  return null;
 };
 
 // Export centralized configuration
@@ -117,17 +118,49 @@ export const config = {
     const url = (typeof endpoint === 'string' && (endpoint.startsWith('http://') || endpoint.startsWith('https://'))) 
       ? endpoint 
       : config.getUrl(endpoint);
-    
-    const response = await fetch(url, {
-      ...options,
+
+    const { includeAuth = true, retryTransportOnce = false, ...restOptions } = options;
+
+    const requestOptions = {
+      ...restOptions,
       headers: {
         'Content-Type': 'application/json',
-        ...config.getAuthHeaders(),
-        ...options.headers,
+        ...(includeAuth ? config.getAuthHeaders() : {}),
+        ...restOptions.headers,
       },
-    });
-    
-    return response;
+    };
+
+    const method = String(requestOptions.method || 'GET').toUpperCase();
+    const canRetry = method === 'GET' || retryTransportOnce;
+
+    try {
+      return await fetch(url, requestOptions);
+    } catch (error) {
+      if (!canRetry) throw error;
+
+      // Retry once for intermittent transport/decode issues seen in dev (e.g. content-length mismatch).
+      // Wrap the retry in its own try/catch so a double-failure still returns a failed-response
+      // object instead of re-throwing (avoids redundant browser console stack traces).
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      try {
+        return await fetch(url, {
+          ...requestOptions,
+          cache: 'no-store',
+        });
+      } catch {
+        const altUrl = getAltLoopbackUrl(url);
+        if (altUrl) {
+          try {
+            return await fetch(altUrl, {
+              ...requestOptions,
+              cache: 'no-store',
+            });
+          } catch {}
+        }
+        // Return a synthetic failed response so callers get ok:false without a thrown exception.
+        return new Response(null, { status: 0, statusText: 'Transport Error' });
+      }
+    }
   },
 };
 

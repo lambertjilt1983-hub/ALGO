@@ -1,0 +1,67 @@
+{
+  "generated_at": "2026-03-13T12:20:57.586116Z",
+  "lookback_days": 5000,
+  "limit": 8000,
+  "rows_fetched": {
+    "paper_trades": 0,
+    "live_trade_reports": 40
+  },
+  "signals_replayed": {
+    "paper_signals": 0,
+    "live_signals": 40,
+    "live_replay_source": "live_signals",
+    "demo_replay_source": "live_signals"
+  },
+  "live": {
+    "sample_size": 40,
+    "old_policy": "old_live",
+    "new_policy": "new_live",
+    "old_accept_count": 40,
+    "new_accept_count": 40,
+    "old_accept_rate": 1.0,
+    "new_accept_rate": 1.0,
+    "delta_accept_count": 0,
+    "delta_accept_rate": 0.0,
+    "kept_count": 40,
+    "dropped_count": 0,
+    "newly_allowed_count": 0,
+    "top_old_rejections": [
+      [
+        "accepted",
+        40
+      ]
+    ],
+    "top_new_rejections": [
+      [
+        "accepted",
+        40
+      ]
+    ]
+  },
+  "demo": {
+    "sample_size": 40,
+    "old_policy": "old_demo",
+    "new_policy": "new_demo",
+    "old_accept_count": 40,
+    "new_accept_count": 40,
+    "old_accept_rate": 1.0,
+    "new_accept_rate": 1.0,
+    "delta_accept_count": 0,
+    "delta_accept_rate": 0.0,
+    "kept_count": 40,
+    "dropped_count": 0,
+    "newly_allowed_count": 0,
+    "top_old_rejections": [
+      [
+        "accepted",
+        40
+      ]
+    ],
+    "top_new_rejections": [
+      [
+        "accepted",
+        40
+      ]
+    ]
+  }
+}

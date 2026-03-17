@@ -171,7 +171,7 @@ class MomentumStrategy(Strategy):
     
     def validate_data(self, data: pd.DataFrame) -> bool:
         """Validate data"""
-        return "close" in data.columns and len(data) >= self.period
+        return "close" in data.columns and len(data) >= (self.period + 1)
     
     def generate_signal(self, data: pd.DataFrame) -> Signal:
         """Generate signal based on momentum"""
@@ -234,10 +234,17 @@ class IntradayProfessionalStrategy(Strategy):
         if not signals_df.empty:
             last_row = signals_df.iloc[-1]
             signal_idx = signals_df.index[-1]
-            current_idx = df.index[-1]
-            
-            # If signal is very recent (within last 5 candles), use it
-            if current_idx - signal_idx <= 5:
+
+            # If signal is very recent (within last 5 candles), use it.
+            # Works for both numeric and datetime indexes.
+            try:
+                signal_pos = int(df.index.get_loc(signal_idx))
+                current_pos = len(df) - 1
+                is_recent = (current_pos - signal_pos) <= 5
+            except Exception:
+                is_recent = False
+
+            if is_recent:
                 action = last_row['Signal'].lower()
                 if 'long' in action:
                     action = 'buy'

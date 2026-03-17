@@ -10,7 +10,10 @@ import ZerodhaCallbackPage from './pages/ZerodhaCallbackPage';
 
 
 export default function App() {
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [isLoggedIn, setIsLoggedIn] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return !!localStorage.getItem('access_token');
+  });
   const [isLogin, setIsLogin] = useState(true);
   const [pendingOtpUser, setPendingOtpUser] = useState('');
   const [otpMode, setOtpMode] = useState(null);
@@ -28,18 +31,63 @@ export default function App() {
   useTokenRefresh();
 
   useEffect(() => {
-    const token = localStorage.getItem('access_token');
-    console.log('[App] Checking auth token:', !!token);
-    if (token) {
-      setIsLoggedIn(true);
-      console.log('[App] User is logged in');
-    } else {
-      console.log('[App] No token found, showing login');
-    }
-    setLoading(false);
+    const validateAuth = async () => {
+      const token = localStorage.getItem('access_token');
+      console.log('[App] Checking auth token:', !!token);
+
+      if (!token) {
+        console.log('[App] No token found, showing login');
+        setIsLoggedIn(false);
+        setLoading(false);
+        return;
+      }
+
+      try {
+        const response = await config.authFetch(config.endpoints.auth.me);
+        if (response.ok) {
+          setIsLoggedIn(true);
+          console.log('[App] User is logged in');
+        } else {
+          if (response.status === 401 || response.status === 403) {
+            console.warn('[App] Token invalid/expired, clearing session');
+            localStorage.removeItem('access_token');
+            localStorage.removeItem('refresh_token');
+            setIsLoggedIn(false);
+          } else {
+            // Avoid forced logout on transient backend errors during refresh.
+            console.warn('[App] Auth check temporary failure, preserving existing session:', response.status);
+            setIsLoggedIn(true);
+          }
+        }
+      } catch (err) {
+        // Network/intermittent errors should not bounce users to login on refresh.
+        console.warn('[App] Auth check failed, preserving session on refresh:', err?.message || err);
+        setIsLoggedIn(!!localStorage.getItem('access_token'));
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    validateAuth();
   }, []);
 
   console.log('[App] Rendering - isLoggedIn:', isLoggedIn, 'loading:', loading);
+
+  if (loading) {
+    return (
+      <div style={{
+        minHeight: '100vh',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        backgroundColor: '#f3f4f6',
+        color: '#374151',
+        fontWeight: '600'
+      }}>
+        Restoring session...
+      </div>
+    );
+  }
   
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -63,6 +111,7 @@ export default function App() {
       const response = await config.authFetch(endpoint, {
         method: 'POST',
         body: JSON.stringify(payload),
+        includeAuth: false,
       });
 
       console.log('Response status:', response.status);
@@ -124,6 +173,7 @@ export default function App() {
             ? { ...otpPayload, password }
             : otpPayload
         ),
+        includeAuth: false,
       });
 
       const data = await response.json();

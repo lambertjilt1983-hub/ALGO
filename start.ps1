@@ -1,7 +1,49 @@
+param(
+    [switch]$SkipTests
+)
+
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host "         AlgoTrade Pro v1.0.0 - Starting..." -ForegroundColor Green
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ""
+
+if (-not $SkipTests) {
+    Write-Host "[0/6] Running unit tests before startup..." -ForegroundColor Yellow
+
+    $backendTests = @(
+        "backend/app/routes/test_auto_trading_tables_backend.py",
+        "backend/app/routes/test_paper_trade_flow.py",
+        "backend/app/routes/test_auto_trading_manual_close.py",
+        "backend/app/routes/test_auto_trading_loss_brake.py",
+        "backend/app/routes/test_auto_trading_trail.py",
+        "backend/app/routes/test_auto_trading_active_api.py"
+    )
+
+    & "F:\ALGO\.venv\Scripts\python.exe" -m pytest @backendTests
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "   Unit tests failed. Startup aborted." -ForegroundColor Red
+        Write-Host "   Fix the failing tests or run: .\start.ps1 -SkipTests" -ForegroundColor Yellow
+        exit 1
+    }
+
+    Push-Location "F:\ALGO\frontend"
+    try {
+        npm run test
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "   Frontend unit tests failed. Startup aborted." -ForegroundColor Red
+            Write-Host "   Fix the failing tests or run: .\start.ps1 -SkipTests" -ForegroundColor Yellow
+            exit 1
+        }
+    } finally {
+        Pop-Location
+    }
+
+    Write-Host "   Unit tests passed. Continuing startup..." -ForegroundColor Green
+    Write-Host ""
+} else {
+    Write-Host "[0/6] Skipping unit tests (requested)." -ForegroundColor Yellow
+    Write-Host ""
+}
 
 # Step 1: Clean up all Python and Node processes
 Write-Host "[1/5] Cleaning up existing processes..." -ForegroundColor Yellow

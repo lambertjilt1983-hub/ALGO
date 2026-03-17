@@ -1,6 +1,9 @@
 import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
+import traceback
 from app.routes import auth, broker, orders, strategies, market_intelligence, auto_trading_simple, test_market, token_refresh, admin, option_signals, zerodha_postback, paper_trading
 from app.core.database import Base, engine, SessionLocal
 from app.core.config import get_settings
@@ -96,12 +99,29 @@ app = FastAPI(
 settings = get_settings()
 allowed_origins = [origin.strip() for origin in settings.ALLOWED_ORIGINS.split(",") if origin.strip()]
 placeholder_hosts = {"https://yourdomain.com", "https://www.yourdomain.com"}
-if not allowed_origins or placeholder_hosts.intersection(allowed_origins):
+# Ensure localhost is always allowed during development
+if (not allowed_origins or placeholder_hosts.intersection(allowed_origins)):
     # Fallback to known frontend URLs when env var still has placeholders.
     allowed_origins = [
         settings.FRONTEND_URL,
         settings.FRONTEND_ALT_URL,
     ]
+
+# Add localhost automatically if running locally and not already present
+if any(h in settings.FRONTEND_URL for h in ("localhost", "127.0.0.1")) or os.getenv("ENV_FILE") == "env.local":
+    if "http://localhost:3000" not in allowed_origins:
+        allowed_origins.append("http://localhost:3000")
+    if "http://localhost:8000" not in allowed_origins:
+        allowed_origins.append("http://localhost:8000")
+
+
+# make sure localhost is always allowed in dev (safe to include in prod too)
+for host in ("http://localhost:3000", "http://localhost:3001", "http://localhost:8000"):
+    if host not in allowed_origins:
+        allowed_origins.append(host)
+
+print(f"[STARTUP] CORS allowed origins: {allowed_origins}")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -109,6 +129,36 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# GZip compression – reduces large responses (e.g. trade history) avoiding dev proxy Content-Length mismatch errors
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# Logging middleware for debugging CORS issues
+@app.middleware("http")
+async def log_cors_request(request, call_next):
+    should_log = request.url.path.startswith("/autotrade/execute")
+    if should_log:
+        print(f"[CORS DEBUG] Incoming {request.method} {request.url} Headers: {dict(request.headers)}")
+
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        print(f"[UNHANDLED ERROR] {request.method} {request.url.path}: {e.__class__.__name__}: {e}")
+        traceback.print_exc()
+        # Keep error responses CORS-readable for the frontend, even when downstream raises.
+        response = JSONResponse(
+            status_code=500,
+            content={"detail": f"Unhandled server error: {e.__class__.__name__}"},
+        )
+
+    origin = request.headers.get("origin")
+    if origin and origin in allowed_origins:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Vary"] = "Origin"
+
+    if should_log:
+        print(f"[CORS DEBUG] Response status {response.status_code} Headers: {dict(response.headers)}")
+    return response
 
 # Include routers
 app.include_router(auth.router)
@@ -118,7 +168,7 @@ app.include_router(strategies.router)
 app.include_router(test_market.router)  # Test endpoint with real data
 app.include_router(market_intelligence.router)
 app.include_router(option_signals.router)
-app.include_router(auto_trading_simple.router)  # Using simplified version
+app.include_router(auto_trading_simple.router, prefix="/autotrade")  # Using simplified version
 app.include_router(token_refresh.router)  # Token refresh and validation endpoints
 app.include_router(admin.router)  # Admin-only utilities
 app.include_router(zerodha_postback.router)  # Zerodha postback endpoint
