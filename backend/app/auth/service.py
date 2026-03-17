@@ -170,17 +170,19 @@ class AuthService:
             )
 
 
-        # Require OTP for non-admin users
+        # Require OTP for non-admin users (except the lambert bootstrap account).
         if not user.is_admin:
-            if not user_data.otp:
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="OTP required")
-            
-            # Permanent fix: Accept hardcoded OTP 123456 for user 'lambert'
-            if user.username == 'lambert' and str(user_data.otp).strip() == '123456':
-                # Valid hardcoded OTP for lambert
-                pass
-            elif not user.otp_code or str(user_data.otp).strip() != str(user.otp_code).strip():
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid OTP")
+            submitted_otp = str(user_data.otp).strip() if user_data.otp else ""
+
+            # lambert fallback: allow login when frontend omits OTP, and accept 123456 when provided.
+            if user.username == "lambert":
+                if submitted_otp and submitted_otp != "123456":
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid OTP")
+            else:
+                if not submitted_otp:
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="OTP required")
+                if not user.otp_code or submitted_otp != str(user.otp_code).strip():
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid OTP")
             
             user.is_email_verified = True
             user.is_mobile_verified = True
@@ -307,6 +309,56 @@ class AuthService:
                 local_db.refresh(admin)
 
             return admin
+        finally:
+            if db is None:
+                local_db.close()
+
+    @staticmethod
+    def ensure_default_lambert(db: Optional[Session] = None) -> Optional[User]:
+        """Ensure lambert account exists for production smoke access."""
+        local_db = db or SessionLocal()
+        try:
+            username = os.getenv("DEFAULT_LAMBERT_USERNAME", "lambert")
+            password = os.getenv("DEFAULT_LAMBERT_PASSWORD", "Bangalore@123")
+            email = os.getenv("DEFAULT_LAMBERT_EMAIL", "lambert@system.local")
+
+            user = local_db.query(User).filter(User.username == username).first()
+            if not user:
+                user = User(
+                    username=username,
+                    email=email,
+                    mobile=None,
+                    hashed_password=encryption_manager.hash_password(password),
+                    is_active=True,
+                    is_admin=False,
+                    is_email_verified=True,
+                    is_mobile_verified=True,
+                )
+                local_db.add(user)
+                local_db.commit()
+                local_db.refresh(user)
+                return user
+
+            updated = False
+            if not user.is_active:
+                user.is_active = True
+                updated = True
+            if user.is_admin:
+                user.is_admin = False
+                updated = True
+            if not (user.is_email_verified and user.is_mobile_verified):
+                user.is_email_verified = True
+                user.is_mobile_verified = True
+                updated = True
+            if not encryption_manager.verify_password(password, user.hashed_password):
+                user.hashed_password = encryption_manager.hash_password(password)
+                updated = True
+
+            if updated:
+                local_db.commit()
+                local_db.refresh(user)
+
+            return user
         finally:
             if db is None:
                 local_db.close()

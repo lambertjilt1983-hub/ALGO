@@ -109,6 +109,9 @@ async def lifespan(app: FastAPI):
         logger.info("[STARTUP] Ensuring default admin user...")
         AuthService.ensure_default_admin(db)
         logger.info("[STARTUP] Default admin ensured.")
+        logger.info("[STARTUP] Ensuring default lambert user...")
+        AuthService.ensure_default_lambert(db)
+        logger.info("[STARTUP] Default lambert ensured.")
     except Exception as e:
         logger.error(f"[STARTUP] Exception during startup: {e}", exc_info=True)
     finally:

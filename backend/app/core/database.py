@@ -1,14 +1,22 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from app.core.config import get_settings
-import os
 
 settings = get_settings()
 
-# Use SQLite for development if DATABASE_URL is not set or Postgres is unavailable
-db_url = settings.DATABASE_URL
-if not db_url or "postgresql" in db_url:
+# Use the configured DATABASE_URL in production.
+# Fall back to local SQLite only when DATABASE_URL is empty or still a placeholder.
+db_url = (settings.DATABASE_URL or "").strip()
+placeholder_tokens = (
+    "YOUR_PRODUCTION_DB_HOST",
+    "user:password@",
+)
+if not db_url or any(token in db_url for token in placeholder_tokens):
     db_url = "sqlite:///./algotrade.db"
+
+# Accept Heroku/Render style postgres:// URLs.
+if db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
 
 # Configure SQLite connection with proper pooling settings
 engine = create_engine(
