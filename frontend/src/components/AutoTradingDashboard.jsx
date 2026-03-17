@@ -42,6 +42,7 @@ import {
   resolveStableActiveTrades as resolveStableActiveTradesUtil,
   resolveStableTradeHistory as resolveStableTradeHistoryUtil,
 } from '../utils/tradeTableState';
+import { shouldFetchCurrentModeActive as shouldFetchCurrentModeActiveUtil } from '../utils/activeTradeFetchPolicy';
 
 const OPTION_SIGNALS_API = `${config.API_BASE_URL}/option-signals/intraday-advanced`;
 const PROFESSIONAL_SIGNAL_API = `${config.API_BASE_URL}/strategies/live/professional-signal`;
@@ -166,7 +167,7 @@ const formatTimeIST = (dateString) => {
 // Screen Wake Lock - Prevent browser/system sleep
 
 const AutoTradingDashboard = () => {
-  const [enabled, setEnabled] = useState(false);
+  const [enabled, setEnabled] = useState(true);
   const [isLiveMode, setIsLiveMode] = useState(false); // Starts in DEMO mode
   const [loading, setLoading] = useState(false);
   const [armingInProgress, setArmingInProgress] = useState(false);
@@ -183,13 +184,19 @@ const AutoTradingDashboard = () => {
   const [activeTab, setActiveTab] = useState('trading');
   const [historySearch, setHistorySearch] = useState('');
   const [lotMultiplier, setLotMultiplier] = useState(1); // For quantity adjustment
-  const [autoTradingActive, setAutoTradingActive] = useState(false);
+  const [autoTradingActive, setAutoTradingActive] = useState(true);
   const [hasActiveTrade, setHasActiveTrade] = useState(false);
   const [lastPaperSignalSymbol, setLastPaperSignalSymbol] = useState(null);
   const [lastPaperSignalAt, setLastPaperSignalAt] = useState(0);
   const [confirmationMode, setConfirmationMode] = useState('balanced');
-  const [historyStartDate, setHistoryStartDate] = useState(() => new Date().toLocaleDateString('en-CA'));
+  const [historyStartDate, setHistoryStartDate] = useState(() => {
+    const end = new Date();
+    const start = new Date(end);
+    start.setDate(start.getDate() - 7); // Last 7 days by default
+    return start.toLocaleDateString('en-CA');
+  });
   const [historyEndDate, setHistoryEndDate] = useState(() => new Date().toLocaleDateString('en-CA'));
+  const [activeModeFilter, setActiveModeFilter] = useState('ALL');
   const [historyModeFilter, setHistoryModeFilter] = useState('ALL');
   const [historyActionFilter, setHistoryActionFilter] = useState('ALL');
   const [historyStatusFilter, setHistoryStatusFilter] = useState('ALL');
@@ -1931,9 +1938,13 @@ const AutoTradingDashboard = () => {
     const shouldFetchHistoryEndpoint = shouldFetchSlowEndpoints && !historyBackoffActive && !skipHistory;
 
     const shouldFetchStatusEndpoint = forceRefresh || (nowMs - Number(slowFetchCacheRef.current?.at || 0)) >= 5000;
-    const noTradeProbeDue = (nowMs - Number(activeProbeAtRef.current || 0)) >= 30000;
-    // Force-refresh must always fetch active trades immediately (e.g., right after execute).
-    const shouldFetchCurrentModeActive = forceRefresh || hasOpenTradeForCurrentMode || noTradeProbeDue;
+    const shouldFetchCurrentModeActive = shouldFetchCurrentModeActiveUtil({
+      forceRefresh,
+      hasOpenTradeForCurrentMode,
+      autoTradingActive,
+      nowMs,
+      lastProbeAt: Number(activeProbeAtRef.current || 0),
+    });
     if (shouldFetchCurrentModeActive && !hasOpenTradeForCurrentMode) {
       activeProbeAtRef.current = nowMs;
     }
@@ -1956,9 +1967,11 @@ const AutoTradingDashboard = () => {
       const backoffMs = Math.min(20000 * Math.pow(2, fc), 300000); // 20s→40s→80s…cap 5min
       historyFetchFailCountRef.current = fc + 1;
       historyFetchBackoffUntilRef.current = nowMs + backoffMs;
+      const statusCode = historyRes?.status || 'unknown';
+      const statusText = historyRes?.statusText || '';
       warnDeduped(
         'fetch:history:backoff',
-        '⚠️ History fetch failed, backing off briefly',
+        `⚠️ History fetch failed (${statusCode} ${statusText}), backing off briefly`,
         { burstWindowMs: 300000, flushDelayMs: 2000 },
       );
     } else if (shouldFetchHistoryEndpoint && historyRes?.ok) {
@@ -2071,8 +2084,11 @@ const AutoTradingDashboard = () => {
     const activeCandidates = isLiveMode ? liveOnlyActive : [...paperActive, ...autoDemoActive];
     const history = historyData.trades || [];
     const backendStatus = statusData.status || statusData;
+    const backendEnabled = Boolean(backendStatus?.enabled ?? statusData?.enabled ?? true);
     const backendLiveArmed = Boolean(backendStatus?.live_armed ?? statusData?.live_armed ?? false);
-    const backendDemoMode = Boolean(backendStatus?.is_demo_mode ?? statusData?.is_demo_mode ?? true);
+    const backendDemoMode = backendLiveArmed
+      ? false
+      : Boolean(backendStatus?.is_demo_mode ?? statusData?.is_demo_mode ?? true);
 
     const canTrustActiveEmpty = shouldFetchCurrentModeActive && (isLiveMode
       ? !!liveActiveRes?.ok
@@ -2105,7 +2121,7 @@ const AutoTradingDashboard = () => {
 
     // Keep UI mode synchronized with backend truth, but avoid flicker right after arm/disarm clicks.
     if (Date.now() >= Number(armSyncHoldUntilRef.current || 0)) {
-      setEnabled(backendLiveArmed);
+      setEnabled(backendEnabled);
       setIsLiveMode(backendLiveArmed && !backendDemoMode);
     }
 
@@ -4205,9 +4221,12 @@ const AutoTradingDashboard = () => {
       if (response.ok) {
         const data = await response.json();
         if (!silent) console.log(armed ? '✅ LIVE TRADING ARMED:' : '🛑 LIVE TRADING DISARMED:', data);
-        setEnabled(armed);
-        setIsLiveMode(armed);
-        setAutoTradingActive(armed);
+        const nextLiveArmed = Boolean(data?.live_armed ?? armed);
+        const nextDemoMode = nextLiveArmed ? false : Boolean(data?.is_demo_mode ?? !armed);
+        const nextEnabled = Boolean(data?.enabled ?? true);
+        setEnabled(nextEnabled);
+        setIsLiveMode(nextLiveArmed && !nextDemoMode);
+        setAutoTradingActive(nextLiveArmed);
         if (!silent) {
           setArmError(null);
           setArmingInProgress(false);
@@ -4372,11 +4391,6 @@ const AutoTradingDashboard = () => {
       clearInterval(intervalId);
     };
   }, [isLiveMode, activeBrokerId]);
-
-  // Default: keep auto-trading off on load, but do not disarm backend live state.
-  useEffect(() => {
-    setAutoTradingActive(false);
-  }, []);
 
   // Refresh once whenever wake lock state changes.
   useEffect(() => {
@@ -4686,6 +4700,12 @@ const AutoTradingDashboard = () => {
   const activeTradesForCurrentMode = (activeTrades || []).filter((trade) => {
     const mode = resolveTradeMode(trade);
     return currentUiTradeMode === 'LIVE' ? mode === 'LIVE' : (mode === 'DEMO' || mode === 'PAPER');
+  });
+  const filteredActiveTrades = (activeTrades || []).filter((trade) => {
+    const mode = resolveTradeMode(trade);
+    if (activeModeFilter === 'ALL') return true;
+    if (activeModeFilter === 'DEMO') return mode === 'DEMO' || mode === 'PAPER';
+    return mode === 'LIVE';
   });
   const riskMode = isLiveMode ? 'LIVE' : 'DEMO';
   const riskControlState = getModeLossControlState(riskMode);
@@ -5603,68 +5623,23 @@ const AutoTradingDashboard = () => {
               <button
                 onClick={async () => {
                   if (armingInProgress) return;
-                  const switchToLive = !isLiveMode;
-                  setArmStatus(null);
-                  const switched = await armLiveTrading(switchToLive, false);
-                  if (switched) {
-                    // Keep mode switch separate from auto-trading start.
-                    setAutoTradingActive(false);
-                    setHasActiveTrade(false);
-                    setArmError(null);
-                    setArmStatus(
-                      switchToLive
-                        ? 'LIVE MODE ENABLED. Click Start/Enable Live Trade to execute.'
-                        : 'DEMO MODE ENABLED. Click Start Demo Auto-Trading to execute.'
-                    );
-                  }
-                }}
-                disabled={armingInProgress}
-                style={{
-                  padding: '12px 18px',
-                  background: isLiveMode ? '#f59e0b' : '#ef4444',
-                  color: 'white',
-                  border: 'none',
-                  borderRadius: '8px',
-                  fontSize: '14px',
-                  fontWeight: '600',
-                  cursor: armingInProgress ? 'wait' : 'pointer',
-                  boxShadow: '0 4px 6px rgba(0,0,0,0.1)',
-                  opacity: armingInProgress ? 0.7 : 1
-                }}
-              >
-                {isLiveMode ? '⚪ Switch To Demo Mode' : '🔴 Switch To Live Mode'}
-              </button>
-              <button
-                onClick={async () => {
-                  if (autoTradingActive) {
-                    if (isLiveMode) {
-                      const disarmed = await armLiveTrading(false, false);
-                      if (!disarmed) return;
-                    }
-                    setAutoTradingActive(false);
-                    setHasActiveTrade(false);
-                    setArmError(null);
-                    setArmStatus(isLiveMode ? 'AUTO-TRADING DE-ACTIVATED!' : 'DEMO AUTO-TRADING DE-ACTIVATED!');
-                    console.log('🛑 AUTO-TRADING DE-ACTIVATED!');
-                    return;
-                  }
+
                   setArmStatus(null);
                   setArmingInProgress(true);
-                  if (!isLiveMode) {
+
+                  if (isLiveMode) {
+                    // Switch LIVE -> DEMO (disarm live first).
+                    const disarmed = await armLiveTrading(false, false);
+                    if (!disarmed) return;
+                    setIsLiveMode(false);
+                    setEnabled(true);
                     setAutoTradingActive(true);
-                    setEnabled(false);
                     setArmError(null);
                     setArmingInProgress(false);
-                    setArmStatus('DEMO AUTO-TRADING ACTIVATED!');
-                    console.log('🚀 DEMO AUTO-TRADING ACTIVATED!');
-                    if (!canStartTradingNow) {
-                      const waitReason = recommendationReadiness?.reasons?.length
-                        ? recommendationReadiness.reasons.join(' | ')
-                        : 'Start Trade decision is NO';
-                      setArmError(`Demo auto-trading enabled. Waiting for Start Trade YES (${waitReason})`);
-                    }
+                    setArmStatus('DEMO MODE ENABLED. AUTO-TRADING ACTIVE.');
                     return;
                   }
+
                   // Close all open demo trades before going live so demo P&L is settled.
                   const openDemoNow = (activeTrades || []).filter((t) => {
                     const st = String(t?.status || '').toUpperCase();
@@ -5682,49 +5657,43 @@ const AutoTradingDashboard = () => {
                         }).catch(() => null)
                       )
                     );
-                    // Refresh so table reflects closed demo trades before live arm completes.
                     await fetchData(true).catch(() => null);
                     console.log('✅ Demo trades closed.');
                   }
+
+                  // Switch DEMO -> LIVE (arm live).
                   const armed = await armLiveTrading(true, false);
-                  if (armed) {
+                  if (!armed) {
+                    setIsLiveMode(false);
                     setAutoTradingActive(true);
-                    setArmStatus('AUTO-TRADING ACTIVATED!');
-                    console.log('🚀 AUTO-TRADING ACTIVATED!');
-                    if (!canStartTradingNow) {
-                      const waitReason = recommendationReadiness?.reasons?.length
-                        ? recommendationReadiness.reasons.join(' | ')
-                        : 'Start Trade decision is NO';
-                      setArmError(`Auto-trading enabled. Waiting for Start Trade YES (${waitReason})`);
-                    }
-                  } else {
-                    console.log('❌ AUTO-TRADING ACTIVATION FAILED');
+                    setEnabled(true);
+                    setArmError(null);
                     setArmingInProgress(false);
+                    setArmStatus('LIVE START FAILED. CONTINUING AUTO-TRADING IN DEMO.');
+                    return;
                   }
+                  setIsLiveMode(true);
+                  setEnabled(true);
+                  setAutoTradingActive(true);
+                  setArmError(null);
+                  setArmingInProgress(false);
+                  setArmStatus('LIVE MODE ENABLED. AUTO-TRADING ACTIVE.');
                 }}
                 disabled={armingInProgress}
                 style={{
-                  padding: '12px 24px',
-                  background: armingInProgress
-                    ? '#cbd5e0'
-                    : autoTradingActive
-                      ? '#f56565'
-                      : '#48bb78',
+                  padding: '12px 18px',
+                  background: isLiveMode ? '#f59e0b' : '#ef4444',
                   color: 'white',
                   border: 'none',
                   borderRadius: '8px',
-                  fontSize: '15px',
+                  fontSize: '14px',
                   fontWeight: '600',
                   cursor: armingInProgress ? 'wait' : 'pointer',
                   boxShadow: '0 4px 6px rgba(0,0,0,0.1)',
                   opacity: armingInProgress ? 0.7 : 1
                 }}
               >
-                {armingInProgress
-                  ? '⏳ Arming...'
-                  : autoTradingActive
-                    ? '🛑 Stop Auto-Trading'
-                    : (isLiveMode ? '▶️ Start/Enable Live Trade' : '▶️ Start Demo Auto-Trading')}
+                {isLiveMode ? '⚪ Switch To Demo Mode' : '🔴 Switch To Live Mode'}
               </button>
               {armStatus && (
                 <div style={{
@@ -5932,7 +5901,7 @@ const AutoTradingDashboard = () => {
         if (_signalsAvailable && !autoTradingActive) return (
           <div style={{ marginBottom: '14px', padding: '10px 14px', background: '#eff6ff', border: '1px solid #93c5fd', borderRadius: '8px', fontSize: '12px', color: '#1e3a8a' }}>
             <strong>📡 {_strictSignalsCount || 1} signal{(_strictSignalsCount || 1) !== 1 ? 's' : ''} ready</strong>{' '}—{' '}
-            Auto-trading is <strong>OFF</strong>. Use <em>{isLiveMode ? '▶️ Start/Enable Live Trade' : '▶️ Start Demo Auto-Trading'}</em> to execute.
+            Auto-trading is <strong>OFF</strong>. Use <em>▶️ Start Live Trading</em> to execute.
           </div>
         );
         if (_signalsAvailable && _entryBlockers.length > 0) return (
@@ -6010,7 +5979,7 @@ const AutoTradingDashboard = () => {
               fontSize: '18px',
               fontWeight: 'bold'
             }}>
-              ⚡ Active Trades ({isLiveMode ? 'LIVE' : 'DEMO'} View)
+              ⚡ Active Trades ({filteredActiveTrades.length})
             </h4>
             <span style={{
               padding: '4px 10px',
@@ -6023,6 +5992,28 @@ const AutoTradingDashboard = () => {
             }}>
               {isUsingStaleData ? 'STALE VIEW' : 'LIVE SYNC'} • {syncBadgeLabel}
             </span>
+          </div>
+          <div style={{
+            display: 'flex',
+            flexWrap: 'wrap',
+            gap: '12px',
+            alignItems: 'center',
+            marginBottom: '12px'
+          }}>
+            <select
+              value={activeModeFilter}
+              onChange={(e) => setActiveModeFilter(e.target.value)}
+              style={{
+                padding: '6px 10px',
+                border: '1px solid #e2e8f0',
+                borderRadius: '6px',
+                fontSize: '12px'
+              }}
+            >
+              <option value="ALL">Mode: All</option>
+              <option value="LIVE">Mode: Live</option>
+              <option value="DEMO">Mode: Demo</option>
+            </select>
           </div>
           <div style={{ overflowX: 'auto' }}>
             <table style={{
@@ -6051,7 +6042,7 @@ const AutoTradingDashboard = () => {
                 </tr>
               </thead>
               <tbody>
-                {activeTradesForCurrentMode.map((trade) => {
+                {filteredActiveTrades.map((trade) => {
                   const entry = Number(trade.entry_price ?? trade.price ?? 0);
                   const current = Number(trade.current_price ?? entry);
                   const action = String(trade.side || trade.action || 'BUY').toUpperCase();
@@ -6148,10 +6139,10 @@ const AutoTradingDashboard = () => {
                     </tr>
                   );
                 })}
-                {activeTradesForCurrentMode.length === 0 && (
+                {filteredActiveTrades.length === 0 && (
                   <tr>
                     <td colSpan={13} style={{ padding: '16px', textAlign: 'center', color: '#718096' }}>
-                      {isLiveMode ? 'No active LIVE trades right now.' : 'No active DEMO trades right now.'}
+                      No active trades for selected mode.
                     </td>
                   </tr>
                 )}

@@ -175,7 +175,7 @@ risk_config = {
     "max_position_pct": 0.10,        # 10% max per position
     "max_portfolio_pct": 0.10,       # 10% total exposure
     "cooldown_minutes": 0,           # NO COOLDOWN - trade immediately if conditions met
-    "symbol_cooldown_minutes": 2,    # Cooldown after SL on same symbol/root
+    "symbol_cooldown_minutes": 5,    # Cooldown after SL on same symbol/root (5 min to allow fresh signals)
     "min_momentum_pct": 0.5,         # Very strong momentum (0.5%) - avoid weak entries
     "min_trend_strength": 0.8,       # HIGH trend strength (80%) required - quality only
     "require_trend_confirmation": True,  # STRICT: Confirm trend before entry
@@ -238,8 +238,8 @@ atr_config = {
 }
 
 state = {
-    "is_demo_mode": False,
-    "live_armed": True,
+    "is_demo_mode": True,
+    "live_armed": False,
     "daily_loss": 0.0,
     "daily_profit": 0.0,  # NEW: Track daily profit
     "daily_date": ist_now().date(),
@@ -413,6 +413,36 @@ def _record_sl_cooldown(symbol: str | None, side: str | None, at: Optional[datet
             "symbol": symbol,
             "side": (side or "BUY").upper(),
         }
+
+
+
+
+def _is_duplicate_trade(symbol: str, side: str, price: float, mode: str = "DEMO") -> Tuple[bool, Optional[str]]:
+    """
+    Check if an identical OPEN trade already exists.
+    Prevents the same symbol/side from being traded twice concurrently in the same mode.
+    History is NOT checked - only active OPEN trades.
+    
+    Returns: (is_duplicate: bool, reason: Optional[str])
+    """
+    side_upper = (side or "BUY").upper()
+    mode_upper = (mode or "DEMO").upper()
+    
+    # Check ONLY active OPEN trades for exact duplicates
+    for trade in active_trades:
+        if trade.get("status") != "OPEN":
+            continue
+        trade_symbol = trade.get("symbol", "").upper()
+        trade_side = (trade.get("side") or "BUY").upper()
+        trade_mode = (trade.get("trade_mode") or "DEMO").upper()
+        
+        # Match on symbol, side, and mode
+        if (trade_symbol == symbol.upper() and 
+            trade_side == side_upper and 
+            trade_mode == mode_upper):
+            return True, f"Active trade exists: {symbol} {side_upper} (already OPEN)"
+    
+    return False, None
 
 
 def _cooldown_info(symbol: str | None, side: str | None) -> Tuple[bool, float, Optional[str]]:
@@ -2029,10 +2059,16 @@ async def set_mode(
     selected_mode = demo_mode if demo_mode is not None else demo_mode_query
     if selected_mode is not None:
         state["is_demo_mode"] = bool(selected_mode)
+        state["live_armed"] = not state["is_demo_mode"]
+    live_armed = bool(state.get("live_armed", False))
+    is_demo_mode = False if live_armed else bool(state.get("is_demo_mode", True))
+    state["live_armed"] = live_armed
+    state["is_demo_mode"] = is_demo_mode
     return {
-        "mode": "DEMO" if state.get("is_demo_mode") else "LIVE",
-        "is_demo_mode": bool(state.get("is_demo_mode", False)),
-        "live_armed": state.get("live_armed"),
+        "mode": "LIVE" if live_armed else "DEMO",
+        "is_demo_mode": is_demo_mode,
+        "live_armed": live_armed,
+        "enabled": True,
     }
 
 
@@ -2040,10 +2076,16 @@ async def set_mode(
 async def get_mode(demo_mode: Optional[bool] = None, authorization: Optional[str] = Header(None)):
     if demo_mode is not None:
         state["is_demo_mode"] = bool(demo_mode)
+        state["live_armed"] = not state["is_demo_mode"]
+    live_armed = bool(state.get("live_armed", False))
+    is_demo_mode = False if live_armed else bool(state.get("is_demo_mode", True))
+    state["live_armed"] = live_armed
+    state["is_demo_mode"] = is_demo_mode
     return {
-        "mode": "DEMO" if state.get("is_demo_mode") else "LIVE",
-        "is_demo_mode": bool(state.get("is_demo_mode", False)),
-        "live_armed": state.get("live_armed"),
+        "mode": "LIVE" if live_armed else "DEMO",
+        "is_demo_mode": is_demo_mode,
+        "live_armed": live_armed,
+        "enabled": True,
     }
 
 
@@ -2052,7 +2094,16 @@ async def arm_live_trading(armed: bool = True, authorization: Optional[str] = He
     state["live_armed"] = armed
     # Keep mode mutually exclusive: arming live forces LIVE mode, disarming reverts to DEMO mode.
     state["is_demo_mode"] = not armed
-    return {"live_armed": state["live_armed"], "is_demo_mode": state["is_demo_mode"]}
+    live_armed = bool(state.get("live_armed", False))
+    is_demo_mode = False if live_armed else bool(state.get("is_demo_mode", True))
+    state["live_armed"] = live_armed
+    state["is_demo_mode"] = is_demo_mode
+    return {
+        "live_armed": live_armed,
+        "is_demo_mode": is_demo_mode,
+        "mode": "LIVE" if live_armed else "DEMO",
+        "enabled": True,
+    }
 
 
 @router.get("/status")
@@ -2061,12 +2112,15 @@ async def status(authorization: Optional[str] = Header(None)):
     win_rate, win_sample = _recent_win_rate()
     capital_in_use = _capital_in_use("DEMO" if state.get("is_demo_mode", False) else "LIVE")
     market = market_status(dt_time(9, 15), dt_time(15, 30))
-    print("[DEBUG] /autotrade/status market_status:", market, flush=True)
+    live_armed = bool(state.get("live_armed", False))
+    is_demo_mode = False if live_armed else bool(state.get("is_demo_mode", True))
+    state["live_armed"] = live_armed
+    state["is_demo_mode"] = is_demo_mode
     payload = {
-        "enabled": bool(state.get("live_armed", True)),
-        "live_armed": bool(state.get("live_armed", True)),
-        "is_demo_mode": state["is_demo_mode"],
-        "mode": "DEMO" if state.get("is_demo_mode") else "LIVE",
+        "enabled": True,
+        "live_armed": live_armed,
+        "is_demo_mode": is_demo_mode,
+        "mode": "LIVE" if live_armed else "DEMO",
         "active_trades_count": len(active),
         "win_rate": round(win_rate * 100, 2),
         "win_sample": win_sample,
@@ -2936,21 +2990,9 @@ async def execute(
         broker_id = int(trade.broker_id or broker_id)
         expiry = getattr(trade, 'expiry', None)
 
-    # Hard gate: never allow new trade execution outside configured market window.
-    if not _within_trade_window():
-        market = market_status(dt_time(9, 15), dt_time(15, 30))
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "message": "Market is closed. New trade execution is blocked outside market hours.",
-                "market_open": market.get("is_open", False),
-                "market_reason": market.get("reason", "Market closed"),
-                "current_time": market.get("current_time"),
-            },
-        )
-
+    # Determine demo vs live mode first (before market hours check)
     mode = "LIVE"
-
+    
     # Demo mode policy:
     # - Internal/direct callers can still force demo via force_demo or balance=0.
     # - For API requests, active LIVE mode must never silently fall back to demo.
@@ -2963,6 +3005,20 @@ async def execute(
             auto_demo = True
         else:
             auto_demo = False
+    
+    # Hard gate: never allow new LIVE trade execution outside configured market window.
+    # Demo trades can execute anytime (for testing purposes).
+    if not _within_trade_window() and not auto_demo:
+        market = market_status(dt_time(9, 15), dt_time(15, 30))
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Market is closed. New trade execution is blocked outside market hours.",
+                "market_open": market.get("is_open", False),
+                "market_reason": market.get("reason", "Market closed"),
+                "current_time": market.get("current_time"),
+            },
+        )
     mode = "DEMO" if auto_demo else "LIVE"
     live_balance_only_mode = _live_protection_active() and bool(risk_config.get("live_start_balance_only", False)) and (not auto_demo)
     loss_brake = _loss_brake_profile()
@@ -3351,6 +3407,17 @@ async def execute(
                     },
                 )
 
+        # Check for duplicate trades (same symbol/side/mode within 120s)
+        is_dup, dup_reason = _is_duplicate_trade(trade.symbol, trade.side, trade.price, "DEMO" if auto_demo else "LIVE")
+        if is_dup:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "message": "Duplicate trade blocked.",
+                    "reason": dup_reason,
+                },
+            )
+
         blocked, wait_seconds, cooldown_key = _cooldown_info(trade.symbol, trade.side)
         if blocked and not auto_demo:
             wait_seconds_rounded = int(math.ceil(wait_seconds))
@@ -3695,6 +3762,11 @@ async def update_trade_price(symbol: str, price: float, authorization: Optional[
             try:
                 side = (trade.get("side") or "BUY").upper()
                 entry = float(trade.get("price") or trade.get("entry_price") or 0.0)
+                
+                # Safeguard: if entry is 0, skip profit lock logic
+                if entry <= 0:
+                    entry = price  # Use current price as reference if entry unknown
+                    
                 profit_points = round((price - entry) * (1 if side == "BUY" else -1), 2)
             except Exception:
                 profit_points = 0
