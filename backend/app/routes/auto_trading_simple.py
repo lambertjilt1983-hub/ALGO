@@ -200,6 +200,7 @@ risk_config = {
     "max_simultaneous_live_trades": 3,
     "max_simultaneous_live_trades": 3,       # Hard cap for concurrent live trades
     "max_simultaneous_demo_trades": 2,       # Hard cap for concurrent demo entries
+    "single_active_trade_global": True,      # Allow only one open trade at a time across LIVE+DEMO
     "simultaneous_min_quality": 82.0,        # Additional trade requires solid quality
     "simultaneous_min_confidence": 72.0,     # Additional trade requires healthy confidence
     "simultaneous_min_ai_edge": 40.0,        # Additional trade requires minimum positive AI edge
@@ -3296,6 +3297,18 @@ async def execute(
     async with execute_lock:
         existing_open = [t for t in active_trades if t.get("status") == "OPEN"]
         existing_live_open = [t for t in existing_open if str(t.get("trade_mode") or "LIVE").upper() == "LIVE"]
+
+        if bool(risk_config.get("single_active_trade_global", True)) and existing_open:
+            first = existing_open[0]
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "message": "Active trade exists. Wait for current trade to close before starting next trade.",
+                    "reasons": [
+                        f"single_active_trade_lock({first.get('symbol')}:{str(first.get('side') or 'BUY').upper()})"
+                    ],
+                },
+            )
 
         if len(existing_live_open) >= MAX_TRADES and not auto_demo:
             raise HTTPException(status_code=429, detail="Max active live trades reached")

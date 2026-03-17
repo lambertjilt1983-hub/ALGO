@@ -3255,16 +3255,15 @@ const AutoTradingDashboard = () => {
 
     if (!executableCandidates.length) return;
 
-    // Try a small batch each cycle; respect client-side concurrency cap (frontend mirror)
+    // Try a small batch each cycle; enforce global single-active-trade lock across LIVE+DEMO.
     const currentModeLabel = isLiveMode ? 'LIVE' : 'DEMO';
-    const openCount = (activeTrades || []).filter((t) => {
+    const openTradesAnyMode = (activeTrades || []).filter((t) => {
       const status = String(t?.status || '').toUpperCase();
-      const mode = String(t?.trade_mode || t?.trade_source || '').toUpperCase();
       const open = status === 'OPEN' || (status !== 'CLOSED' && status !== 'CANCELLED' && status !== 'SL_HIT' && status !== 'TARGET_HIT');
-      return open && mode === currentModeLabel;
-    }).length;
-    const modeCap = isLiveMode ? MAX_CONCURRENT_TRADES : MAX_DEMO_CONCURRENT_TRADES;
-    const availableSlots = Math.max(0, modeCap - openCount);
+      return open;
+    });
+    const openCount = openTradesAnyMode.length;
+    const availableSlots = openCount > 0 ? 0 : 1;
     if (availableSlots <= 0) return;
 
     // helper: symbol root (e.g., BANKNIFTY26MAR... -> BANKNIFTY)
@@ -3287,9 +3286,8 @@ const AutoTradingDashboard = () => {
     const openLanes = new Set((activeTrades || [])
       .filter((t) => {
         const status = String(t?.status || '').toUpperCase();
-        const mode = String(t?.trade_mode || t?.trade_source || '').toUpperCase();
         const open = status === 'OPEN' || (status !== 'CLOSED' && status !== 'CANCELLED' && status !== 'SL_HIT' && status !== 'TARGET_HIT');
-        return open && mode === currentModeLabel;
+        return open;
       })
       .map((t) => `${symbolRoot(t?.symbol)}:${optionLeg(t)}`));
     const selectionBalance = Number(liveAccountBalance);
@@ -3977,17 +3975,21 @@ const AutoTradingDashboard = () => {
       return;
     }
     
-    // Enforce demo concurrent trade cap (aligned with backend paper trade limit).
-    const openDemoTrades = (activeTrades || []).filter((t) => {
+    // Enforce global single-active-trade lock across LIVE+DEMO.
+    const openTradesAnyMode = (activeTrades || []).filter((t) => {
       const status = String(t?.status || '').toUpperCase();
       const isOpen = status === 'OPEN' || (status !== 'CLOSED' && status !== 'CANCELLED' && status !== 'SL_HIT' && status !== 'TARGET_HIT');
-      const mode = String(t?.trade_mode || t?.trade_source || '').toUpperCase();
-      return isOpen && (mode === 'DEMO' || mode === 'PAPER');
+      return isOpen;
     });
-    if (openDemoTrades.length >= MAX_DEMO_CONCURRENT_TRADES) {
-      console.log(`⏸️ Demo trade creation blocked: ${openDemoTrades.length} active demo trade(s) already exist.`);
+    if (openTradesAnyMode.length > 0) {
+      console.log(`⏸️ Demo trade creation blocked: ${openTradesAnyMode.length} active trade(s) already exist. Wait for close before next entry.`);
       return;
     }
+
+    const openDemoTrades = openTradesAnyMode.filter((t) => {
+      const mode = String(t?.trade_mode || t?.trade_source || '').toUpperCase();
+      return mode === 'DEMO' || mode === 'PAPER';
+    });
 
     // Prevent duplicate demo entry: if the same symbol+side is already open as demo, skip.
     const signalSideNorm = String(normalizedSignal?.action || '').toUpperCase();
@@ -4530,13 +4532,12 @@ const AutoTradingDashboard = () => {
     if (executing || autoBatchExecutingRef.current) return;
     // Hard safety: never place demo background entries when live is armed/enabled.
     if (enabled || isLiveMode || autoTradingActive) return;
-    const openDemoTrades = (activeTrades || []).filter((t) => {
+    const openTradesAnyMode = (activeTrades || []).filter((t) => {
       const status = String(t?.status || '').toUpperCase();
       const isOpen = status === 'OPEN' || (status !== 'CLOSED' && status !== 'CANCELLED' && status !== 'SL_HIT');
-      const mode = String(t?.trade_mode || t?.trade_source || '').toUpperCase();
-      return isOpen && (mode === 'DEMO' || mode === 'PAPER');
+      return isOpen;
     });
-    const availableDemoSlots = Math.max(0, MAX_DEMO_CONCURRENT_TRADES - openDemoTrades.length);
+    const availableDemoSlots = openTradesAnyMode.length > 0 ? 0 : 1;
     if (!autoTradingActive && !isLiveMode && signalsLoaded && availableDemoSlots > 0) {
       const now = Date.now();
       if (paperGlobalRejectUntilRef.current > now) return;
