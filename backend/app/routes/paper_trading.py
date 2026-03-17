@@ -666,8 +666,7 @@ def get_active_paper_trades(db: Session = Depends(get_db)):
                 "target": t.target,
                 "pnl": t.pnl,
                 "pnl_percentage": t.pnl_percentage,
-                "entry_time": t.entry_time.isoformat() if t.entry_time else None,
-                "signal_data": t.signal_data
+                "entry_time": t.entry_time.isoformat() if t.entry_time else None
             }
             for t in trades
         ]

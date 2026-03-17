@@ -72,9 +72,10 @@ const DEFAULT_SCANNER_MIN_QUALITY = 70; // Balanced default so scanner is not em
 const SCANNER_MIN_REFRESH_MS = 8000; // Prevent rapid manual refresh jitter
 const SCANNER_STABILITY_WINDOW_MS = 120000; // Keep continuity over recent scans
 const SCANNER_STICKY_MS = 45000; // Keep selected scanner rows stable for brief period unless quality threshold changes
-const SCANNER_LOOP_INTERVAL_MS = 3000; // Lower backend pressure vs 1s loop to reduce transport truncation/mismatch
+const SCANNER_LOOP_INTERVAL_MS = 5000; // Further reduce parallel request pressure to avoid browser resource exhaustion.
 const PAPER_REJECTION_COOLDOWN_MS = 180000; // Back off repeated create attempts for same root/side after rejection
 const EMPTY_ACTIVE_POLLS_TO_CLEAR = 2; // Anti-flicker: clear rows only after consecutive confirmed empty polls
+const STALE_SYNC_MISSES_TO_FLAG = 2; // Tolerate one transient poll miss before surfacing stale state
 const UI_ERROR_TTL_MS = 5000; // Auto-clear transient blocker/error messages after 5s
 // Frontend mirror of backend concurrent trade limits
 const MAX_CONCURRENT_TRADES = 3;
@@ -164,7 +165,7 @@ const formatTimeIST = (dateString) => {
 // Screen Wake Lock - Prevent browser/system sleep
 
 const AutoTradingDashboard = () => {
-  const [enabled, setEnabled] = useState(false);
+  const [enabled, setEnabled] = useState(true);
   const [isLiveMode, setIsLiveMode] = useState(false); // Starts in DEMO mode
   const [loading, setLoading] = useState(false);
   const [armingInProgress, setArmingInProgress] = useState(false);
@@ -188,6 +189,7 @@ const AutoTradingDashboard = () => {
   const [confirmationMode, setConfirmationMode] = useState('balanced');
   const [historyStartDate, setHistoryStartDate] = useState(() => new Date().toLocaleDateString('en-CA'));
   const [historyEndDate, setHistoryEndDate] = useState(() => new Date().toLocaleDateString('en-CA'));
+  const [activeModeFilter, setActiveModeFilter] = useState('ALL');
   const [historyModeFilter, setHistoryModeFilter] = useState('ALL');
   const [historyActionFilter, setHistoryActionFilter] = useState('ALL');
   const [historyStatusFilter, setHistoryStatusFilter] = useState('ALL');
@@ -948,6 +950,7 @@ const AutoTradingDashboard = () => {
   const prevDemoOpenRef = React.useRef(new Set());    // Set of "symbol:SIDE" open last cycle
   const paperPriceUpdateAtRef = React.useRef(0);
   const demoAutoStartBurstGuardRef = React.useRef({ at: 0, key: '' });
+  const scannerFetchInFlightRef = React.useRef(false);
 
   // Update visible cooldown countdown (ms) every second while cooldown is active
   useEffect(() => {
@@ -977,6 +980,7 @@ const AutoTradingDashboard = () => {
   const dataFetchStartedAtRef = React.useRef(0);
   const lastSuccessfulSyncAtRef = React.useRef(null);
   const isUsingStaleDataRef = React.useRef(false);
+  const staleSyncMissesRef = React.useRef(0);
   const staleRecoveryLastRunRef = React.useRef(0);
   const sawTradeDuringStartHoldRef = React.useRef(false);
   const slowFetchCacheRef = React.useRef({
@@ -1185,6 +1189,10 @@ const AutoTradingDashboard = () => {
 
   // Market Quality Scanner - finds all 75%+ quality trades
   const scanMarketForQualityTrades = async (minQuality = scannerMinQuality, bypassCache = false) => {
+    if (scannerFetchInFlightRef.current) {
+      return;
+    }
+    scannerFetchInFlightRef.current = true;
     const parsedMinQuality = Number(minQuality);
     const safeMinQuality = Number.isFinite(parsedMinQuality) ? parsedMinQuality : Number(scannerMinQuality);
     const nowMs = Date.now();
@@ -1256,14 +1264,18 @@ const AutoTradingDashboard = () => {
           return await response.json();
         } catch {
           // Retry once for intermittent truncated body/decode issues.
-          const retryRes = await config.authFetch(url, { cache: 'no-store' });
-          if (!retryRes.ok) return null;
-          return await retryRes.json();
+          try {
+            const retryRes = await config.authFetch(url, { cache: 'no-store', retryTransportOnce: true });
+            if (!retryRes.ok) return null;
+            return await retryRes.json();
+          } catch {
+            return null;
+          }
         }
       };
       for (const url of requestsToTry) {
         try {
-          const res = await config.authFetch(url);
+          const res = await config.authFetch(url, { cache: 'no-store', retryTransportOnce: true });
           if (!res.ok) {
             sawHttpError = true;
             continue;
@@ -1295,15 +1307,19 @@ const AutoTradingDashboard = () => {
       if (!allSignals.length) {
         for (const url of requestsToTry) {
           try {
-            const res = await fetch(url);
+            const res = await fetch(url, { cache: 'no-store' });
             if (!res.ok) continue;
             let data;
             try {
               data = await res.json();
             } catch {
-              const retryRes = await fetch(url, { cache: 'no-store' });
-              if (!retryRes.ok) continue;
-              data = await retryRes.json();
+              try {
+                const retryRes = await fetch(url, { cache: 'no-store' });
+                if (!retryRes.ok) continue;
+                data = await retryRes.json();
+              } catch {
+                continue;
+              }
             }
             const candidateSignals = Array.isArray(data?.signals) ? data.signals : [];
             if (candidateSignals.length > 0) {
@@ -1611,6 +1627,7 @@ const AutoTradingDashboard = () => {
       // Keep previous scanner results visible when backend fails.
       setProfessionalSignal(null);
     } finally {
+      scannerFetchInFlightRef.current = false;
       setScannerLoading(false);
     }
   };
@@ -1726,7 +1743,7 @@ const AutoTradingDashboard = () => {
         }
       };
 
-    const historyUrl = `${PAPER_TRADES_HISTORY_API}?days=7&limit=100`;
+    const historyUrl = `${PAPER_TRADES_HISTORY_API}?days=7&limit=50`;
     const perfUrl = `${PAPER_TRADES_PERFORMANCE_API}?days=30`;
 
     const shouldFetchSlowEndpoints = forceRefresh || (nowMs - Number(slowFetchCacheRef.current?.at || 0)) >= 10000;
@@ -1734,17 +1751,19 @@ const AutoTradingDashboard = () => {
     const shouldFetchStatusEndpoint = forceRefresh || (nowMs - Number(slowFetchCacheRef.current?.at || 0)) >= 5000;
 
     const [paperActiveRes, liveActiveRes, historyRes, perfRes, statusRes] = await Promise.all([
-      safeFetch(PAPER_TRADES_ACTIVE_API),
-      safeFetch(AUTO_TRADE_ACTIVE_API),
-      shouldFetchSlowEndpoints ? safeFetch(historyUrl) : Promise.resolve({ ok: false, skipped: true }),
-      shouldFetchSlowEndpoints ? safeFetch(perfUrl) : Promise.resolve({ ok: false, skipped: true }),
+      safeFetch(PAPER_TRADES_ACTIVE_API, { retryTransportOnce: true, cache: 'no-store' }),
+      safeFetch(AUTO_TRADE_ACTIVE_API, { retryTransportOnce: true, cache: 'no-store' }),
+      shouldFetchSlowEndpoints ? safeFetch(historyUrl, { retryTransportOnce: true, cache: 'no-store' }) : Promise.resolve({ ok: false, skipped: true }),
+      shouldFetchSlowEndpoints ? safeFetch(perfUrl, { retryTransportOnce: true, cache: 'no-store' }) : Promise.resolve({ ok: false, skipped: true }),
       shouldFetchStatusEndpoint
         ? safeFetch(AUTO_TRADE_STATUS_API, { retryTransportOnce: true, cache: 'no-store' })
         : Promise.resolve({ ok: false, skipped: true }),
     ]);
 
-    const hasAnyFreshResponse = [paperActiveRes, liveActiveRes, historyRes, perfRes, statusRes]
-      .some((res) => !!res?.ok);
+    const hasFreshVisibleDataResponse = isLiveMode
+      ? (!!liveActiveRes?.ok || !!historyRes?.ok)
+      // In DEMO mode, auto-trade endpoint also serves DEMO trades — include it in freshness check.
+      : (!!liveActiveRes?.ok || !!paperActiveRes?.ok || !!historyRes?.ok);
 
     const parseJsonSafe = async (response, fallback, retryUrl = null) => {
       if (!response?.ok) return fallback;
@@ -1755,11 +1774,18 @@ const AutoTradingDashboard = () => {
         if (retryUrl) {
           try {
             const retry = await timeoutPromise(
-              config.authFetch(retryUrl, { cache: 'no-store' }),
+              config.authFetch(retryUrl, { cache: 'no-store', retryTransportOnce: true }),
               8000,
             );
             if (retry?.ok) {
               return await retry.json();
+            }
+            const plainRetry = await timeoutPromise(
+              fetch(retryUrl, { cache: 'no-store' }),
+              8000,
+            );
+            if (plainRetry?.ok) {
+              return await plainRetry.json();
             }
           } catch {}
         }
@@ -1799,14 +1825,20 @@ const AutoTradingDashboard = () => {
       trade_mode: 'DEMO',
       trade_source: 'paper',
     }));
+    // Use backend's is_demo_mode to correctly tag auto-trade active trades.
+    // When the engine runs in DEMO mode, its active trades must appear in the DEMO table.
+    const autoTradeIsDemo = Boolean(liveActiveData?.is_demo_mode);
     const liveActive = (Array.isArray(liveActiveData.trades) ? liveActiveData.trades : []).map((t) => ({
       ...t,
-      trade_mode: 'LIVE',
+      trade_mode: t.trade_mode || (autoTradeIsDemo ? 'DEMO' : 'LIVE'),
       trade_source: 'live',
     }));
     const activeCandidates = [...liveActive, ...paperActive];
     const history = historyData.trades || [];
     const backendStatus = statusData.status || statusData;
+    const backendEnabled = Boolean(backendStatus?.enabled ?? true);
+    const backendDemoMode = Boolean(backendStatus?.is_demo_mode ?? true);
+    const backendLiveArmed = Boolean(backendStatus?.live_armed ?? (!backendDemoMode));
 
     const canTrustActiveEmpty = isLiveMode
       ? !!liveActiveRes?.ok
@@ -1842,6 +1874,9 @@ const AutoTradingDashboard = () => {
     setTradeHistory(resolvedHistory);
     setReportSummary(perfData);
     setHasActiveTrade(resolvedActiveTrades.length > 0);
+    setEnabled(backendEnabled);
+    setIsLiveMode(!backendDemoMode);
+    setAutoTradingActive(backendLiveArmed && !backendDemoMode);
 
     // Compute daily P&L from closed trades
     const todayLabel = new Date().toDateString();
@@ -1884,11 +1919,15 @@ const AutoTradingDashboard = () => {
       portfolio_cap: null,
     });
 
-      if (hasAnyFreshResponse) {
+      if (hasFreshVisibleDataResponse) {
+        staleSyncMissesRef.current = 0;
         setLastSuccessfulSyncAt(new Date());
         setIsUsingStaleData(false);
       } else {
-        setIsUsingStaleData(true);
+        staleSyncMissesRef.current += 1;
+        if (staleSyncMissesRef.current >= STALE_SYNC_MISSES_TO_FLAG) {
+          setIsUsingStaleData(true);
+        }
       }
     } finally {
       dataFetchInFlightRef.current = false;
@@ -3413,6 +3452,22 @@ const AutoTradingDashboard = () => {
             ) {
               shouldStopAutoTrading = false;
               console.log('⏸️ Concurrent trade gate active - keeping auto-trading ON and waiting for next eligible signal.');
+
+                        // Cross-mode exclusivity conflict: a trade of the opposite mode is already running.
+                        // Keep auto-trading active but surface a clear notice to the user.
+                        if (
+                          response.status === 409
+                          || detailLower.includes('cannot start a')
+                          || detailLower.includes('close all')
+                          || errData?.detail?.active_mode
+                        ) {
+                          shouldStopAutoTrading = false;
+                          const activeMode = errData?.detail?.active_mode || 'UNKNOWN';
+                          const requestedMode = errData?.detail?.requested_mode || mode;
+                          const conflictMsg = errData?.detail?.message || `A ${activeMode} trade is already active. Close it before starting a ${requestedMode} trade.`;
+                          console.warn(`⚠️ MODE CONFLICT: ${conflictMsg}`);
+                          setArmStatus(`⚠️ ${conflictMsg}`);
+                        }
             }
 
             if (
@@ -3801,8 +3856,9 @@ const AutoTradingDashboard = () => {
       if (response.ok) {
         const data = await response.json();
         console.log(armed ? '✅ LIVE TRADING ARMED:' : '🛑 LIVE TRADING DISARMED:', data);
-        setEnabled(armed);
-        setIsLiveMode(armed);
+        setEnabled(Boolean(data?.enabled ?? true));
+        setIsLiveMode(!Boolean(data?.is_demo_mode ?? !armed));
+        setAutoTradingActive(Boolean(data?.live_armed ?? armed));
         if (!silent) {
           setArmError(null);
           setArmingInProgress(false);
@@ -3945,21 +4001,10 @@ const AutoTradingDashboard = () => {
     };
   }, [isLiveMode, activeBrokerId]);
 
-  // Default: keep auto-trading off on load, but do not disarm backend live state.
-  useEffect(() => {
-    setAutoTradingActive(false);
-  }, []);
-
   // Refresh once whenever wake lock state changes.
   useEffect(() => {
     fetchData();
   }, [wakeLockActive]);
-
-  useEffect(() => {
-    if (!autoTradingActive) {
-      setIsLiveMode(false);
-    }
-  }, [autoTradingActive]);
 
   // Detect individual demo trade closures mid-session and apply appropriate cooldowns.
   // SL_HIT → 5-min penalty per symbol + root streak tracking + global surge detection.
@@ -4266,6 +4311,17 @@ const AutoTradingDashboard = () => {
     const mode = resolveTradeMode(trade);
     return currentUiTradeMode === 'LIVE' ? mode === 'LIVE' : (mode === 'DEMO' || mode === 'PAPER');
   });
+  const demoActiveTrades = (activeTrades || []).filter((trade) => {
+    const mode = resolveTradeMode(trade);
+    return mode === 'DEMO' || mode === 'PAPER';
+  });
+  const liveActiveTrades = (activeTrades || []).filter((trade) => resolveTradeMode(trade) === 'LIVE');
+  const filteredActiveTrades = (activeTrades || []).filter((trade) => {
+    const mode = resolveTradeMode(trade);
+    if (activeModeFilter === 'ALL') return true;
+    if (activeModeFilter === 'DEMO') return mode === 'DEMO' || mode === 'PAPER';
+    return mode === 'LIVE';
+  });
   const riskMode = isLiveMode ? 'LIVE' : 'DEMO';
   const riskControlState = getModeLossControlState(riskMode);
   const adaptiveGateState = getAdaptiveGateTightening(riskMode);
@@ -4277,6 +4333,164 @@ const AutoTradingDashboard = () => {
 
   // --- Professional Signal Integration ---
   // ...existing code...
+
+  const renderActiveTradesTable = (trades, modeLabel) => (
+    <div style={{ overflowX: 'auto' }}>
+      <div style={{
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        margin: '0 0 10px 0',
+        gap: '12px',
+        flexWrap: 'wrap'
+      }}>
+        <h5 style={{
+          margin: 0,
+          color: '#2d3748',
+          fontSize: '15px',
+          fontWeight: '700'
+        }}>
+          {modeLabel === 'LIVE'
+            ? '🔴 Live Trades'
+            : modeLabel === 'DEMO'
+              ? '⚪ Demo Trades'
+              : '⚡ All Active Trades'} ({trades.length})
+        </h5>
+      </div>
+      <table style={{
+        width: '100%',
+        borderCollapse: 'collapse',
+        fontSize: '13px',
+        background: 'white',
+        borderRadius: '8px',
+        overflow: 'hidden'
+      }}>
+        <thead>
+          <tr style={{ background: '#f7fafc', borderBottom: '2px solid #e2e8f0' }}>
+            <th style={{ padding: '10px', textAlign: 'left' }}>Symbol</th>
+            <th style={{ padding: '10px', textAlign: 'center' }}>Mode</th>
+            <th style={{ padding: '10px', textAlign: 'left' }}>Action</th>
+            <th style={{ padding: '10px', textAlign: 'right' }}>Entry</th>
+            <th style={{ padding: '10px', textAlign: 'right' }}>Current</th>
+            <th style={{ padding: '10px', textAlign: 'right' }}>Target</th>
+            <th style={{ padding: '10px', textAlign: 'right' }}>Stop Loss</th>
+            <th style={{ padding: '10px', textAlign: 'right' }}>Expected</th>
+            <th style={{ padding: '10px', textAlign: 'right' }}>P&L</th>
+            <th style={{ padding: '10px', textAlign: 'right' }}>%</th>
+            <th style={{ padding: '10px', textAlign: 'right' }}>Qty</th>
+            <th style={{ padding: '10px', textAlign: 'left' }}>Opened</th>
+            <th style={{ padding: '10px', textAlign: 'center' }}>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {trades.map((trade) => {
+            const entry = Number(trade.entry_price ?? trade.price ?? 0);
+            const current = Number(trade.current_price ?? entry);
+            const action = String(trade.side || trade.action || 'BUY').toUpperCase();
+            const tradeMode = resolveTradeMode(trade);
+            const qty = Number(trade.quantity ?? 0);
+            const computedPnl = entry > 0 && qty > 0
+              ? (action === 'BUY' ? (current - entry) * qty : (entry - current) * qty)
+              : 0;
+            const pnl = Number(trade.pnl ?? trade.profit_loss ?? trade.unrealized_pnl ?? computedPnl);
+            const pnlPct = Number(
+              trade.pnl_percentage
+              ?? trade.profit_percentage
+              ?? trade.pnl_percent
+              ?? (entry > 0 && qty > 0 ? (computedPnl / (entry * qty)) * 100 : 0)
+            );
+            const target = Number(trade.target ?? 0);
+            const stopLoss = Number(trade.stop_loss ?? 0);
+            const expected = entry > 0 && target > 0 ? Math.abs(target - entry) * qty : 0;
+            return (
+              <tr key={getTradeRowKey(trade)} style={{ borderBottom: '1px solid #e2e8f0' }}>
+                <td style={{ padding: '10px', fontWeight: '600' }}>{trade.symbol}</td>
+                <td style={{ padding: '10px', textAlign: 'center' }}>
+                  <span style={{
+                    padding: '2px 8px',
+                    borderRadius: '999px',
+                    background: tradeMode === 'LIVE' ? '#fee2e2' : '#e0f2fe',
+                    color: tradeMode === 'LIVE' ? '#991b1b' : '#0c4a6e',
+                    fontSize: '11px',
+                    fontWeight: '700'
+                  }}>
+                    {tradeMode}
+                  </span>
+                </td>
+                <td style={{ padding: '10px' }}>
+                  <span style={{
+                    padding: '2px 6px',
+                    borderRadius: '3px',
+                    background: action === 'BUY' ? '#c6f6d5' : '#fed7d7',
+                    color: action === 'BUY' ? '#22543d' : '#742a2a',
+                    fontSize: '11px',
+                    fontWeight: 'bold'
+                  }}>
+                    {action}
+                  </span>
+                </td>
+                <td style={{ padding: '10px', textAlign: 'right' }}>₹{entry.toFixed(2)}</td>
+                <td style={{ padding: '10px', textAlign: 'right' }}>₹{current.toFixed(2)}</td>
+                <td style={{ padding: '10px', textAlign: 'right', color: '#48bb78', fontWeight: '600' }}>
+                  {target ? `₹${target.toFixed(2)}` : '--'}
+                </td>
+                <td style={{ padding: '10px', textAlign: 'right', color: '#f56565', fontWeight: '600' }}>
+                  {stopLoss ? `₹${stopLoss.toFixed(2)}` : '--'}
+                </td>
+                <td style={{ padding: '10px', textAlign: 'right', fontWeight: '600', color: '#2b6cb0' }}>
+                  {expected ? `₹${expected.toFixed(2)}` : '--'}
+                </td>
+                <td style={{
+                  padding: '10px',
+                  textAlign: 'right',
+                  fontWeight: '700',
+                  color: pnl >= 0 ? '#48bb78' : '#f56565'
+                }}>
+                  {pnl >= 0 ? '+' : ''}₹{pnl.toLocaleString()}
+                </td>
+                <td style={{
+                  padding: '10px',
+                  textAlign: 'right',
+                  fontWeight: '600',
+                  color: pnlPct >= 0 ? '#48bb78' : '#f56565'
+                }}>
+                  {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%
+                </td>
+                <td style={{ padding: '10px', textAlign: 'right' }}>{trade.quantity}</td>
+                <td style={{ padding: '10px', fontSize: '11px', color: '#718096' }}>
+                  {formatTimeIST(trade.entry_time)}
+                </td>
+                <td style={{ padding: '10px', textAlign: 'center' }}>
+                  <button
+                    onClick={() => closeActiveTrade(trade)}
+                    style={{
+                      padding: '6px 10px',
+                      borderRadius: '6px',
+                      border: '1px solid #e53e3e',
+                      background: '#fff5f5',
+                      color: '#c53030',
+                      fontSize: '12px',
+                      fontWeight: '600',
+                      cursor: 'pointer'
+                    }}
+                  >
+                    Close
+                  </button>
+                </td>
+              </tr>
+            );
+          })}
+          {trades.length === 0 && (
+            <tr>
+              <td colSpan={13} style={{ padding: '16px', textAlign: 'center', color: '#718096' }}>
+                {modeLabel === 'ALL' ? 'No active trades right now.' : `No active ${modeLabel} trades right now.`}
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
 
   return (
     <div style={{ minHeight: '100vh', background: '#f3f4f6', padding: '24px' }}>
@@ -4348,7 +4562,7 @@ const AutoTradingDashboard = () => {
               color: 'white',
               fontWeight: '600'
             }}>
-              {autoTradingActive ? 'ACTIVE' : enabled ? '⏸️ STANDBY' : 'DISABLED'}
+              {autoTradingActive ? 'LIVE ACTIVE' : enabled ? 'DEMO ENABLED' : 'DISABLED'}
             </span>
             <span style={{
               fontSize: '14px',
@@ -5184,11 +5398,10 @@ const AutoTradingDashboard = () => {
                   if (autoTradingActive) {
                     const disarmed = await armLiveTrading(false, false);
                     if (disarmed) {
-                      setAutoTradingActive(false);
                       setHasActiveTrade(false);
                       setArmError(null);
-                      setArmStatus('AUTO-TRADING DE-ACTIVATED!');
-                      console.log('🛑 AUTO-TRADING DE-ACTIVATED!');
+                      setArmStatus('LIVE TRADING STOPPED. ENGINE CONTINUES IN DEMO MODE.');
+                      console.log('🛑 LIVE TRADING STOPPED. ENGINE CONTINUES IN DEMO MODE.');
                     }
                     return;
                   }
@@ -5217,9 +5430,8 @@ const AutoTradingDashboard = () => {
                   }
                   const armed = await armLiveTrading(true, false);
                   if (armed) {
-                    setAutoTradingActive(true);
-                    setArmStatus('AUTO-TRADING ACTIVATED!');
-                    console.log('🚀 AUTO-TRADING ACTIVATED!');
+                    setArmStatus('LIVE TRADING ACTIVATED!');
+                    console.log('🚀 LIVE TRADING ACTIVATED!');
                     if (!canStartTradingNow) {
                       const waitReason = recommendationReadiness?.reasons?.length
                         ? recommendationReadiness.reasons.join(' | ')
@@ -5252,8 +5464,8 @@ const AutoTradingDashboard = () => {
                 {armingInProgress
                   ? '⏳ Arming...'
                   : autoTradingActive
-                    ? '🛑 Stop Auto-Trading'
-                    : '▶️ Start/Enable Live Trade'}
+                    ? '🛑 Stop Live Trading'
+                    : '▶️ Start Live Trading'}
               </button>
               {armStatus && (
                 <div style={{
@@ -5461,7 +5673,7 @@ const AutoTradingDashboard = () => {
         if (_signalsAvailable && !autoTradingActive) return (
           <div style={{ marginBottom: '14px', padding: '10px 14px', background: '#eff6ff', border: '1px solid #93c5fd', borderRadius: '8px', fontSize: '12px', color: '#1e3a8a' }}>
             <strong>📡 {_strictSignalsCount || 1} signal{(_strictSignalsCount || 1) !== 1 ? 's' : ''} ready</strong>{' '}—{' '}
-            Auto-trading is <strong>OFF</strong>. Use <em>▶️ Start/Enable Live Trade</em> or enable demo auto-trading to execute.
+            Demo engine is running. Use <em>▶️ Start Live Trading</em> to switch new executions to LIVE mode.
           </div>
         );
         if (_signalsAvailable && _entryBlockers.length > 0) return (
@@ -5539,7 +5751,7 @@ const AutoTradingDashboard = () => {
               fontSize: '18px',
               fontWeight: 'bold'
             }}>
-              ⚡ Active Trades ({isLiveMode ? 'LIVE' : 'DEMO'} View)
+              ⚡ Active Trades
             </h4>
             <span style={{
               padding: '4px 10px',
@@ -5553,140 +5765,36 @@ const AutoTradingDashboard = () => {
               {isUsingStaleData ? 'STALE VIEW' : 'LIVE SYNC'} • {syncBadgeLabel}
             </span>
           </div>
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{
-              width: '100%',
-              borderCollapse: 'collapse',
-              fontSize: '13px',
-              background: 'white',
-              borderRadius: '8px',
-              overflow: 'hidden'
-            }}>
-              <thead>
-                <tr style={{ background: '#f7fafc', borderBottom: '2px solid #e2e8f0' }}>
-                  <th style={{ padding: '10px', textAlign: 'left' }}>Symbol</th>
-                  <th style={{ padding: '10px', textAlign: 'center' }}>Mode</th>
-                  <th style={{ padding: '10px', textAlign: 'left' }}>Action</th>
-                  <th style={{ padding: '10px', textAlign: 'right' }}>Entry</th>
-                  <th style={{ padding: '10px', textAlign: 'right' }}>Current</th>
-                  <th style={{ padding: '10px', textAlign: 'right' }}>Target</th>
-                  <th style={{ padding: '10px', textAlign: 'right' }}>Stop Loss</th>
-                  <th style={{ padding: '10px', textAlign: 'right' }}>Expected</th>
-                  <th style={{ padding: '10px', textAlign: 'right' }}>P&L</th>
-                  <th style={{ padding: '10px', textAlign: 'right' }}>%</th>
-                  <th style={{ padding: '10px', textAlign: 'right' }}>Qty</th>
-                  <th style={{ padding: '10px', textAlign: 'left' }}>Opened</th>
-                  <th style={{ padding: '10px', textAlign: 'center' }}>Action</th>
-                </tr>
-              </thead>
-              <tbody>
-                {activeTradesForCurrentMode.map((trade) => {
-                  const entry = Number(trade.entry_price ?? trade.price ?? 0);
-                  const current = Number(trade.current_price ?? entry);
-                  const action = String(trade.side || trade.action || 'BUY').toUpperCase();
-                  const tradeMode = resolveTradeMode(trade);
-                  const qty = Number(trade.quantity ?? 0);
-                  const computedPnl = entry > 0 && qty > 0
-                    ? (action === 'BUY' ? (current - entry) * qty : (entry - current) * qty)
-                    : 0;
-                  const pnl = Number(trade.pnl ?? trade.profit_loss ?? trade.unrealized_pnl ?? computedPnl);
-                  const pnlPct = Number(
-                    trade.pnl_percentage
-                    ?? trade.profit_percentage
-                    ?? trade.pnl_percent
-                    ?? (entry > 0 && qty > 0 ? (computedPnl / (entry * qty)) * 100 : 0)
-                  );
-                  const target = Number(trade.target ?? 0);
-                  const stopLoss = Number(trade.stop_loss ?? 0);
-                  const expected = entry > 0 && target > 0 ? Math.abs(target - entry) * qty : 0;
-                  return (
-                    <tr key={getTradeRowKey(trade)} style={{ borderBottom: '1px solid #e2e8f0' }}>
-                      <td style={{ padding: '10px', fontWeight: '600' }}>{trade.symbol}</td>
-                      <td style={{ padding: '10px', textAlign: 'center' }}>
-                        <span style={{
-                          padding: '2px 8px',
-                          borderRadius: '999px',
-                          background: tradeMode === 'LIVE' ? '#fee2e2' : '#e0f2fe',
-                          color: tradeMode === 'LIVE' ? '#991b1b' : '#0c4a6e',
-                          fontSize: '11px',
-                          fontWeight: '700'
-                        }}>
-                          {tradeMode}
-                        </span>
-                      </td>
-                      <td style={{ padding: '10px' }}>
-                        <span style={{
-                          padding: '2px 6px',
-                          borderRadius: '3px',
-                          background: action === 'BUY' ? '#c6f6d5' : '#fed7d7',
-                          color: action === 'BUY' ? '#22543d' : '#742a2a',
-                          fontSize: '11px',
-                          fontWeight: 'bold'
-                        }}>
-                          {action}
-                        </span>
-                      </td>
-                      <td style={{ padding: '10px', textAlign: 'right' }}>₹{entry.toFixed(2)}</td>
-                      <td style={{ padding: '10px', textAlign: 'right' }}>₹{current.toFixed(2)}</td>
-                      <td style={{ padding: '10px', textAlign: 'right', color: '#48bb78', fontWeight: '600' }}>
-                        {target ? `₹${target.toFixed(2)}` : '--'}
-                      </td>
-                      <td style={{ padding: '10px', textAlign: 'right', color: '#f56565', fontWeight: '600' }}>
-                        {stopLoss ? `₹${stopLoss.toFixed(2)}` : '--'}
-                      </td>
-                      <td style={{ padding: '10px', textAlign: 'right', fontWeight: '600', color: '#2b6cb0' }}>
-                        {expected ? `₹${expected.toFixed(2)}` : '--'}
-                      </td>
-                      <td style={{
-                        padding: '10px',
-                        textAlign: 'right',
-                        fontWeight: '700',
-                        color: pnl >= 0 ? '#48bb78' : '#f56565'
-                      }}>
-                        {pnl >= 0 ? '+' : ''}₹{pnl.toLocaleString()}
-                      </td>
-                      <td style={{
-                        padding: '10px',
-                        textAlign: 'right',
-                        fontWeight: '600',
-                        color: pnlPct >= 0 ? '#48bb78' : '#f56565'
-                      }}>
-                        {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%
-                      </td>
-                      <td style={{ padding: '10px', textAlign: 'right' }}>{trade.quantity}</td>
-                      <td style={{ padding: '10px', fontSize: '11px', color: '#718096' }}>
-                        {formatTimeIST(trade.entry_time)}
-                      </td>
-                      <td style={{ padding: '10px', textAlign: 'center' }}>
-                        <button
-                          onClick={() => closeActiveTrade(trade)}
-                          style={{
-                            padding: '6px 10px',
-                            borderRadius: '6px',
-                            border: '1px solid #e53e3e',
-                            background: '#fff5f5',
-                            color: '#c53030',
-                            fontSize: '12px',
-                            fontWeight: '600',
-                            cursor: 'pointer'
-                          }}
-                        >
-                          Close
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })}
-                {activeTradesForCurrentMode.length === 0 && (
-                  <tr>
-                    <td colSpan={13} style={{ padding: '16px', textAlign: 'center', color: '#718096' }}>
-                      {isLiveMode ? 'No active LIVE trades right now.' : 'No active DEMO trades right now.'}
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
+          <div style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            gap: '12px',
+            flexWrap: 'wrap',
+            marginBottom: '12px'
+          }}>
+            <div style={{ display: 'flex', gap: '16px', alignItems: 'center', flexWrap: 'wrap', fontSize: '13px', color: '#4a5568' }}>
+              <span>Trades: {filteredActiveTrades.length}</span>
+              <span>Demo: {demoActiveTrades.length}</span>
+              <span>Live: {liveActiveTrades.length}</span>
+            </div>
+            <select
+              value={activeModeFilter}
+              onChange={(e) => setActiveModeFilter(e.target.value)}
+              style={{
+                padding: '8px 10px',
+                borderRadius: '6px',
+                border: '1px solid #cbd5e0',
+                background: 'white',
+                fontSize: '13px'
+              }}
+            >
+              <option value="ALL">Mode: All</option>
+              <option value="DEMO">Mode: Demo</option>
+              <option value="LIVE">Mode: Live</option>
+            </select>
           </div>
+          {renderActiveTradesTable(filteredActiveTrades, activeModeFilter)}
         </div>
       )}
 

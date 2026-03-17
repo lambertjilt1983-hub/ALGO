@@ -231,8 +231,8 @@ atr_config = {
 }
 
 state = {
-    "is_demo_mode": False,
-    "live_armed": True,
+    "is_demo_mode": True,
+    "live_armed": False,
     "daily_loss": 0.0,
     "daily_profit": 0.0,  # NEW: Track daily profit
     "daily_date": ist_now().date(),
@@ -1966,6 +1966,7 @@ async def set_mode(
     selected_mode = demo_mode if demo_mode is not None else demo_mode_query
     if selected_mode is not None:
         state["is_demo_mode"] = bool(selected_mode)
+        state["live_armed"] = not state["is_demo_mode"]
     return {
         "mode": "DEMO" if state.get("is_demo_mode") else "LIVE",
         "is_demo_mode": bool(state.get("is_demo_mode", False)),
@@ -1977,6 +1978,7 @@ async def set_mode(
 async def get_mode(demo_mode: Optional[bool] = None, authorization: Optional[str] = Header(None)):
     if demo_mode is not None:
         state["is_demo_mode"] = bool(demo_mode)
+        state["live_armed"] = not state["is_demo_mode"]
     return {
         "mode": "DEMO" if state.get("is_demo_mode") else "LIVE",
         "is_demo_mode": bool(state.get("is_demo_mode", False)),
@@ -1987,7 +1989,13 @@ async def get_mode(demo_mode: Optional[bool] = None, authorization: Optional[str
 @router.post("/arm")
 async def arm_live_trading(armed: bool = True, authorization: Optional[str] = Header(None)):
     state["live_armed"] = armed
-    return {"live_armed": state["live_armed"], "is_demo_mode": state["is_demo_mode"]}
+    state["is_demo_mode"] = not armed
+    return {
+        "live_armed": state["live_armed"],
+        "is_demo_mode": state["is_demo_mode"],
+        "mode": "LIVE" if state["live_armed"] else "DEMO",
+        "enabled": True,
+    }
 
 
 @router.get("/status")
@@ -1996,10 +2004,11 @@ async def status(authorization: Optional[str] = Header(None)):
     win_rate, win_sample = _recent_win_rate()
     capital_in_use = _capital_in_use()
     market = market_status(dt_time(9, 15), dt_time(15, 30))
-    print("[DEBUG] /autotrade/status market_status:", market, flush=True)
     payload = {
         "enabled": True,
         "is_demo_mode": state["is_demo_mode"],
+        "live_armed": state.get("live_armed", False),
+        "mode": "LIVE" if state.get("live_armed", False) and not state["is_demo_mode"] else "DEMO",
         "active_trades_count": len(active),
         "win_rate": round(win_rate * 100, 2),
         "win_sample": win_sample,
@@ -2017,7 +2026,6 @@ async def status(authorization: Optional[str] = Header(None)):
         "market_time": market["current_time"],
         "timestamp": _now(),
     }
-    print("[DEBUG] /autotrade/status payload:", payload, flush=True)
     return {"status": payload, **payload}
 
 
@@ -3180,7 +3188,27 @@ async def execute(
         if len(active_trades) >= MAX_TRADES and not auto_demo:
             raise HTTPException(status_code=429, detail="Max active trades reached")
 
+        # Cross-mode exclusivity: a DEMO trade must not start while a LIVE trade is open,
+        # and a LIVE trade must not start while a DEMO trade is open.
         existing_open = [t for t in active_trades if t.get("status") == "OPEN"]
+        if existing_open:
+            incoming_mode = "DEMO" if auto_demo else "LIVE"
+            conflicting = [
+                t for t in existing_open
+                if str(t.get("trade_mode") or ("DEMO" if state.get("is_demo_mode") else "LIVE")).upper() != incoming_mode
+            ]
+            if conflicting:
+                conflict_mode = str(conflicting[0].get("trade_mode") or "UNKNOWN").upper()
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": f"Cannot start a {incoming_mode} trade while a {conflict_mode} trade is active. Close all {conflict_mode} trades first.",
+                        "active_mode": conflict_mode,
+                        "requested_mode": incoming_mode,
+                        "active_count": len(conflicting),
+                    },
+                )
+
         if existing_open and (not auto_demo):
             simultaneous_ok, simultaneous_reasons = _can_allow_additional_live_trade(ai_context)
             if not simultaneous_ok:

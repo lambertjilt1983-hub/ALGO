@@ -142,7 +142,7 @@ export const config = {
         });
       } catch {
         // Return a synthetic failed response so callers get ok:false without a thrown exception.
-        return new Response(null, { status: 0, statusText: 'Transport Error' });
+        return new Response(null, { status: 503, statusText: 'Transport Error' });
       }
     }
   },

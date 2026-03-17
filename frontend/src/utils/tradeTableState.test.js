@@ -25,8 +25,8 @@ describe('trade table defaults', () => {
     expect(DEFAULT_TABLE_VISIBILITY.showTradeHistoryTable).toBe(true);
   });
 
-  it('uses 1-second refresh interval for trade updates', () => {
-    expect(ACTIVE_HISTORY_REFRESH_INTERVAL_MS).toBe(1000);
+  it('uses 3-second refresh interval for trade updates', () => {
+    expect(ACTIVE_HISTORY_REFRESH_INTERVAL_MS).toBe(3000);
   });
 });
 

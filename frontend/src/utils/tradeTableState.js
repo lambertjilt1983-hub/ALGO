@@ -1,4 +1,4 @@
-export const ACTIVE_HISTORY_REFRESH_INTERVAL_MS = 1000;
+export const ACTIVE_HISTORY_REFRESH_INTERVAL_MS = 3000;
 export const DEFAULT_TABLE_VISIBILITY = Object.freeze({
   showActiveTradesTable: true,
   showTradeHistoryTable: true,
