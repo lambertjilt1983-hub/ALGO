@@ -211,6 +211,7 @@ risk_config = {
     "max_portfolio_pct": 0.10,       # 10% total exposure
     "cooldown_minutes": 0,           # NO COOLDOWN - trade immediately if conditions met
     "symbol_cooldown_minutes": 5,    # Cooldown after SL on same symbol/root (5 min to allow fresh signals)
+    "apply_symbol_cooldown_demo": True,  # Enforce SL cooldown for demo too (prevents rapid paper churn)
     "min_momentum_pct": 0.5,         # Very strong momentum (0.5%) - avoid weak entries
     "min_trend_strength": 0.8,       # HIGH trend strength (80%) required - quality only
     "require_trend_confirmation": True,  # STRICT: Confirm trend before entry
@@ -245,6 +246,11 @@ risk_config = {
     "reentry_min_ai_edge_improvement": 6.0,  # Require materially better AI edge for same-move re-entry
     "reentry_min_breakout_improvement": 8.0, # Require stronger breakout score for same-move re-entry
     "reentry_require_breakout_hold": True,   # Require breakout hold confirmation for same-move re-entry
+    "overtrade_guard_enabled": True,
+    "overtrade_guard_lookback_minutes": 20,
+    "overtrade_guard_max_trades_per_lane": 3,
+    "overtrade_guard_apply_demo": True,
+    "overtrade_guard_apply_live": True,
 }
 
 trade_window = {
@@ -404,6 +410,8 @@ def _is_synthetic_trade_symbol(symbol: Any) -> bool:
     if normalized.startswith("SIM:"):
         return True
     if normalized in {"TST", "TEST", "TEST1"}:
+        return True
+    if re.match(r"^T\d+$", normalized):
         return True
     if normalized.startswith("TEST"):
         return True
@@ -969,6 +977,70 @@ def _same_move_reentry_info(ai_context: Dict[str, Any]) -> Tuple[bool, Dict[str,
         ).total_seconds())),
     }
     return blocked, detail
+
+
+def _lane_overtrade_info(symbol: str | None, side: str | None, mode: str) -> Tuple[bool, Dict[str, Any]]:
+    if not bool(risk_config.get("overtrade_guard_enabled", True)):
+        return False, {}
+
+    mode_upper = _normalize_trade_mode(mode, default="DEMO")
+    if mode_upper == "DEMO" and not bool(risk_config.get("overtrade_guard_apply_demo", True)):
+        return False, {}
+    if mode_upper == "LIVE" and not bool(risk_config.get("overtrade_guard_apply_live", True)):
+        return False, {}
+
+    root = _symbol_root(symbol)
+    if not root:
+        return False, {}
+
+    lookback_minutes = max(1, int(risk_config.get("overtrade_guard_lookback_minutes", 20) or 20))
+    max_trades = max(1, int(risk_config.get("overtrade_guard_max_trades_per_lane", 3) or 3))
+    cutoff = datetime.utcnow() - timedelta(minutes=lookback_minutes)
+    norm_side = (side or "BUY").upper()
+
+    recent_exit_times: List[datetime] = []
+    for trade in history:
+        if not _include_trade_in_runtime(trade):
+            continue
+        trade_mode = _normalize_trade_mode(trade.get("trade_mode"), default="DEMO")
+        if trade_mode != mode_upper:
+            continue
+        trade_root = _symbol_root(trade.get("symbol") or trade.get("index"))
+        trade_side = (trade.get("side") or "BUY").upper()
+        if trade_root != root or trade_side != norm_side:
+            continue
+        exit_raw = trade.get("exit_time") or trade.get("timestamp")
+        if not exit_raw:
+            continue
+        try:
+            exit_dt = exit_raw if isinstance(exit_raw, datetime) else datetime.fromisoformat(str(exit_raw))
+        except Exception:
+            continue
+
+        if exit_dt.tzinfo is not None and exit_dt.utcoffset() is not None:
+            cutoff_compare = datetime.now(exit_dt.tzinfo) - timedelta(minutes=lookback_minutes)
+            if exit_dt < cutoff_compare:
+                continue
+            remaining_seconds = max(0, int((exit_dt + timedelta(minutes=lookback_minutes) - datetime.now(exit_dt.tzinfo)).total_seconds()))
+        else:
+            if exit_dt < cutoff:
+                continue
+            remaining_seconds = max(0, int((exit_dt + timedelta(minutes=lookback_minutes) - datetime.utcnow()).total_seconds()))
+
+        recent_exit_times.append(exit_dt)
+        if len(recent_exit_times) >= max_trades:
+            return True, {
+                "reason": "LANE_OVERTRADE_GUARD",
+                "message": f"Too many {mode_upper} trades on {root}:{norm_side} in last {lookback_minutes}m.",
+                "root": root,
+                "side": norm_side,
+                "mode": mode_upper,
+                "recent_count": len(recent_exit_times),
+                "lookback_minutes": lookback_minutes,
+                "remaining_seconds": remaining_seconds,
+            }
+
+    return False, {}
 
 
 def _compute_rr(entry_price: Any, target: Any, stop_loss: Any) -> float:
@@ -3858,16 +3930,27 @@ async def execute(
             )
 
         blocked, wait_seconds, cooldown_key = _cooldown_info(trade.symbol, trade.side)
-        if blocked and not auto_demo:
+        enforce_demo_cooldown = bool(risk_config.get("apply_symbol_cooldown_demo", True))
+        if blocked and ((not auto_demo) or enforce_demo_cooldown):
             wait_seconds_rounded = int(math.ceil(wait_seconds))
             raise HTTPException(
                 status_code=429,
                 detail={
                     "message": "SL cooldown active for this trade side/symbol.",
+                    "reason": "SL_COOLDOWN_ACTIVE",
                     "cooldown_key": cooldown_key,
                     "wait_seconds": wait_seconds_rounded,
+                    "remaining_seconds": wait_seconds_rounded,
                 },
             )
+
+        overtrade_blocked, overtrade_detail = _lane_overtrade_info(
+            trade.symbol,
+            trade.side,
+            "DEMO" if auto_demo else "LIVE",
+        )
+        if overtrade_blocked:
+            raise HTTPException(status_code=429, detail=overtrade_detail)
 
         reentry_blocked, reentry_detail = _same_move_reentry_info(ai_context)
         if reentry_blocked:
