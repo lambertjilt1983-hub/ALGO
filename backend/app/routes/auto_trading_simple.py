@@ -390,6 +390,44 @@ def _include_trade_in_runtime(trade: Dict[str, Any]) -> bool:
     return not _is_synthetic_trade_symbol((trade or {}).get("symbol"))
 
 
+def _cleanup_synthetic_trade_rows() -> Dict[str, Any]:
+    """Permanently delete synthetic/test trade rows from DB and runtime caches."""
+    db = SessionLocal()
+    active_deleted = 0
+    history_deleted = 0
+    active_before = len(active_trades)
+    history_before = len(history)
+    try:
+        active_rows = db.query(ActiveTrade).all()
+        active_ids = [row.id for row in active_rows if _is_synthetic_trade_symbol(getattr(row, "symbol", None))]
+        if active_ids:
+            active_deleted = db.query(ActiveTrade).filter(ActiveTrade.id.in_(active_ids)).delete(synchronize_session=False)
+
+        report_rows = db.query(TradeReport).all()
+        report_ids = [row.id for row in report_rows if _is_synthetic_trade_symbol(getattr(row, "symbol", None))]
+        if report_ids:
+            history_deleted = db.query(TradeReport).filter(TradeReport.id.in_(report_ids)).delete(synchronize_session=False)
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Cleanup failed: {e}")
+    finally:
+        db.close()
+
+    active_trades[:] = [t for t in active_trades if not _is_synthetic_trade_symbol(t.get("symbol"))]
+    history[:] = [t for t in history if not _is_synthetic_trade_symbol(t.get("symbol"))]
+
+    return {
+        "active_deleted": int(active_deleted or 0),
+        "history_deleted": int(history_deleted or 0),
+        "active_before": active_before,
+        "active_after": len(active_trades),
+        "history_before": history_before,
+        "history_after": len(history),
+    }
+
+
 def _sync_active_trades_from_db() -> None:
     """Load active OPEN trades from DB into in-memory state for runtime logic."""
     db = SessionLocal()
@@ -4230,6 +4268,18 @@ async def debug_source():
         "source_file": __file__,
         "has_demo_trades": bool(demo_trades),
         "has_active_trades": bool(active_trades),
+        "timestamp": _now(),
+    }
+
+
+@router.post("/maintenance/cleanup-synthetic")
+async def cleanup_synthetic_trades(authorization: Optional[str] = Header(None)):
+    """One-time maintenance: remove synthetic/test trades from DB and runtime memory."""
+    result = _cleanup_synthetic_trade_rows()
+    return {
+        "success": True,
+        "message": "Synthetic test trades cleaned from active/history.",
+        **result,
         "timestamp": _now(),
     }
 
