@@ -301,6 +301,33 @@ def _now() -> str:
     return ist_now().isoformat()
 
 
+def _normalize_trade_mode(value: Any, default: str = "DEMO") -> str:
+    mode = str(value or default).strip().upper()
+    if mode in {"LIVE", "DEMO", "PAPER"}:
+        return "DEMO" if mode == "PAPER" else mode
+    return str(default).strip().upper()
+
+
+def _resolve_report_trade_mode(meta: Optional[Dict[str, Any]], default: str = "DEMO") -> str:
+    payload = dict(meta or {})
+    explicit = _normalize_trade_mode(payload.get("trade_mode"), default=default)
+    if explicit in {"LIVE", "DEMO"}:
+        return explicit
+
+    broker_response = payload.get("broker_response")
+    if isinstance(broker_response, dict):
+        if broker_response.get("simulated") is True:
+            return "DEMO"
+        if broker_response.get("order_id") or broker_response.get("broker_order_id"):
+            return "LIVE"
+
+    if payload.get("broker_order_id"):
+        return "LIVE"
+    if payload.get("force_demo") is True:
+        return "DEMO"
+    return _normalize_trade_mode(default, default="DEMO")
+
+
 def _sync_active_trades_from_db() -> None:
     """Load active OPEN trades from DB into in-memory state for runtime logic."""
     db = SessionLocal()
@@ -342,6 +369,7 @@ def _sync_history_from_db(limit: int = 500) -> None:
         loaded: List[Dict[str, Any]] = []
         for row in reversed(rows):
             meta = dict(row.meta or {})
+            row_mode = _resolve_report_trade_mode(meta, default="DEMO")
             loaded.append(
                 {
                     "id": row.id,
@@ -357,7 +385,7 @@ def _sync_history_from_db(limit: int = 500) -> None:
                     "entry_time": row.entry_time.isoformat() if row.entry_time else None,
                     "exit_time": row.exit_time.isoformat() if row.exit_time else None,
                     "trading_date": row.trading_date,
-                    "trade_mode": str(meta.get("trade_mode") or "LIVE").upper(),
+                    "trade_mode": row_mode,
                     **meta,
                 }
             )
@@ -849,10 +877,17 @@ def _ai_entry_validation(
         ai_edge_min = base_ai_edge_min
         rr_min = base_rr_min
 
-    fake_move_risk = float(signal.get("fake_move_risk") or signal.get("fake_move_risk_score") or 0.0)
-    news_risk = float(signal.get("sudden_news_risk") or signal.get("news_risk") or signal.get("news_risk_score") or 0.0)
-    liquidity_spike_risk = float(signal.get("liquidity_spike_risk") or signal.get("liquidity_spike_risk_score") or 0.0)
-    premium_distortion = float(signal.get("premium_distortion") or signal.get("premium_distortion_risk") or signal.get("premium_distortion_score") or 0.0)
+    # Use safe numeric coercion so malformed payload values never crash execute/analyze paths.
+    fake_move_risk = _safe_metric(signal.get("fake_move_risk"), _safe_metric(signal.get("fake_move_risk_score"), 0.0))
+    news_risk = _safe_metric(
+        signal.get("sudden_news_risk"),
+        _safe_metric(signal.get("news_risk"), _safe_metric(signal.get("news_risk_score"), 0.0)),
+    )
+    liquidity_spike_risk = _safe_metric(signal.get("liquidity_spike_risk"), _safe_metric(signal.get("liquidity_spike_risk_score"), 0.0))
+    premium_distortion = _safe_metric(
+        signal.get("premium_distortion"),
+        _safe_metric(signal.get("premium_distortion_risk"), _safe_metric(signal.get("premium_distortion_score"), 0.0)),
+    )
 
     market_regime = str(signal.get("market_regime") or "").upper()
     market_bias = str(signal.get("market_bias") or signal.get("trend_direction") or "").upper()
@@ -1727,6 +1762,11 @@ def _close_trade(trade: Dict[str, Any], exit_price: float) -> None:
         trade["status"] = trade.get("status") or "CLOSED"
         trade["pnl"] = round(pnl, 2)
         trade["pnl_percentage"] = round(pnl_percentage, 2)
+        trade_mode = _normalize_trade_mode(
+            trade.get("trade_mode"),
+            default="DEMO" if isinstance(trade.get("broker_response"), dict) and trade.get("broker_response", {}).get("simulated") else "LIVE",
+        )
+        trade["trade_mode"] = trade_mode
 
         # Record exit context and only apply SL cooldown to true stop-loss exits.
         exit_dt = datetime.fromisoformat(trade.get("exit_time")) if isinstance(trade.get("exit_time"), str) else datetime.utcnow()
@@ -1736,7 +1776,6 @@ def _close_trade(trade: Dict[str, Any], exit_price: float) -> None:
         history.append(trade.copy())
 
         # Track daily P&L and consecutive losses
-        trade_mode = str(trade.get("trade_mode") or "LIVE").upper()
         if trade_mode == "LIVE":
             state["daily_loss"] += pnl
             state["daily_profit"] = state.get("daily_profit", 0.0) + max(0, pnl)
@@ -1790,6 +1829,9 @@ def _close_trade(trade: Dict[str, Any], exit_price: float) -> None:
                     "liquidity_spike_risk": trade.get("liquidity_spike_risk"),
                     "premium_distortion": trade.get("premium_distortion") or trade.get("premium_distortion_risk"),
                     "profit_lock_applied": trade.get("profit_lock_applied"),
+                    "trade_mode": trade_mode,
+                    "broker_order_id": trade.get("broker_order_id"),
+                    "broker_response": trade.get("broker_response"),
                 },
             )
             db.add(report)
@@ -3092,6 +3134,18 @@ async def execute(
         try:
             payload = await request.json()
             if isinstance(payload, dict) and payload:
+                def _to_int_or_default(value, default_value):
+                    try:
+                        if value is None:
+                            return default_value
+                        return int(value)
+                    except Exception:
+                        return default_value
+
+                def _to_bool_or_default(value, default_value):
+                    parsed = _boolish(value)
+                    return default_value if parsed is None else parsed
+
                 def _to_float_or_default(value, default_value):
                     try:
                         if value is None:
@@ -3100,20 +3154,17 @@ async def execute(
                     except Exception:
                         return default_value
 
-                force_demo = bool(payload.get("force_demo", force_demo))
+                force_demo = _to_bool_or_default(payload.get("force_demo", force_demo), force_demo)
                 symbol = payload.get("symbol", symbol)
-                if payload.get("price") is not None:
-                    price = float(payload.get("price"))
-                if payload.get("balance") is not None:
-                    balance = float(payload.get("balance"))
-                if payload.get("quantity") is not None:
-                    quantity = int(payload.get("quantity"))
+                price = _to_float_or_default(payload.get("price", price), price)
+                balance = _to_float_or_default(payload.get("balance", balance), balance)
+                quantity = _to_int_or_default(payload.get("quantity", quantity), quantity)
                 side = _normalize_side(payload.get("side", side), default=side)
                 stop_loss = _to_float_or_default(payload.get("stop_loss", stop_loss), stop_loss)
                 target = _to_float_or_default(payload.get("target", target), target)
                 support = _to_float_or_default(payload.get("support", support), support)
                 resistance = _to_float_or_default(payload.get("resistance", resistance), resistance)
-                broker_id = int(payload.get("broker_id", broker_id))
+                broker_id = _to_int_or_default(payload.get("broker_id", broker_id), broker_id)
                 quality_score = payload.get("quality_score", quality_score)
                 confirmation_score = payload.get("confirmation_score", confirmation_score)
                 ai_edge_score = payload.get("ai_edge_score", ai_edge_score)
@@ -3696,6 +3747,7 @@ async def execute(
             trade_obj["trade_mode"] = "DEMO"
             trade_obj["entry_time"] = _now()
             trade_obj["broker_response"] = {"simulated": True}
+            trade_obj["broker_order_id"] = None
             demo_trades.append(trade_obj)
             active_trades.append(trade_obj)
             _upsert_active_trade_record(trade_obj)
@@ -3733,6 +3785,8 @@ async def execute(
             if real_order.get("success"):
                 print(f"[API /execute] ✓ Zerodha order ACCEPTED - Order ID: {real_order.get('order_id', 'N/A')}")
                 broker_response = real_order
+                trade_obj["broker_order_id"] = real_order.get("order_id") or real_order.get("broker_order_id")
+                trade_obj["broker_response"] = real_order
                 active_trades.append(trade_obj)
                 _upsert_active_trade_record(trade_obj)
             else:
@@ -4031,7 +4085,7 @@ async def get_trade_history(
     normalized_rows: List[Dict[str, Any]] = []
     for row in rows:
         meta = dict(row.meta or {})
-        row_mode = str(meta.get("trade_mode") or "LIVE").upper()
+        row_mode = _resolve_report_trade_mode(meta, default="DEMO")
         if selected_mode in {"LIVE", "DEMO"} and row_mode != selected_mode:
             continue
         normalized_rows.append(

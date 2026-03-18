@@ -46,14 +46,11 @@ import { shouldFetchCurrentModeActive as shouldFetchCurrentModeActiveUtil } from
 
 const OPTION_SIGNALS_API = `${config.API_BASE_URL}/option-signals/intraday-advanced`;
 const PROFESSIONAL_SIGNAL_API = `${config.API_BASE_URL}/strategies/live/professional-signal`;
-const PAPER_TRADES_ACTIVE_API = `${config.API_BASE_URL}/paper-trades/active`;
-const PAPER_TRADES_HISTORY_API = `${config.API_BASE_URL}/paper-trades/history`;
-const PAPER_TRADES_PERFORMANCE_API = `${config.API_BASE_URL}/paper-trades/performance`;
-const PAPER_TRADES_CREATE_API = `${config.API_BASE_URL}/paper-trades`;
-const PAPER_TRADES_UPDATE_API = `${config.API_BASE_URL}/paper-trades/update-prices`;
 const AUTO_TRADE_STATUS_API = `${config.API_BASE_URL}/autotrade/status`;
+const AUTO_TRADE_EXECUTE_API = config.endpoints?.autoTrade?.execute || `${config.API_BASE_URL}/autotrade/execute`;
 const AUTO_TRADE_ACTIVE_API = config.endpoints?.autoTrade?.activeTrades || `${config.API_BASE_URL}/autotrade/trades/active`;
 const AUTO_TRADE_UPDATE_API = `${config.API_BASE_URL}/autotrade/trades/update-prices`;
+const AUTO_TRADE_CLOSE_API = config.endpoints?.autoTrade?.closeTrade || `${config.API_BASE_URL}/autotrade/trades/close`;
 const AUTO_TRADE_HISTORY_API = config.endpoints?.autoTrade?.tradeHistory || `${config.API_BASE_URL}/autotrade/trades/history`;
 const AUTO_TRADE_REPORT_API = config.endpoints?.autoTrade?.report || `${config.API_BASE_URL}/autotrade/report`;
 
@@ -1840,7 +1837,6 @@ const AutoTradingDashboard = () => {
       const priceUpdatesBlocked = priceUpdateBackoffUntil > nowMs;
       const updateJobs = [];
       const shouldRunAutoTradeUpdate = !priceUpdatesBlocked
-        && isLiveMode
         && hasOpenTradeForCurrentMode
         && (forceRefresh || (nowMs - Number(autoTradePriceUpdateAtRef.current || 0)) >= 5000);
       if (shouldRunAutoTradeUpdate) {
@@ -1849,51 +1845,6 @@ const AutoTradingDashboard = () => {
           timeoutPromise(config.authFetch(AUTO_TRADE_UPDATE_API, { method: 'POST', retryTransportOnce: true, cache: 'no-store' }), 3000)
             .then((res) => {
               // A synthetic status:0 response means both fetch attempts failed (transport error).
-              if (res && Number(res.status) === 0) {
-                priceUpdateBackoffUntilRef.current = Date.now() + 10000;
-              }
-              return res;
-            })
-            .catch(() => {
-              priceUpdateBackoffUntilRef.current = Date.now() + 10000;
-              return null;
-            })
-        );
-      }
-      const shouldRunPaperPriceUpdate = !priceUpdatesBlocked
-        && !isLiveMode
-        && hasOpenTradeForCurrentMode
-        && (forceRefresh || (nowMs - Number(paperPriceUpdateAtRef.current || 0)) >= 5000);
-      if (shouldRunPaperPriceUpdate) {
-        paperPriceUpdateAtRef.current = nowMs;
-        updateJobs.push(
-          timeoutPromise(config.authFetch(PAPER_TRADES_UPDATE_API, { method: 'POST', retryTransportOnce: true, cache: 'no-store' }), 3000)
-            .then((res) => {
-              if (res && Number(res.status) === 0) {
-                priceUpdateBackoffUntilRef.current = Date.now() + 10000;
-              }
-              return res;
-            })
-            .catch(() => {
-              priceUpdateBackoffUntilRef.current = Date.now() + 10000;
-              return null;
-            })
-        );
-      }
-
-      const hasAutoDemoOpenTrade = !isLiveMode && currentModeOpenTrades.some((t) => {
-        const mode = String(t?.trade_mode || '').toUpperCase();
-        const source = String(t?.trade_source || '').toLowerCase();
-        return (mode === 'DEMO' || mode === 'PAPER') && source === 'autotrade';
-      });
-      const shouldRunAutoDemoUpdate = !priceUpdatesBlocked
-        && hasAutoDemoOpenTrade
-        && (forceRefresh || (nowMs - Number(autoTradePriceUpdateAtRef.current || 0)) >= 5000);
-      if (shouldRunAutoDemoUpdate) {
-        autoTradePriceUpdateAtRef.current = nowMs;
-        updateJobs.push(
-          timeoutPromise(config.authFetch(AUTO_TRADE_UPDATE_API, { method: 'POST', retryTransportOnce: true, cache: 'no-store' }), 3000)
-            .then((res) => {
               if (res && Number(res.status) === 0) {
                 priceUpdateBackoffUntilRef.current = Date.now() + 10000;
               }
@@ -1925,12 +1876,9 @@ const AutoTradingDashboard = () => {
     }
     historyLastModeRef.current = isLiveMode;
 
-    const historyUrl = isLiveMode
-      ? `${AUTO_TRADE_HISTORY_API}?limit=50`
-      : `${PAPER_TRADES_HISTORY_API}?days=1&limit=50`;
-    const perfUrl = isLiveMode
-      ? `${AUTO_TRADE_REPORT_API}?limit=500`
-      : `${PAPER_TRADES_PERFORMANCE_API}?days=30`;
+    const modeParam = isLiveMode ? 'LIVE' : 'DEMO';
+    const historyUrl = `${AUTO_TRADE_HISTORY_API}?mode=${modeParam}&limit=50`;
+    const perfUrl = `${AUTO_TRADE_REPORT_API}?mode=${modeParam}&limit=500`;
 
     const pageHidden = typeof document !== 'undefined' && document.hidden;
     const shouldFetchSlowEndpoints = !pageHidden && (forceRefresh || (nowMs - Number(slowFetchCacheRef.current?.at || 0)) >= 10000);
@@ -1952,8 +1900,7 @@ const AutoTradingDashboard = () => {
       trades: currentModeOpenTrades,
     };
 
-    const [paperActiveRes, liveActiveRes, historyRes, perfRes, statusRes] = await Promise.all([
-      isLiveMode || !shouldFetchCurrentModeActive ? Promise.resolve({ ok: false, skipped: true }) : safeFetch(PAPER_TRADES_ACTIVE_API),
+    const [liveActiveRes, historyRes, perfRes, statusRes] = await Promise.all([
       shouldFetchCurrentModeActive ? safeFetch(AUTO_TRADE_ACTIVE_API) : Promise.resolve({ ok: false, skipped: true }),
       shouldFetchHistoryEndpoint ? safeFetch(historyUrl) : Promise.resolve({ ok: false, skipped: true }),
       shouldFetchSlowEndpoints && !skipHistory ? safeFetch(perfUrl) : Promise.resolve({ ok: false, skipped: true }),
@@ -1978,7 +1925,7 @@ const AutoTradingDashboard = () => {
       historyFetchFailCountRef.current = 0; // reset fail count on success
     }
 
-    const hasAnyFreshResponse = [paperActiveRes, liveActiveRes, historyRes, perfRes, statusRes]
+    const hasAnyFreshResponse = [liveActiveRes, historyRes, perfRes, statusRes]
       .some((res) => !!res?.ok);
 
     const parseJsonSafe = async (response, fallback, retryUrl = null, onDecodeFail = null) => {
@@ -2011,14 +1958,9 @@ const AutoTradingDashboard = () => {
       }
     };
 
-    const paperActiveData = await parseJsonSafe(
-      paperActiveRes,
-      !isLiveMode ? currentModeActiveFallback : { trades: [] },
-      PAPER_TRADES_ACTIVE_API,
-    );
     const liveActiveData = await parseJsonSafe(
       liveActiveRes,
-      isLiveMode ? currentModeActiveFallback : { trades: [] },
+      currentModeActiveFallback,
       AUTO_TRADE_ACTIVE_API,
     );
     const historyData = shouldFetchHistoryEndpoint
@@ -2058,11 +2000,6 @@ const AutoTradingDashboard = () => {
       };
     }
 
-    const paperActive = (Array.isArray(paperActiveData.trades) ? paperActiveData.trades : []).map((t) => ({
-      ...t,
-      trade_mode: 'DEMO',
-      trade_source: 'paper',
-    }));
     const liveActive = (Array.isArray(liveActiveData.trades) ? liveActiveData.trades : []).map((t) => {
       const inferredMode = String(
         t?.trade_mode
@@ -2081,7 +2018,7 @@ const AutoTradingDashboard = () => {
       const mode = String(t?.trade_mode || '').toUpperCase();
       return mode === 'DEMO' || mode === 'PAPER';
     });
-    const activeCandidates = isLiveMode ? liveOnlyActive : [...paperActive, ...autoDemoActive];
+    const activeCandidates = isLiveMode ? liveOnlyActive : autoDemoActive;
     const history = historyData.trades || [];
     const backendStatus = statusData.status || statusData;
     const backendEnabled = Boolean(backendStatus?.enabled ?? statusData?.enabled ?? true);
@@ -2090,9 +2027,7 @@ const AutoTradingDashboard = () => {
       ? false
       : Boolean(backendStatus?.is_demo_mode ?? statusData?.is_demo_mode ?? true);
 
-    const canTrustActiveEmpty = shouldFetchCurrentModeActive && (isLiveMode
-      ? !!liveActiveRes?.ok
-      : (!!paperActiveRes?.ok || !!liveActiveRes?.ok));
+    const canTrustActiveEmpty = shouldFetchCurrentModeActive && !!liveActiveRes?.ok;
 
     // Deduplicate active trades by symbol, action, entry_price, and entry_time
     const dedupedActive = Array.isArray(activeCandidates)
@@ -3897,21 +3832,14 @@ const AutoTradingDashboard = () => {
 
     try {
       let response;
-      const isTradeLive = String(trade?.trade_mode || trade?.trade_source || '').toUpperCase() === 'LIVE';
-      if (isTradeLive) {
-        response = await config.authFetch(config.endpoints.autoTrade.closeTrade, {
-          method: 'POST',
-          body: JSON.stringify({ trade_id: trade.id, symbol: trade.symbol })
-        });
+      // Unified close path: autotrade endpoint handles both LIVE and DEMO trades.
+      response = await config.authFetch(AUTO_TRADE_CLOSE_API, {
+        method: 'POST',
+        body: JSON.stringify({ trade_id: trade.id, symbol: trade.symbol })
+      });
 
-        // If the row is actually a paper trade while in live view, fallback gracefully.
-        if (!response.ok && response.status === 404) {
-          response = await config.authFetch(`${config.API_BASE_URL}/paper-trades/${trade.id}`, {
-            method: 'PUT',
-            body: JSON.stringify({ status: 'MANUAL_CLOSE' })
-          });
-        }
-      } else {
+      // Backward-compatible fallback for legacy rows that exist only in paper_trades.
+      if (!response.ok && response.status === 404) {
         response = await config.authFetch(`${config.API_BASE_URL}/paper-trades/${trade.id}`, {
           method: 'PUT',
           body: JSON.stringify({ status: 'MANUAL_CLOSE' })
@@ -4081,29 +4009,48 @@ const AutoTradingDashboard = () => {
 
     const payload = {
       symbol: normalizedSignal.symbol,
-      index_name: normalizedSignal.index,
+      price: normalizedSignal.entry_price,
       side: normalizedSignal.action,
-      signal_type: normalizedSignal.signal_type || 'intraday_option',
       quantity: Math.max(1, Math.floor(Number(normalizedSignal.quantity || 1) * Number(lotMultiplier) * capitalQtyBoost * demoDrawdownMultiplier)),
-      entry_price: normalizedSignal.entry_price,
       stop_loss: normalizedSignal.stop_loss,
       target: normalizedSignal.target,
-      strategy: normalizedSignal.strategy || 'ATM Option',
-      signal_data: normalizedSignal,
-      // If unified readiness already passed, avoid a second server-side confirmation mismatch in paper mode.
-      bypass_confirmation: readiness.pass,
+      quality_score: normalizedSignal.quality_score ?? normalizedSignal.quality,
+      confirmation_score: normalizedSignal.confirmation_score ?? normalizedSignal.confidence,
+      ai_edge_score: normalizedSignal.ai_edge_score,
+      momentum_score: normalizedSignal.momentum_score,
+      breakout_score: normalizedSignal.breakout_score,
+      option_type: normalizedSignal.option_type,
+      signal_type: normalizedSignal.signal_type,
+      is_stock: normalizedSignal.is_stock === true || normalizedSignal.signal_type === 'stock',
+      trend_direction: normalizedSignal.trend_direction,
+      trend_strength: normalizedSignal.trend_strength,
+      breakout_confirmed: normalizedSignal.breakout_confirmed,
+      momentum_confirmed: normalizedSignal.momentum_confirmed,
+      breakout_hold_confirmed: normalizedSignal.breakout_hold_confirmed,
+      timing_risk: normalizedSignal.timing_risk || normalizedSignal?.timing_risk_profile?.window,
+      sudden_news_risk: normalizedSignal.sudden_news_risk ?? normalizedSignal.news_risk,
+      liquidity_spike_risk: normalizedSignal.liquidity_spike_risk,
+      premium_distortion_risk: normalizedSignal.premium_distortion_risk ?? normalizedSignal.premium_distortion,
+      close_back_in_range: normalizedSignal.close_back_in_range,
+      fake_breakout_by_candle: normalizedSignal.fake_breakout_by_candle,
+      market_bias: normalizedSignal.market_bias,
+      market_regime: normalizedSignal.market_regime,
+      expiry: normalizedSignal.expiry_date,
+      force_demo: true,
+      balance: 0,
+      broker_id: 1,
     };
 
     paperCreateInFlightRef.current.add(paperSignalKey);
     try {
-      const res = await config.authFetch(PAPER_TRADES_CREATE_API, {
+      const res = await config.authFetch(AUTO_TRADE_EXECUTE_API, {
         method: 'POST',
         body: JSON.stringify(payload),
       });
       if (res.ok) {
         const data = await res.json();
         if (data?.success === true) {
-          console.log(`✅ Paper trade created: ${normalizedSignal.symbol}`);
+          console.log(`✅ Demo trade created: ${normalizedSignal.symbol}`);
           paperRejectCooldownRef.current.delete(paperRootKey);
           paperSymbolEntryRef.current.set(symbolSideKey, Date.now());
           setLastPaperSignalSymbol(paperSignalKey);
