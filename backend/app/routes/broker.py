@@ -11,6 +11,7 @@ from app.core.security import encryption_manager
 from app.core.config import get_settings
 import urllib.parse
 import requests
+from datetime import datetime, timedelta
 
 router = APIRouter(prefix="/brokers", tags=["brokers"])
 
@@ -429,6 +430,8 @@ async def zerodha_oauth_callback(
         try:
             data = kite.generate_session(request_token, api_secret=decrypted_api_secret)
             access_token = data["access_token"]
+            refresh_token = data.get("refresh_token")
+            login_time = data.get("login_time")
             print(f"Access token received: {access_token[:20]}...")
         except Exception as kite_error:
             print(f"Kite session generation failed: {str(kite_error)}")
@@ -438,6 +441,15 @@ async def zerodha_oauth_callback(
         print(f"Saving access token to broker ID: {credential.id}")
         safe_access_token = access_token.strip() if isinstance(access_token, str) else access_token
         credential.access_token = encryption_manager.encrypt_credentials(safe_access_token)
+        if refresh_token:
+            safe_refresh_token = refresh_token.strip() if isinstance(refresh_token, str) else refresh_token
+            credential.refresh_token = encryption_manager.encrypt_credentials(safe_refresh_token)
+
+        if isinstance(login_time, datetime):
+            credential.token_expiry = login_time + timedelta(hours=23, minutes=50)
+        else:
+            credential.token_expiry = datetime.utcnow() + timedelta(hours=23, minutes=50)
+
         db.add(credential)  # Explicitly add to session
         db.commit()
         
@@ -452,7 +464,12 @@ async def zerodha_oauth_callback(
         
         # Return JSON for frontend fetch handler
         print("✅ Returning JSON success to frontend")
-        return {"status": "success", "broker_id": credential.id}
+        return {
+            "status": "success",
+            "broker_id": credential.id,
+            "has_refresh_token": bool(refresh_token),
+            "token_expiry": credential.token_expiry.isoformat() if credential.token_expiry else None,
+        }
         
     except Exception as e:
         print(f"ERROR in callback: {str(e)}")
