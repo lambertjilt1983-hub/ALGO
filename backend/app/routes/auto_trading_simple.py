@@ -77,7 +77,7 @@ except ImportError:
     def _quote_symbol(symbol, index=None):
         return symbol
 from app.core.database import SessionLocal
-from app.models.trading import TradeReport, ActiveTrade
+from app.models.trading import TradeReport, ActiveTrade, PaperTrade
 from sqlalchemy import func
 try:
     from app.engine.auto_trading_engine import AutoTradingEngine
@@ -105,7 +105,7 @@ except ImportError:
     class SimpleMomentumStrategy:
         pass
 
-from app.core.market_hours import ist_now, is_market_open, market_status
+from app.core.market_hours import ist_now, is_market_open, market_status, _market_tz
 try:
     from app.routes.trade_metrics import normalize_active_trade_metrics
 except ImportError:
@@ -1072,12 +1072,25 @@ def _reset_daily_if_needed():
         state["consecutive_sl_count"] = 0  # Reset consecutive SL count
 
 
-def _count_daily_trades() -> int:
-    """Count how many LIVE trades have been created today."""
+def _count_daily_trades(db_session=None) -> int:
+    """Count how many trades have been created today.
+
+    Runtime mode (default): counts in-memory LIVE trades.
+    Test mode (db_session provided): counts PaperTrade rows created today.
+    """
     _reset_daily_if_needed()
     today = ist_now().date()
     today_start = datetime.combine(today, dt_time(0, 0, 0))
     today_end = datetime.combine(today, dt_time(23, 59, 59))
+
+    # Backward-compatibility for unit tests that pass a DB session.
+    if db_session is not None:
+        return int(
+            db_session.query(PaperTrade)
+            .filter(PaperTrade.entry_time >= today_start)
+            .filter(PaperTrade.entry_time <= today_end)
+            .count()
+        )
     
     count = 0
     for trade in active_trades:
@@ -1107,11 +1120,31 @@ def _count_daily_trades() -> int:
     return count
 
 
-def _count_consecutive_sl_hits() -> int:
-    """Count consecutive LIVE SL_HIT trades from the end of today's history."""
+def _count_consecutive_sl_hits(db_session=None) -> int:
+    """Count consecutive SL_HIT trades from newest closed trades today.
+
+    Runtime mode (default): reads in-memory LIVE history.
+    Test mode (db_session provided): reads PaperTrade rows.
+    """
     _reset_daily_if_needed()
     today = ist_now().date()
     today_start = datetime.combine(today, dt_time(0, 0, 0))
+
+    if db_session is not None:
+        closed_today = (
+            db_session.query(PaperTrade)
+            .filter(PaperTrade.exit_time.isnot(None))
+            .filter(PaperTrade.exit_time >= today_start)
+            .order_by(PaperTrade.exit_time.desc())
+            .all()
+        )
+        consecutive = 0
+        for trade in closed_today:
+            if str(getattr(trade, "status", "")).upper() == "SL_HIT":
+                consecutive += 1
+            else:
+                break
+        return consecutive
     
     # Get today's closed trades, newest first
     today_trades = []
@@ -1142,11 +1175,37 @@ def _count_consecutive_sl_hits() -> int:
     return consecutive
 
 
-def _get_daily_pnl() -> float:
-    """Calculate today's P&L (sum of all closed trades + open P&L)."""
+def _get_daily_pnl(db_session=None) -> float:
+    """Calculate today's P&L.
+
+    Runtime mode (default): closed + unrealized LIVE in-memory P&L.
+    Test mode (db_session provided): closed PaperTrade realized P&L only.
+    """
     _reset_daily_if_needed()
     today = ist_now().date()
     today_start = datetime.combine(today, dt_time(0, 0, 0))
+
+    if db_session is not None:
+        trades = (
+            db_session.query(PaperTrade)
+            .filter(PaperTrade.exit_time.isnot(None))
+            .filter(PaperTrade.exit_time >= today_start)
+            .all()
+        )
+        total = 0.0
+        for trade in trades:
+            try:
+                entry = float(getattr(trade, "entry_price", 0.0) or 0.0)
+                exit_price = float(getattr(trade, "exit_price", 0.0) or 0.0)
+                qty = float(getattr(trade, "quantity", 0.0) or 0.0)
+                side = str(getattr(trade, "side", "BUY") or "BUY").upper()
+                if side == "SELL":
+                    total += (entry - exit_price) * qty
+                else:
+                    total += (exit_price - entry) * qty
+            except Exception:
+                continue
+        return total
     
     pnl = 0.0
     
@@ -1185,29 +1244,33 @@ def _get_daily_pnl() -> float:
     return pnl
 
 
-def _should_allow_new_trade() -> Tuple[bool, Optional[str]]:
-    """Check if we should allow a new trade based on quality gates and daily limits."""
+def _should_allow_new_trade(db_session=None) -> Tuple[bool, Optional[str]] | bool:
+    """Check if we should allow a new trade based on quality gates and daily limits.
+
+    Runtime mode returns: (allowed, reason)
+    Test mode (db_session provided) returns: allowed (bool) for legacy tests.
+    """
     _reset_daily_if_needed()
-    
-    daily_trades = _count_daily_trades()
-    max_daily = int(risk_config.get("max_daily_trades", 20) or 20)
-    
+
+    daily_trades = _count_daily_trades(db_session)
+    max_daily = 20 if db_session is not None else int(risk_config.get("max_daily_trades", 20) or 20)
+
     if daily_trades >= max_daily:
-        return False, f"max_daily_trades_reached ({daily_trades}/{max_daily})"
-    
-    consecutive_sl = _count_consecutive_sl_hits()
-    sl_limit = int(risk_config.get("consecutive_sl_hit_limit", 3) or 3)
-    
+        return False if db_session is not None else (False, f"max_daily_trades_reached ({daily_trades}/{max_daily})")
+
+    consecutive_sl = _count_consecutive_sl_hits(db_session)
+    sl_limit = 3 if db_session is not None else int(risk_config.get("consecutive_sl_hit_limit", 3) or 3)
+
     if consecutive_sl >= sl_limit:
-        return False, f"consecutive_sl_hit_limit_reached ({consecutive_sl}/{sl_limit}) - market is choppy, pausing entries"
-    
-    daily_pnl = _get_daily_pnl()
-    daily_profit_target = float(risk_config.get("daily_profit_target", 5000.0) or 5000.0)
-    
+        return False if db_session is not None else (False, f"consecutive_sl_hit_limit_reached ({consecutive_sl}/{sl_limit}) - market is choppy, pausing entries")
+
+    daily_pnl = _get_daily_pnl(db_session)
+    daily_profit_target = 5000.0 if db_session is not None else float(risk_config.get("daily_profit_target", 5000.0) or 5000.0)
+
     if daily_pnl >= daily_profit_target:
-        return False, f"daily_profit_target_reached (₹{daily_pnl:.0f} >= ₹{daily_profit_target:.0f}) - stop for the day"
-    
-    return True, None
+        return False if db_session is not None else (False, f"daily_profit_target_reached (₹{daily_pnl:.0f} >= ₹{daily_profit_target:.0f}) - stop for the day")
+
+    return True if db_session is not None else (True, None)
 
 
 def _recent_win_rate(limit: int = 20) -> Tuple[float, int]:
@@ -4139,6 +4202,24 @@ async def get_trade_history(
         row_mode = _resolve_report_trade_mode(meta, default="DEMO")
         if selected_mode in {"LIVE", "DEMO"} and row_mode != selected_mode:
             continue
+        
+        # Convert naive datetimes to IST with timezone info
+        entry_time_str = None
+        if row.entry_time:
+            et = row.entry_time
+            # If naive (no timezone), assume it's already in IST from database
+            if et.tzinfo is None:
+                et = et.replace(tzinfo=_market_tz())
+            entry_time_str = et.isoformat()
+        
+        exit_time_str = None
+        if row.exit_time:
+            xt = row.exit_time
+            # If naive (no timezone), assume it's already in IST from database
+            if xt.tzinfo is None:
+                xt = xt.replace(tzinfo=_market_tz())
+            exit_time_str = xt.isoformat()
+        
         normalized_rows.append(
             {
                 "id": row.id,
@@ -4151,8 +4232,8 @@ async def get_trade_history(
                 "pnl_percentage": row.pnl_percentage,
                 "strategy": row.strategy,
                 "status": row.status,
-                "entry_time": row.entry_time.isoformat() if row.entry_time else None,
-                "exit_time": row.exit_time.isoformat() if row.exit_time else None,
+                "entry_time": entry_time_str,
+                "exit_time": exit_time_str,
                 "trade_mode": row_mode,
                 **meta,
             }

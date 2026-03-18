@@ -3,9 +3,9 @@ import os
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from backend.app.engine.auto_trading_engine import AutoTradingEngine
-from backend.app.engine.zerodha_broker import ZerodhaBroker
-from backend.app.engine.simple_momentum_strategy import SimpleMomentumStrategy
+from app.engine.auto_trading_engine import AutoTradingEngine
+from app.engine.zerodha_broker import ZerodhaBroker
+from app.engine.simple_momentum_strategy import SimpleMomentumStrategy
 
 class DummyBroker(ZerodhaBroker):
     def connect(self, credentials):
