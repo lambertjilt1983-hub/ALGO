@@ -63,11 +63,31 @@ def _sqlite_file_from_url(url: str) -> Path | None:
         return Path(raw)
     return (_BACKEND_ROOT / raw).resolve()
 
+
+def _resolve_database_url(settings) -> str:
+    """Resolve primary DB URL from settings and common cloud aliases."""
+    primary = str(getattr(settings, "DATABASE_URL", "") or "").strip()
+    if primary:
+        return primary
+
+    # Defensive fallbacks for cloud providers / managed DB integrations.
+    for key in (
+        "POSTGRES_URL",
+        "POSTGRESQL_URL",
+        "POSTGRES_INTERNAL_URL",
+        "RENDER_DATABASE_URL",
+        "RENDER_POSTGRES_INTERNAL_URL",
+    ):
+        value = str(os.getenv(key) or "").strip()
+        if value:
+            return value
+    return ""
+
 settings = get_settings()
 
 # Use the configured DATABASE_URL in production.
 # Fall back to local SQLite only when DATABASE_URL is empty or still a placeholder.
-db_url = (settings.DATABASE_URL or "").strip()
+db_url = _resolve_database_url(settings)
 placeholder_tokens = (
     "YOUR_PRODUCTION_DB_HOST",
     "user:password@",
