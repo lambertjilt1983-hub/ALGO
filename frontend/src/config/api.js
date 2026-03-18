@@ -164,7 +164,8 @@ export const config = {
           } catch {}
         }
         // Return a synthetic failed response so callers get ok:false without a thrown exception.
-        return new Response(null, { status: 0, statusText: 'Transport Error' });
+        // NOTE: status 0 is not a valid HTTP status code; use 503 to avoid RangeError in Response constructor.
+        return new Response(null, { status: 503, statusText: 'Transport Error' });
       }
     }
   },

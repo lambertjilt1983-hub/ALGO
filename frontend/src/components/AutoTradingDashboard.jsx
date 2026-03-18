@@ -176,7 +176,10 @@ const formatTimeIST = (dateString) => {
 
 const AutoTradingDashboard = () => {
   const [enabled, setEnabled] = useState(true);
-  const [isLiveMode, setIsLiveMode] = useState(false); // Starts in DEMO mode
+  const [isLiveMode, setIsLiveMode] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return localStorage.getItem('atd_is_live_mode') === 'true';
+  }); // Restored from localStorage; backend truth synced shortly after mount
   const [loading, setLoading] = useState(false);
   const [armingInProgress, setArmingInProgress] = useState(false);
   const [armError, setArmError] = useState(null);
@@ -223,8 +226,15 @@ const AutoTradingDashboard = () => {
   const [liveAccountBalance, setLiveAccountBalance] = useState(null);
   const [liveBalanceSyncedAt, setLiveBalanceSyncedAt] = useState(null);
   const [liveBalanceBrokerId, setLiveBalanceBrokerId] = useState(null);
-  const [activeBrokerId, setActiveBrokerId] = useState(null);
-  const [activeBrokerName, setActiveBrokerName] = useState(null);
+  const [activeBrokerId, setActiveBrokerId] = useState(() => {
+    if (typeof window === 'undefined') return null;
+    const saved = Number(localStorage.getItem('zerodha_last_broker_id'));
+    return Number.isFinite(saved) && saved > 0 ? saved : null;
+  });
+  const [activeBrokerName, setActiveBrokerName] = useState(() => {
+    if (typeof window === 'undefined') return null;
+    return localStorage.getItem('atd_broker_name') || null;
+  });
 
   // calculate whether market is open (used by many effects below)
   const getIstDateParts = () => {
@@ -464,6 +474,11 @@ const AutoTradingDashboard = () => {
     });
   };
 
+  // Persist live-mode hint so the badge is correct instantly on next mount (before backend resync)
+  useEffect(() => {
+    localStorage.setItem('atd_is_live_mode', String(isLiveMode));
+  }, [isLiveMode]);
+
   useEffect(() => {
     if (!scannerLastError) return;
     const timer = setTimeout(() => {
@@ -566,6 +581,8 @@ const AutoTradingDashboard = () => {
     }
     setActiveBrokerId(broker.id);
     setActiveBrokerName(broker.name);
+    localStorage.setItem('zerodha_last_broker_id', String(broker.id));
+    localStorage.setItem('atd_broker_name', broker.name);
     return broker;
   };
 
@@ -4218,7 +4235,7 @@ const AutoTradingDashboard = () => {
     // Resolve active broker early so live balance/execute use correct broker_id.
     // Retry a few times to avoid startup-time transient timeout noise.
     (async () => {
-      const attempts = [0, 600, 1500];
+      const attempts = [0, 1000, 3000, 8000];
       let lastErr = null;
       for (const waitMs of attempts) {
         if (waitMs > 0) {
@@ -4237,6 +4254,8 @@ const AutoTradingDashboard = () => {
     const handleVisibilityRefresh = () => {
       if (!document.hidden) {
         fetchData();
+        // Re-fetch broker context on tab focus so broker name/ID is always current
+        fetchActiveBrokerContext().catch(() => {});
       }
     };
 

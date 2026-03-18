@@ -786,7 +786,12 @@ def _same_move_reentry_info(ai_context: Dict[str, Any]) -> Tuple[bool, Dict[str,
         except Exception:
             stale_keys.append(key)
             continue
-        if expires_at <= now:
+        # Support both naive and timezone-aware expiry timestamps (parity with _cooldown_info).
+        if expires_at.tzinfo is not None and expires_at.utcoffset() is not None:
+            now_compare = datetime.now(expires_at.tzinfo)
+        else:
+            now_compare = now
+        if expires_at <= now_compare:
             stale_keys.append(key)
             continue
         if latest_expiry is None or expires_at > latest_expiry:
@@ -853,7 +858,9 @@ def _same_move_reentry_info(ai_context: Dict[str, Any]) -> Tuple[bool, Dict[str,
             "fresh_breakout": True,
             "stronger_signal": True,
         },
-        "remaining_seconds": max(0, int((latest_expiry - now).total_seconds())),
+        "remaining_seconds": max(0, int((
+            latest_expiry - (datetime.now(latest_expiry.tzinfo) if latest_expiry.tzinfo is not None and latest_expiry.utcoffset() is not None else now)
+        ).total_seconds())),
     }
     return blocked, detail
 
