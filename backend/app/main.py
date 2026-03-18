@@ -172,12 +172,16 @@ async def log_cors_request(request, call_next):
     try:
         response = await call_next(request)
     except Exception as e:
-        print(f"[UNHANDLED ERROR] {request.method} {request.url.path}: {e.__class__.__name__}: {e}")
-        traceback.print_exc()
+        import sys
+        error_class = e.__class__.__name__
+        error_msg = str(e)
+        print(f"[UNHANDLED ERROR] {request.method} {request.url.path}: {error_class}: {error_msg}")
+        print(f"[UNHANDLED ERROR] Full traceback:")
+        traceback.print_exc(file=sys.stdout)
         # Keep error responses CORS-readable for the frontend, even when downstream raises.
         response = JSONResponse(
             status_code=500,
-            content={"detail": f"Unhandled server error: {e.__class__.__name__}"},
+            content={"detail": f"Unhandled server error: {error_class}: {error_msg}"},
         )
 
     origin = _normalize_origin(request.headers.get("origin"))

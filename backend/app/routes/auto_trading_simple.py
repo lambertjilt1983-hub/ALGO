@@ -120,6 +120,37 @@ except ImportError:
 from app.engine.zerodha_order_util import place_zerodha_order
 
 
+def _ensure_json_serializable(value):
+    """Convert any value to a JSON-serializable type."""
+    import decimal
+    import numpy as np
+    
+    if value is None:
+        return None
+    if isinstance(value, bool):  # Must check before int since bool is a subclass of int
+        return value
+    if isinstance(value, (int, float)):
+        # Check for NaN or Inf and convert to None
+        if isinstance(value, float):
+            if np.isnan(value) or np.isinf(value):
+                return None
+        return value
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return {k: _ensure_json_serializable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_ensure_json_serializable(v) for v in value]
+    if isinstance(value, decimal.Decimal):
+        return float(value)
+    if isinstance(value, (np.integer, np.floating)):
+        if isinstance(value, np.floating) and (np.isnan(value) or np.isinf(value)):
+            return None
+        return value.item()  # Convert numpy scalar to Python native
+    # For any other type, convert to string as fallback
+    return str(value)
+
+
 # Option Chain Endpoint (must be after router is defined)
 @router.get("/option_chain")
 async def option_chain(
@@ -3672,15 +3703,15 @@ async def execute(
             "product": "MIS",
             "timestamp": _now(),
             "trade_mode": "DEMO" if auto_demo else "LIVE",
-            "stop_loss": derived_stop,
-            "target": derived_target,
-            "support": trade.support,
-            "resistance": trade.resistance,
-            "quality_score": quality_score,
-            "confirmation_score": confirmation_score,
-            "ai_edge_score": ai_edge_score,
-            "momentum_score": momentum_score,
-            "breakout_score": breakout_score,
+            "stop_loss": float(derived_stop) if derived_stop is not None else None,
+            "target": float(derived_target) if derived_target is not None else None,
+            "support": float(trade.support) if trade.support is not None else None,
+            "resistance": float(trade.resistance) if trade.resistance is not None else None,
+            "quality_score": _ensure_json_serializable(quality_score),
+            "confirmation_score": _ensure_json_serializable(confirmation_score),
+            "ai_edge_score": _ensure_json_serializable(ai_edge_score),
+            "momentum_score": _ensure_json_serializable(momentum_score),
+            "breakout_score": _ensure_json_serializable(breakout_score),
             "option_type": option_type,
             "trend_direction": trend_direction,
             "trend_strength": trend_strength,
@@ -3688,9 +3719,9 @@ async def execute(
             "momentum_confirmed": momentum_confirmed,
             "breakout_hold_confirmed": breakout_hold_confirmed,
             "timing_risk": timing_risk,
-            "sudden_news_risk": sudden_news_risk,
-            "liquidity_spike_risk": liquidity_spike_risk,
-            "premium_distortion_risk": premium_distortion_risk,
+            "sudden_news_risk": _ensure_json_serializable(sudden_news_risk),
+            "liquidity_spike_risk": _ensure_json_serializable(liquidity_spike_risk),
+            "premium_distortion_risk": _ensure_json_serializable(premium_distortion_risk),
             "close_back_in_range": close_back_in_range,
             "fake_breakout_by_candle": fake_breakout_by_candle,
             "start_trade_allowed": final_start_trade_allowed,
@@ -3799,17 +3830,37 @@ async def execute(
 
         broker_logs.append({"trade": trade_obj, "response": broker_response})
 
-        return {
-            "success": True,
-            "is_demo_mode": auto_demo,
-            "message": f"{mode} trade accepted for {trade.symbol} at {trade.price}",
-            "live_start_rule": "BALANCE_ONLY" if live_balance_only_mode else "PROTECTED",
-            "timestamp": _now(),
-            "broker_response": broker_response,
-            "stop_loss": derived_stop,
-            "target": derived_target,
-            "capital_protection": capital_profile,
-        }
+        # Ensure all response values are JSON-serializable
+        try:
+            response_dict = {
+                "success": True,
+                "is_demo_mode": bool(auto_demo),
+                "message": f"{mode} trade accepted for {trade.symbol} at {trade.price}",
+                "live_start_rule": "BALANCE_ONLY" if live_balance_only_mode else "PROTECTED",
+                "timestamp": str(_now()),
+                "broker_response": _ensure_json_serializable(broker_response) if isinstance(broker_response, dict) else {},
+                "stop_loss": float(derived_stop) if derived_stop is not None else 0.0,
+                "target": float(derived_target) if derived_target is not None else 0.0,
+                "capital_protection": _ensure_json_serializable(capital_profile) if isinstance(capital_profile, dict) else {},
+            }
+            # Final safety check: ensure the entire dict is serializable
+            import json
+            json.dumps(response_dict)  # This will raise TypeError if not serializable
+            return response_dict
+        except (TypeError, ValueError) as response_error:
+            print(f"[API /execute] Response serialization error: {response_error}")
+            print(f"[API /execute] derived_stop type={type(derived_stop)} value={derived_stop}")
+            print(f"[API /execute] derived_target type={type(derived_target)} value={derived_target}")
+            print(f"[API /execute] capital_profile={capital_profile}")
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "message": "Trade accepted but response serialization failed.",
+                    "error": str(response_error),
+                    "stop_loss": float(derived_stop) if isinstance(derived_stop, (int, float)) else None,
+                    "target": float(derived_target) if isinstance(derived_target, (int, float)) else None,
+                }
+            )
 
 
 @router.get("/trades/active")
