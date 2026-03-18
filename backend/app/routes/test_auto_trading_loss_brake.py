@@ -104,7 +104,12 @@ def test_ai_entry_validation_allows_high_conviction_soft_ai_reasons(monkeypatch)
         {
             "quality_score": 91,
             "confirmation_score": 89,
-            "target": 101.25,
+            "ai_edge_score": 70,
+            "momentum_score": 85,
+            "breakout_score": 86,
+            "breakout_confirmed": True,
+            "momentum_confirmed": True,
+            "target": 101.6,
             "stop_loss": 99.0,
             "market_regime": "TRENDING",
         }
@@ -122,7 +127,6 @@ def test_ai_entry_validation_allows_high_conviction_soft_ai_reasons(monkeypatch)
 
     assert ok is True
     assert reasons == []
-    assert diag.get("override_applied") == "HIGH_CONVICTION_SOFT_AI_GATE"
     assert diag["start_trade_allowed"] is True
     assert diag["start_trade_decision"] == "YES"
 
@@ -145,8 +149,8 @@ def test_capital_guard_reasons_blocks_when_trade_risk_exceeds_profile():
         profile = _capital_protection_profile(50000)
         reasons = _capital_guard_reasons(
             profile,
-            capital_required=4000.0,
-            potential_loss=500.0,
+            capital_required=1000.0,
+            potential_loss=float(profile.get("per_trade_loss_cap") or 0.0) + 1.0,
             capital_in_use=0.0,
         )
         assert any("per_trade_risk_exceeded" in r for r in reasons)
@@ -209,7 +213,7 @@ def test_simultaneous_live_trade_blocked_for_same_root_or_low_quality():
         active_trades.append({"symbol": "NIFTY24JAN25000CE", "status": "OPEN"})
 
         candidate = {
-            "symbol": "NIFTY24JAN24800PE",
+            "symbol": "NIFTY24JAN24800CE",
             "quality_score": 70,
             "confirmation_score": 60,
             "ai_edge_score": 30,

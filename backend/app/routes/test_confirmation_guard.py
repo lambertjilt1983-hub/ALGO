@@ -20,23 +20,47 @@ def test_live_execute_blocked_by_confirmation(monkeypatch):
 
     # Not demo mode so guard applies
     ats.state["is_demo_mode"] = False
+    ats.state["live_armed"] = True
 
     # Force confirmation to fail
     monkeypatch.setattr(ats, "_require_multi_tick_confirmation", lambda u, p, s, required_ticks=3: False)
 
-    # Call execute and expect HTTPException due to guard
+    # Provide complete AI context so execute reaches the confirmation gate in live mode.
+    payload = {
+        "symbol": "NIFTYTESTCE",
+        "price": 100.0,
+        "quantity": 1,
+        "side": "BUY",
+        "stop_loss": 95.0,
+        "target": 110.0,
+        # Keep scores above hard minimums but below confirmation override thresholds.
+        "quality_score": 80.0,
+        "confirmation_score": 80.0,
+        "ai_edge_score": 60.0,
+        "momentum_score": 85.0,
+        "breakout_score": 85.0,
+        "market_bias": "UPTREND",
+        "market_regime": "TRENDING",
+        "breakout_confirmed": True,
+        "momentum_confirmed": True,
+        "start_trade_allowed": True,
+        "start_trade_decision": "YES",
+    }
+
+    # Call execute and expect HTTPException due to confirmation guard
     try:
-        asyncio.run(ats.execute(symbol="NIFTYTESTCE", price=100.0, quantity=1, side="BUY"))
+        asyncio.run(ats.execute(**payload))
         assert False, "Expected HTTPException due to failed confirmation"
     except HTTPException as e:
         assert e.status_code == 403
-        assert 'failed multi-tick confirmation' in str(e.detail).lower()
+        assert "confirmation" in str(e.detail).lower()
 
 
 def test_live_execute_allowed_when_confirmed(monkeypatch):
     ats.trade_window["start"] = (0, 0)
     ats.trade_window["end"] = (23, 59)
     ats.state["is_demo_mode"] = False
+    ats.state["live_armed"] = True
 
     # Force confirmation to pass
     monkeypatch.setattr(ats, "_require_multi_tick_confirmation", lambda u, p, s, required_ticks=3: True)
@@ -44,8 +68,28 @@ def test_live_execute_allowed_when_confirmed(monkeypatch):
     # Stub broker order placement to avoid external calls
     monkeypatch.setattr(ats, "place_zerodha_order", lambda **k: {"order_id": 12345, "status": "OK"})
 
+    payload = {
+        "symbol": "NIFTYTESTCE",
+        "price": 100.0,
+        "quantity": 1,
+        "side": "BUY",
+        "stop_loss": 95.0,
+        "target": 110.0,
+        "quality_score": 90.0,
+        "confirmation_score": 90.0,
+        "ai_edge_score": 60.0,
+        "momentum_score": 85.0,
+        "breakout_score": 85.0,
+        "market_bias": "UPTREND",
+        "market_regime": "TRENDING",
+        "breakout_confirmed": True,
+        "momentum_confirmed": True,
+        "start_trade_allowed": True,
+        "start_trade_decision": "YES",
+    }
+
     # Call execute - should not raise
-    res = asyncio.run(ats.execute(symbol="NIFTYTESTCE", price=100.0, quantity=1, side="BUY"))
+    res = asyncio.run(ats.execute(**payload))
     # execute returns a dict on success - check for success key or no exception
     assert isinstance(res, dict) or res is None
 

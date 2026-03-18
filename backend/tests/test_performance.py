@@ -285,8 +285,9 @@ class TestConcurrentOperations:
 
         # Should complete in < 0.5 seconds
         assert duration < 0.5
-        # Expect about 150 trades (from 70-99 range)
-        assert 140 < len(high_quality) < 160
+        # Values cycle from 30-99 (70 values), and 30 of those are >= 70.
+        # For 500 rows this yields ~214 matches (observed around 210 due cycle boundaries).
+        assert 200 < len(high_quality) < 220
 
 
 class TestMemoryEfficiency:
