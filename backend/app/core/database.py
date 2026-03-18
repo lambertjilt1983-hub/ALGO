@@ -66,8 +66,16 @@ def _sqlite_file_from_url(url: str) -> Path | None:
 
 def _resolve_database_url(settings) -> str:
     """Resolve primary DB URL from settings and common cloud aliases."""
+    placeholder_tokens = (
+        "YOUR_PRODUCTION_DB_HOST",
+        "user:password@",
+    )
+
+    def _is_placeholder(value: str) -> bool:
+        return any(token in value for token in placeholder_tokens)
+
     primary = str(getattr(settings, "DATABASE_URL", "") or "").strip()
-    if primary:
+    if primary and not _is_placeholder(primary):
         return primary
 
     # Defensive fallbacks for cloud providers / managed DB integrations.
@@ -79,7 +87,7 @@ def _resolve_database_url(settings) -> str:
         "RENDER_POSTGRES_INTERNAL_URL",
     ):
         value = str(os.getenv(key) or "").strip()
-        if value:
+        if value and not _is_placeholder(value):
             return value
     return ""
 
