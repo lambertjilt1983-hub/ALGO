@@ -1162,6 +1162,8 @@ const AutoTradingDashboard = () => {
   const paperRejectCooldownRef = React.useRef(new Map());
   const paperCreateInFlightRef = React.useRef(new Set());
   const paperGlobalRejectUntilRef = React.useRef(0);
+  const executeRejectCooldownRef = React.useRef(new Map());
+  const executeGlobalRejectUntilRef = React.useRef(0);
   const liveRiskRejectCooldownRef = React.useRef(new Map());
   const liveGlobalRejectUntilRef = React.useRef(0);
   const liveBalanceBackoffUntilRef = React.useRef(0);
@@ -3196,6 +3198,7 @@ const AutoTradingDashboard = () => {
     if (autoBatchExecutingRef.current) return;
     const nowMs = Date.now();
     if (isLiveMode && liveGlobalRejectUntilRef.current > nowMs) return;
+    if (executeGlobalRejectUntilRef.current > nowMs) return;
 
     const sourceSignals = sortedQualityTrades.length > 0
       ? sortedQualityTrades
@@ -3271,10 +3274,14 @@ const AutoTradingDashboard = () => {
     for (const c of executableCandidates) {
       const root = symbolRoot(c?.symbol);
       const leg = optionLeg(c);
+      const side = String(c?.action || 'BUY').toUpperCase();
       const lane = `${root}:${leg}`;
+      const executeLaneKey = `${lane}:${side}`;
       if (!root) continue;
       if (openLanes.has(lane)) continue; // avoid retrying same root+leg while open
       if (seenLanes.has(lane)) continue; // don't start two trades on same root+leg in same batch
+      const executeRejectUntil = Number(executeRejectCooldownRef.current.get(executeLaneKey) || 0);
+      if (executeRejectUntil > nowMs) continue;
       if (isLiveMode) {
         const rootRejectUntil = Number(liveRiskRejectCooldownRef.current.get(root) || 0);
         if (rootRejectUntil > nowMs) continue;
@@ -3326,6 +3333,15 @@ const AutoTradingDashboard = () => {
 
     let normalizedSignal = enrichSignalWithAiMetrics(signal);
     const lotUnitQty = normalizeTradeQuantity(getSignalBaseQuantity(normalizedSignal));
+    const signalSide = String(normalizedSignal?.action || 'BUY').toUpperCase();
+    const signalLeg = (() => {
+      const fromType = String(normalizedSignal?.option_type || normalizedSignal?.optionType || '').toUpperCase();
+      if (fromType === 'CE' || fromType === 'PE') return fromType;
+      const sym = String(normalizedSignal?.symbol || '').toUpperCase();
+      if (sym.endsWith('CE')) return 'CE';
+      if (sym.endsWith('PE')) return 'PE';
+      return 'NA';
+    })();
 
     const modeLossControl = getModeLossControlState(isLiveMode ? 'LIVE' : 'DEMO');
     if (modeLossControl.active && !manualStart) {
@@ -3352,6 +3368,46 @@ const AutoTradingDashboard = () => {
     }
 
     const signalRoot = getUnderlyingRoot(normalizedSignal);
+    const executeLaneKey = `${signalRoot}:${signalLeg}:${signalSide}`;
+    const applyExecuteRejectCooldown = ({
+      reason = '',
+      remainingSeconds = 0,
+      isRateLimit = false,
+    } = {}) => {
+      const reasonText = String(reason || '').toLowerCase();
+      let cooldownMs = 0;
+      const parsedRemaining = Number(remainingSeconds || 0);
+      if (Number.isFinite(parsedRemaining) && parsedRemaining > 0) {
+        cooldownMs = Math.max(cooldownMs, parsedRemaining * 1000);
+      }
+      if (reasonText.includes('same_move_reentry_guard') || reasonText.includes('same-move re-entry')) {
+        cooldownMs = Math.max(cooldownMs, 60000);
+      }
+      if (isRateLimit) {
+        cooldownMs = Math.max(cooldownMs, 30000);
+      }
+      if (cooldownMs <= 0) return;
+
+      const now = Date.now();
+      const until = now + cooldownMs;
+      executeRejectCooldownRef.current.set(executeLaneKey, until);
+      executeGlobalRejectUntilRef.current = Math.max(
+        Number(executeGlobalRejectUntilRef.current || 0),
+        now + Math.min(cooldownMs, 20000),
+      );
+      const seconds = Math.max(1, Math.round(cooldownMs / 1000));
+      logDeduped(
+        `execute:reject_cooldown:${executeLaneKey}`,
+        `⏸️ Entry retry paused for ${seconds}s: ${normalizedSignal?.symbol} (${reason || 'server reject'})`,
+        { burstWindowMs: 60000, flushDelayMs: 1200, emitFirst: false },
+      );
+    };
+
+    const preRejectUntil = Number(executeRejectCooldownRef.current.get(executeLaneKey) || 0);
+    if (!manualStart && preRejectUntil > Date.now()) {
+      return;
+    }
+
     if (isLiveMode && !manualStart) {
       const nowMs = Date.now();
       const globalRejectUntil = Number(liveGlobalRejectUntilRef.current || 0);
@@ -3620,9 +3676,19 @@ const AutoTradingDashboard = () => {
         const data = await response.json();
         if (data && data.success === false) {
           let errorMsg = `Failed to execute trade.\nReason: ${data.message || 'Broker rejected order.'}`;
+          const detailObj = (data && typeof data.detail === 'object' && data.detail !== null) ? data.detail : null;
+          const reasonCode = String(detailObj?.reason || data?.reason || data?.message || '').toUpperCase();
+          const remainingSeconds = Number(detailObj?.remaining_seconds ?? data?.remaining_seconds ?? 0);
           if (data.detail) {
             const detailText = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail);
             errorMsg += `\nDetail: ${detailText}`;
+          }
+          if (reasonCode === 'SAME_MOVE_REENTRY_GUARD') {
+            applyExecuteRejectCooldown({
+              reason: reasonCode,
+              remainingSeconds,
+              isRateLimit: false,
+            });
           }
           console.error(`❌ TRADE EXECUTION FAILED: ${errorMsg}`);
           console.log(`♻️ AUTO-TRADING REMAINS ACTIVE: Will retry when conditions improve`);
@@ -3674,6 +3740,8 @@ const AutoTradingDashboard = () => {
         let errorMsg = 'Failed to execute trade.';
         let shouldStopAutoTrading = false;
         let cooldownMinutes = 0;
+        let serverReasonCode = '';
+        let serverRemainingSeconds = 0;
 
         // Keep auto-trading running for transient/server-side failures.
         // Only disarm automatically for explicit auth failures or hard risk locks.
@@ -3683,6 +3751,9 @@ const AutoTradingDashboard = () => {
         
         try {
           const errData = await response.json();
+          const detailObj = (errData && typeof errData.detail === 'object' && errData.detail !== null) ? errData.detail : null;
+          serverReasonCode = String(detailObj?.reason || errData?.reason || '').toUpperCase();
+          serverRemainingSeconds = Number(detailObj?.remaining_seconds ?? errData?.remaining_seconds ?? 0);
           if (errData.message) errorMsg += '\nReason: ' + errData.message;
           if (errData.detail) {
             const detailText = typeof errData.detail === 'string'
@@ -3805,8 +3876,29 @@ const AutoTradingDashboard = () => {
                 emitFirst: false,
               });
             }
+
+            if (
+              response.status === 429
+              || serverReasonCode === 'SAME_MOVE_REENTRY_GUARD'
+              || detailLower.includes('same-move re-entry')
+              || detailLower.includes('too many requests')
+            ) {
+              applyExecuteRejectCooldown({
+                reason: serverReasonCode || detailLower || `http_${response.status}`,
+                remainingSeconds: serverRemainingSeconds,
+                isRateLimit: response.status === 429,
+              });
+            }
           }
         } catch {}
+
+        if (response.status === 429 && !serverReasonCode) {
+          applyExecuteRejectCooldown({
+            reason: 'HTTP_429_RATE_LIMIT',
+            remainingSeconds: serverRemainingSeconds,
+            isRateLimit: true,
+          });
+        }
         
         console.error(`❌ TRADE EXECUTION FAILED: ${errorMsg}`);
         
