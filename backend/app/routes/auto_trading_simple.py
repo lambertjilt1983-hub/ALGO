@@ -34,6 +34,7 @@ async def start_auto_close_trades():
 import math
 import time
 import asyncio
+import os
 import re
 import uuid
 import pandas as pd
