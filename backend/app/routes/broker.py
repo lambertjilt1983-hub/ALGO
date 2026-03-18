@@ -214,9 +214,11 @@ async def zerodha_oauth_login(
             detail="Broker credential not found"
         )
     
-    # Decrypt API key before using it
+    # Decrypt API key before using it, fallback to environment if not set in DB
+    decrypted_api_key = None
     try:
-        decrypted_api_key = encryption_manager.decrypt_credentials(credential.api_key)
+        if credential.api_key:
+            decrypted_api_key = encryption_manager.decrypt_credentials(credential.api_key)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -227,6 +229,16 @@ async def zerodha_oauth_login(
     # Use the frontend URL from config
     settings = get_settings()
     redirect_uri = settings.FRONTEND_URL
+    
+    # Fallback to environment ZERODHA_API_KEY if not stored in credential
+    if not decrypted_api_key:
+        decrypted_api_key = settings.ZERODHA_API_KEY
+    
+    if not decrypted_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="API key not found. Please add Zerodha credentials with API key, or set ZERODHA_API_KEY environment variable."
+        )
     
     # Store broker_id in state parameter to identify the callback
     state = f"{user_id}:{broker_id}"
@@ -437,15 +449,35 @@ async def zerodha_oauth_callback(
         print(f"Found broker: ID={credential.id}, Name={credential.broker_name}, User={user_id}")
         
         if not credential.api_key or not credential.api_secret:
-            print("ERROR: Missing API credentials!")
-            return {"status": "error", "message": "Missing API credentials"}
+            print("WARNING: Missing API credentials in DB, attempting to use environment variables...")
+            settings = get_settings()
+            if not settings.ZERODHA_API_KEY or not settings.ZERODHA_API_SECRET:
+                print("ERROR: Missing API credentials!")
+                return {"status": "error", "message": "API credentials not found. Please configure Zerodha credentials in your account or set environment variables."}
+        else:
+            settings = get_settings()
+        
+        # Decrypt credentials (fallback to environment if not set in DB)
+        try:
+            decrypted_api_key = encryption_manager.decrypt_credentials(credential.api_key) if credential.api_key else None
+            decrypted_api_secret = encryption_manager.decrypt_credentials(credential.api_secret) if credential.api_secret else None
+        except Exception as e:
+            print(f"ERROR decrypting credentials: {str(e)}")
+            settings = get_settings()
+            decrypted_api_key = None
+            decrypted_api_secret = None
+        
+        # Use environment fallback if DB values are empty
+        decrypted_api_key = decrypted_api_key or settings.ZERODHA_API_KEY
+        decrypted_api_secret = decrypted_api_secret or settings.ZERODHA_API_SECRET
+        
+        if not decrypted_api_key or not decrypted_api_secret:
+            print("ERROR: Unable to resolve API key/secret from DB or environment!")
+            return {"status": "error", "message": "API credentials not available"}
+        
+        print(f"Using API key: {decrypted_api_key[:10]}...")
         
         # Decrypt credentials
-        decrypted_api_key = encryption_manager.decrypt_credentials(credential.api_key)
-        decrypted_api_secret = encryption_manager.decrypt_credentials(credential.api_secret)
-        print(f"Decrypted API key: {decrypted_api_key[:10]}...")
-        
-        # Initialize KiteConnect with decrypted credentials
         kite = KiteConnect(api_key=decrypted_api_key)
         
         # Exchange request token for access token
