@@ -289,6 +289,37 @@ active_trades: List[Dict] = []
 history: List[Dict] = []
 broker_logs: List[Dict] = []
 live_price_cache: Dict[str, float] = {}
+
+# Memory guards for long-running Render instances (512MB plans).
+MAX_ACTIVE_TRADES_IN_MEMORY = max(50, int(os.getenv("MAX_ACTIVE_TRADES_IN_MEMORY", "500") or 500))
+MAX_HISTORY_IN_MEMORY = max(200, int(os.getenv("MAX_HISTORY_IN_MEMORY", "2000") or 2000))
+MAX_BROKER_LOGS_IN_MEMORY = max(100, int(os.getenv("MAX_BROKER_LOGS_IN_MEMORY", "500") or 500))
+MAX_COOLDOWN_KEYS_IN_MEMORY = max(100, int(os.getenv("MAX_COOLDOWN_KEYS_IN_MEMORY", "2000") or 2000))
+MAX_REENTRY_CONTEXTS_IN_MEMORY = max(100, int(os.getenv("MAX_REENTRY_CONTEXTS_IN_MEMORY", "2000") or 2000))
+MAX_PRICE_CACHE_IN_MEMORY = max(100, int(os.getenv("MAX_PRICE_CACHE_IN_MEMORY", "4000") or 4000))
+
+
+def _trim_list_in_place(items: List[Any], max_len: int) -> None:
+    try:
+        if max_len > 0 and len(items) > max_len:
+            del items[:-max_len]
+    except Exception:
+        pass
+
+
+def _trim_dict_in_place(mapping: Dict[str, Any], max_len: int) -> None:
+    """Trim oldest dict keys when size exceeds configured bound."""
+    try:
+        if max_len <= 0:
+            return
+        overflow = len(mapping) - max_len
+        if overflow <= 0:
+            return
+        for key in list(mapping.keys())[:overflow]:
+            mapping.pop(key, None)
+    except Exception:
+        pass
+
 live_update_state = {
     "failure_count": 0,
     "backoff_until": 0.0,
@@ -704,6 +735,7 @@ def _record_sl_cooldown(symbol: str | None, side: str | None, at: Optional[datet
             "symbol": symbol,
             "side": (side or "BUY").upper(),
         }
+    _trim_dict_in_place(cooldowns, MAX_COOLDOWN_KEYS_IN_MEMORY)
 
 
 
@@ -836,6 +868,7 @@ def _record_recent_exit_context(trade: Dict[str, Any], at: Optional[datetime] = 
     contexts = state.setdefault("recent_exit_contexts", {})
     for key in _reentry_keys_for_trade(context.get("symbol"), context.get("side")):
         contexts[key] = context
+    _trim_dict_in_place(contexts, MAX_REENTRY_CONTEXTS_IN_MEMORY)
 
 
 def _same_move_reentry_info(ai_context: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
@@ -1963,6 +1996,7 @@ def _close_trade(trade: Dict[str, Any], exit_price: float) -> None:
             _record_sl_cooldown(trade.get("symbol") or trade.get("index"), side, exit_dt)
         _record_recent_exit_context(trade, exit_dt)
         history.append(trade.copy())
+        _trim_list_in_place(history, MAX_HISTORY_IN_MEMORY)
 
         # Track daily P&L and consecutive losses
         if trade_mode == "LIVE":
@@ -3939,6 +3973,7 @@ async def execute(
             trade_obj["broker_order_id"] = None
             demo_trades.append(trade_obj)
             active_trades.append(trade_obj)
+            _trim_list_in_place(active_trades, MAX_ACTIVE_TRADES_IN_MEMORY)
             _upsert_active_trade_record(trade_obj)
             broker_response = {"simulated": True}
             print(f"[API /execute] ℹ Demo trade started for {trade_obj.get('symbol')} qty={trade_obj.get('quantity')}")
@@ -3977,6 +4012,7 @@ async def execute(
                 trade_obj["broker_order_id"] = real_order.get("order_id") or real_order.get("broker_order_id")
                 trade_obj["broker_response"] = real_order
                 active_trades.append(trade_obj)
+                _trim_list_in_place(active_trades, MAX_ACTIVE_TRADES_IN_MEMORY)
                 _upsert_active_trade_record(trade_obj)
             else:
                 print(f"[API /execute] ✗ Zerodha order REJECTED - Error: {real_order.get('error', 'Unknown')}")
@@ -3987,6 +4023,8 @@ async def execute(
                 }
 
         broker_logs.append({"trade": trade_obj, "response": broker_response})
+        _trim_list_in_place(broker_logs, MAX_BROKER_LOGS_IN_MEMORY)
+        _trim_dict_in_place(live_price_cache, MAX_PRICE_CACHE_IN_MEMORY)
 
         # Ensure all response values are JSON-serializable
         try:
