@@ -359,6 +359,37 @@ def _resolve_report_trade_mode(meta: Optional[Dict[str, Any]], default: str = "D
     return _normalize_trade_mode(default, default="DEMO")
 
 
+def _allow_synthetic_trades() -> bool:
+    return str(os.getenv("ALLOW_SYNTHETIC_TRADES") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_synthetic_trade_symbol(symbol: Any) -> bool:
+    text = str(symbol or "").strip().upper()
+    if not text:
+        return False
+
+    normalized = text[4:] if text.startswith("NFO:") else text
+    if normalized.startswith("SIM:"):
+        return True
+    if normalized in {"TST", "TEST", "TEST1"}:
+        return True
+    if normalized.startswith("TEST"):
+        return True
+    if normalized.startswith("STREAM"):
+        return True
+    if "_CHECK" in normalized:
+        return True
+    if "TEST" in normalized and ("NIFTY" in normalized or "BANKNIFTY" in normalized):
+        return True
+    return False
+
+
+def _include_trade_in_runtime(trade: Dict[str, Any]) -> bool:
+    if _allow_synthetic_trades():
+        return True
+    return not _is_synthetic_trade_symbol((trade or {}).get("symbol"))
+
+
 def _sync_active_trades_from_db() -> None:
     """Load active OPEN trades from DB into in-memory state for runtime logic."""
     db = SessionLocal()
@@ -379,6 +410,8 @@ def _sync_active_trades_from_db() -> None:
             payload.setdefault("trade_mode", row.trade_mode)
             if row.entry_time and not payload.get("entry_time"):
                 payload["entry_time"] = row.entry_time.isoformat()
+            if not _include_trade_in_runtime(payload):
+                continue
             loaded.append(payload)
         active_trades[:] = loaded
     except Exception as e:
@@ -401,25 +434,26 @@ def _sync_history_from_db(limit: int = 500) -> None:
         for row in reversed(rows):
             meta = dict(row.meta or {})
             row_mode = _resolve_report_trade_mode(meta, default="DEMO")
-            loaded.append(
-                {
-                    "id": row.id,
-                    "symbol": row.symbol,
-                    "side": row.side,
-                    "quantity": row.quantity,
-                    "entry_price": row.entry_price,
-                    "exit_price": row.exit_price,
-                    "pnl": row.pnl,
-                    "pnl_percentage": row.pnl_percentage,
-                    "strategy": row.strategy,
-                    "status": row.status,
-                    "entry_time": row.entry_time.isoformat() if row.entry_time else None,
-                    "exit_time": row.exit_time.isoformat() if row.exit_time else None,
-                    "trading_date": row.trading_date,
-                    "trade_mode": row_mode,
-                    **meta,
-                }
-            )
+            payload = {
+                "id": row.id,
+                "symbol": row.symbol,
+                "side": row.side,
+                "quantity": row.quantity,
+                "entry_price": row.entry_price,
+                "exit_price": row.exit_price,
+                "pnl": row.pnl,
+                "pnl_percentage": row.pnl_percentage,
+                "strategy": row.strategy,
+                "status": row.status,
+                "entry_time": row.entry_time.isoformat() if row.entry_time else None,
+                "exit_time": row.exit_time.isoformat() if row.exit_time else None,
+                "trading_date": row.trading_date,
+                "trade_mode": row_mode,
+                **meta,
+            }
+            if not _include_trade_in_runtime(payload):
+                continue
+            loaded.append(payload)
         history[:] = loaded
     except Exception as e:
         print(f"[HISTORY_SYNC] Failed to load trade history from DB: {e}")
@@ -1101,6 +1135,8 @@ def _count_daily_trades(db_session=None) -> int:
     
     count = 0
     for trade in active_trades:
+        if not _include_trade_in_runtime(trade):
+            continue
         mode = str(trade.get("trade_mode") or "LIVE").upper()
         if mode != "LIVE":
             continue
@@ -1112,6 +1148,8 @@ def _count_daily_trades(db_session=None) -> int:
             except Exception:
                 pass
     for trade in history:
+        if not _include_trade_in_runtime(trade):
+            continue
         mode = str(trade.get("trade_mode") or "LIVE").upper()
         if mode != "LIVE":
             continue
@@ -1156,6 +1194,8 @@ def _count_consecutive_sl_hits(db_session=None) -> int:
     # Get today's closed trades, newest first
     today_trades = []
     for trade in history:
+        if not _include_trade_in_runtime(trade):
+            continue
         mode = str(trade.get("trade_mode") or "LIVE").upper()
         if mode != "LIVE":
             continue
@@ -1218,6 +1258,8 @@ def _get_daily_pnl(db_session=None) -> float:
     
     # Add P&L from closed trades today
     for trade in history:
+        if not _include_trade_in_runtime(trade):
+            continue
         mode = str(trade.get("trade_mode") or "LIVE").upper()
         if mode != "LIVE":
             continue
@@ -1231,6 +1273,8 @@ def _get_daily_pnl(db_session=None) -> float:
     
     # Add unrealized P&L from open trades today
     for trade in active_trades:
+        if not _include_trade_in_runtime(trade):
+            continue
         mode = str(trade.get("trade_mode") or "LIVE").upper()
         if mode != "LIVE":
             continue
@@ -1281,7 +1325,10 @@ def _should_allow_new_trade(db_session=None) -> Tuple[bool, Optional[str]] | boo
 
 
 def _recent_win_rate(limit: int = 20) -> Tuple[float, int]:
-    closed = [t for t in history if str(t.get("trade_mode") or "LIVE").upper() == "LIVE"][-limit:]
+    closed = [
+        t for t in history
+        if _include_trade_in_runtime(t) and str(t.get("trade_mode") or "LIVE").upper() == "LIVE"
+    ][-limit:]
     if not closed:
         return 1.0, 0
     wins = sum(1 for t in closed if t.get("pnl", 0) > 0)
@@ -1300,6 +1347,8 @@ def _capital_in_use(mode: Optional[str] = None) -> float:
     mode_filter = str(mode or "").upper()
     total = 0.0
     for t in active_trades:
+        if not _include_trade_in_runtime(t):
+            continue
         if t.get("status") == "OPEN":
             trade_mode = str(t.get("trade_mode") or "LIVE").upper()
             if mode_filter in {"LIVE", "DEMO", "PAPER"}:
@@ -3937,7 +3986,7 @@ async def execute(
 async def get_active_trades(authorization: Optional[str] = Header(None)):
     _sync_active_trades_from_db()
     print(f"[API /trades/active] Returning {len(active_trades)} active trades from Zerodha")
-    trades = [normalize_active_trade_metrics(trade) for trade in active_trades]
+    trades = [normalize_active_trade_metrics(trade) for trade in active_trades if _include_trade_in_runtime(trade)]
     active_trades[:] = trades
     return {"trades": trades, "is_demo_mode": bool(state.get("is_demo_mode", False)), "count": len(trades)}
 
@@ -4207,6 +4256,9 @@ async def get_trade_history(
     for row in rows:
         meta = dict(row.meta or {})
         row_mode = _resolve_report_trade_mode(meta, default="DEMO")
+        row_symbol = str(row.symbol or "")
+        if not _allow_synthetic_trades() and _is_synthetic_trade_symbol(row_symbol):
+            continue
         if selected_mode in {"LIVE", "DEMO"} and row_mode != selected_mode:
             continue
         
@@ -4271,6 +4323,7 @@ async def trade_report(
     filtered = [
         t
         for t in history
+        if _include_trade_in_runtime(t)
         if start_dt <= (t.get("trading_date") or today) <= end_dt
         and (
             selected_mode not in {"LIVE", "DEMO"}
