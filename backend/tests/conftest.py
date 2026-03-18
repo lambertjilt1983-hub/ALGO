@@ -16,13 +16,14 @@ from app.models.trading import PaperTrade, TradeReport
 from app.models.auth import User, BrokerCredential
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def test_db_engine():
-    """Create in-memory SQLite database for testing."""
+    """Create isolated in-memory SQLite database for each test."""
     engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
     yield engine
     Base.metadata.drop_all(engine)
+    engine.dispose()
 
 
 @pytest.fixture
@@ -38,7 +39,6 @@ def db_session(test_db_engine):
 def sample_user(db_session):
     """Create a sample user for testing."""
     user = User(
-        id="test_user_1",
         email="test@example.com",
         username="testuser",
         hashed_password="hashedpassword123",
@@ -56,12 +56,12 @@ def sample_broker_credential(db_session, sample_user):
     cred = BrokerCredential(
         user_id=sample_user.id,
         broker_name="zerodha",
+        api_key="test_api_key",
+        api_secret="test_api_secret",
         access_token="test_token_123",
         refresh_token="test_refresh_123",
-        client_id="test_client",
-        secret_key="test_secret",
         created_at=datetime.utcnow(),
-        expires_at=datetime.utcnow() + timedelta(hours=24),
+        token_expiry=datetime.utcnow() + timedelta(hours=24),
     )
     db_session.add(cred)
     db_session.commit()

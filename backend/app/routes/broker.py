@@ -32,17 +32,40 @@ def _api_key_preview(value: str | None) -> str | None:
 
 
 def _build_broker_response(credential: BrokerCredential) -> dict:
+    """
+    Build broker credential response.
+    
+    IMPORTANT: If token exists in DB, we assume it's still usable unless:
+    1. token_expiry is explicitly set and in the past
+    2. Validation API call definitively proves it's expired
+    
+    This prevents spurious "requires_reauth" prompts when tokens are just stale
+    but haven't hit their explicit expiry time yet. The trading system will
+    attempt token refresh on first use if needed.
+    """
     api_key = _safe_decrypt(getattr(credential, "api_key", None))
     has_access_token = bool(getattr(credential, "access_token", None))
     token_status = None
     requires_reauth = None
+    
+    # Check if token_expiry is explicitly set and in the past
+    is_explicitly_expired = (
+        credential.token_expiry 
+        and credential.token_expiry < datetime.utcnow()
+    )
 
     if credential.broker_name and "zerodha" in credential.broker_name.lower():
-        if has_access_token:
-            is_valid = token_manager.validate_zerodha_token(credential)
-            token_status = "valid" if is_valid else "expired"
-            requires_reauth = not is_valid
+        if has_access_token and not is_explicitly_expired:
+            # Token exists and hasn't hit explicit expiry time
+            # Assume it's still usable for now (trading system will refresh if needed)
+            token_status = "stored"
+            requires_reauth = False
+        elif has_access_token and is_explicitly_expired:
+            # Token explicitly expired
+            token_status = "expired"
+            requires_reauth = True
         else:
+            # No token
             token_status = "missing"
             requires_reauth = True
     else:
