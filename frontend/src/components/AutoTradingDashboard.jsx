@@ -140,20 +140,13 @@ const ALWAYS_FETCH_TRADES = true;
 const formatTimeIST = (dateString) => {
   if (!dateString) return '--';
   try {
-    // Handle backend responses that already include timezone (+05:30)
-    // Only add 'Z' if no timezone indicator present AND not already IST offset
     let s = dateString;
     const hasTimezoneIndicator = /[Zz]|[+-]\d{2}:?\d{2}/.test(s);
-    const isIST = /[+-]05:?30/.test(s);  // Already IST offset
-    
-    // If no timezone: assume it's naive UTC, add Z
-    // If already IST offset: convert back to UTC equivalent for parsing, then format as IST
+    // If no timezone info: DB stored naive UTC — append Z so Date() parses it as UTC.
+    // If already has offset (e.g. +05:30 from backend _now()): Date() handles it correctly.
+    // Do NOT strip +05:30 — that was shifting times by +5:30 a second time.
     if (!hasTimezoneIndicator) {
-      s = s + 'Z';  // Treat as UTC (database stored time, not timezone-aware)
-    } else if (isIST) {
-      // Already has IST offset, convert to UTC for Date parsing
-      // Remove +05:30 and add Z so Date can parse it correctly
-      s = s.replace(/[+-]05:?30/, 'Z');
+      s = s + 'Z';
     }
     
     const date = new Date(s);
