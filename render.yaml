@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: algo-backend
+    runtime: python
+    plan: starter
+    rootDir: .
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: algo-postgres
+          property: connectionString
+      - key: SECRET_KEY
+        generateValue: true
+      - key: FERNET_KEY
+        sync: false
+      - key: ZERODHA_API_KEY
+        sync: false
+      - key: ZERODHA_API_SECRET
+        sync: false
+      - key: ZERODHA_REDIRECT_URL
+        value: https://algo-mlcb.onrender.com/brokers/zerodha/callback
+      - key: FRONTEND_URL
+        value: https://algo-theta-nine.vercel.app
+      - key: FRONTEND_ALT_URL
+        value: https://algo-theta-nine.vercel.app
+      - key: ALLOWED_ORIGINS
+        value: https://algo-theta-nine.vercel.app
+
+databases:
+  - name: algo-postgres
+    databaseName: algo
+    user: algo
+    plan: starter
