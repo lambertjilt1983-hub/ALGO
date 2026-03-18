@@ -1877,8 +1877,8 @@ const AutoTradingDashboard = () => {
     historyLastModeRef.current = isLiveMode;
 
     const modeParam = isLiveMode ? 'LIVE' : 'DEMO';
-    const historyUrl = `${AUTO_TRADE_HISTORY_API}?mode=${modeParam}&limit=50`;
-    const perfUrl = `${AUTO_TRADE_REPORT_API}?mode=${modeParam}&limit=500`;
+    const historyUrl = `${AUTO_TRADE_HISTORY_API}?mode=ALL&limit=200`;
+    const perfUrl = `${AUTO_TRADE_REPORT_API}?mode=ALL&limit=500`;
 
     const pageHidden = typeof document !== 'undefined' && document.hidden;
     const shouldFetchSlowEndpoints = !pageHidden && (forceRefresh || (nowMs - Number(slowFetchCacheRef.current?.at || 0)) >= 10000);
@@ -2013,12 +2013,7 @@ const AutoTradingDashboard = () => {
         trade_source: String(t?.trade_source || 'autotrade').toLowerCase(),
       };
     });
-    const liveOnlyActive = liveActive.filter((t) => String(t?.trade_mode || '').toUpperCase() === 'LIVE');
-    const autoDemoActive = liveActive.filter((t) => {
-      const mode = String(t?.trade_mode || '').toUpperCase();
-      return mode === 'DEMO' || mode === 'PAPER';
-    });
-    const activeCandidates = isLiveMode ? liveOnlyActive : autoDemoActive;
+    const activeCandidates = liveActive;
     const history = historyData.trades || [];
     const backendStatus = statusData.status || statusData;
     const backendEnabled = Boolean(backendStatus?.enabled ?? statusData?.enabled ?? true);

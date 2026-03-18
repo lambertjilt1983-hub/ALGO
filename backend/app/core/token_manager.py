@@ -50,8 +50,9 @@ class TokenManager:
     @staticmethod
     def refresh_zerodha_token(broker_id: int, db: Session, request_token: str | None = None) -> dict:
         """
-        Exchange Zerodha request_token for a new access_token and persist it.
-        If request_token not provided, uses stored refresh_token column as the request token.
+        Refresh Zerodha access token and persist it.
+        - If request_token is provided, perform OAuth session exchange (generate_session).
+        - Else, attempt refresh-token flow (renew_access_token) using stored refresh_token.
         """
         try:
             credential = db.query(BrokerCredential).filter(
@@ -71,16 +72,11 @@ class TokenManager:
             if not decrypted_api_key or not decrypted_api_secret:
                 return {"status": "error", "message": "Unable to resolve API key/secret"}
 
-            # Determine request token source
-            stored_rt = credential.refresh_token
-            if stored_rt:
-                stored_rt = TokenManager._maybe_decrypt(stored_rt)
-
-            effective_request_token = request_token or stored_rt
-            if not effective_request_token:
+            stored_refresh_token = TokenManager._maybe_decrypt(credential.refresh_token)
+            if not request_token and not stored_refresh_token:
                 return {
                     "status": "requires_reauth",
-                    "message": "Request token missing. Please complete Zerodha login.",
+                    "message": "No refresh token available. Please complete Zerodha login.",
                     "broker_id": broker_id,
                     "action": "redirect_to_zerodha_login"
                 }
@@ -91,18 +87,38 @@ class TokenManager:
             })
 
             kite = KiteConnect(api_key=decrypted_api_key)
-            session = kite.generate_session(effective_request_token, api_secret=decrypted_api_secret)
-            new_access = session.get("access_token")
-            login_time = session.get("login_time")
+            new_refresh_token = None
+            login_time = None
+
+            if request_token:
+                session = kite.generate_session(request_token, api_secret=decrypted_api_secret)
+                new_access = session.get("access_token")
+                new_refresh_token = session.get("refresh_token")
+                login_time = session.get("login_time")
+            else:
+                renew = kite.renew_access_token(stored_refresh_token, api_secret=decrypted_api_secret)
+                if not isinstance(renew, dict):
+                    renew = {}
+                # Zerodha may return either access_token or new access_token in data depending SDK/version.
+                new_access = renew.get("access_token") or renew.get("data", {}).get("access_token")
+                new_refresh_token = renew.get("refresh_token") or renew.get("data", {}).get("refresh_token") or stored_refresh_token
 
             if not new_access:
                 return {"status": "error", "message": "No access token returned from Zerodha"}
 
             # Persist encrypted tokens
             credential.access_token = encryption_manager.encrypt_credentials(new_access)
-            if request_token:
-                credential.refresh_token = encryption_manager.encrypt_credentials(request_token)
-            credential.token_expiry = None  # Zerodha tokens are day-scoped; expiry managed by validation
+            if new_refresh_token:
+                credential.refresh_token = encryption_manager.encrypt_credentials(new_refresh_token)
+
+            # Zerodha access token is day-scoped; keep a practical DB expiry for fast checks.
+            now = datetime.utcnow()
+            if isinstance(login_time, datetime):
+                # End-of-day guard (~24h from login with small safety margin).
+                credential.token_expiry = login_time + timedelta(hours=23, minutes=50)
+            else:
+                credential.token_expiry = now + timedelta(hours=23, minutes=50)
+
             db.add(credential)
             db.commit()
             db.refresh(credential)
@@ -113,6 +129,7 @@ class TokenManager:
                 "broker_id": broker_id,
                 "access_token_last4": new_access[-4:],
                 "login_time": login_time.isoformat() if login_time else None,
+                "has_refresh_token": bool(new_refresh_token),
             }
 
         except Exception as e:

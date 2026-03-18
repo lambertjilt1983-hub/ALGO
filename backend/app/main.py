@@ -5,7 +5,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 import traceback
 from app.routes import auth, broker, orders, strategies, market_intelligence, auto_trading_simple, test_market, token_refresh, admin, option_signals, zerodha_postback, paper_trading
-from app.core.database import Base, engine, SessionLocal
+from app.core.database import Base, engine, SessionLocal, bootstrap_sqlite_trade_data_if_needed, db_url
 from app.core.config import get_settings
 from app.core.background_tasks import start_background_tasks, stop_background_tasks
 from app import brokers  # Import brokers to trigger registration
@@ -16,6 +16,13 @@ try:
     Base.metadata.create_all(bind=engine)
 except Exception as e:
     print(f"Warning: Could not create tables: {e}")
+
+try:
+    bootstrap_result = bootstrap_sqlite_trade_data_if_needed()
+    print(f"[STARTUP] DB URL: {db_url}")
+    print(f"[STARTUP] SQLite bootstrap: {bootstrap_result}")
+except Exception as e:
+    print(f"[STARTUP] SQLite bootstrap check failed: {e}")
 
 
 # --- FastAPI lifespan event handler (replaces deprecated on_event) ---

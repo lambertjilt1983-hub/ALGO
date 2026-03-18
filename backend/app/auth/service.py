@@ -450,7 +450,7 @@ class BrokerAuthService:
         ).first()
         
         if credential:
-            credential.access_token = access_token
+            credential.access_token = encryption_manager.encrypt_credentials(access_token)
             if refresh_token:
                 credential.refresh_token = encryption_manager.encrypt_credentials(refresh_token)
             credential.token_expiry = token_expiry

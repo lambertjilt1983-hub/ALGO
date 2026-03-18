@@ -4067,7 +4067,7 @@ async def debug_source():
 @router.get("/trades/history")
 async def get_trade_history(
     limit: int = 50,
-    mode: str = "LIVE",
+    mode: str = "ALL",
     authorization: Optional[str] = Header(None),
 ):
     selected_mode = str(mode or "LIVE").strip().upper()
@@ -4118,7 +4118,7 @@ async def get_trade_history(
 async def trade_report(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    mode: str = "LIVE",
+    mode: str = "ALL",
     limit: int = 500,
     authorization: Optional[str] = Header(None),
 ):

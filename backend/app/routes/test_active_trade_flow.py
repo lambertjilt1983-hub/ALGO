@@ -4,6 +4,8 @@ import sys
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from app.core.database import SessionLocal
+from app.models.trading import ActiveTrade
 
 from app.routes.auto_trading_simple import (
     active_trades,
@@ -22,12 +24,30 @@ def reset_state():
     # clear trades and history before each test
     active_trades.clear()
     history.clear()
+    db = SessionLocal()
+    try:
+        try:
+            db.query(ActiveTrade).delete()
+            db.commit()
+        except Exception:
+            db.rollback()
+    finally:
+        db.close()
     # default demo mode
     state["is_demo_mode"] = True
     state["live_armed"] = False
     yield
     active_trades.clear()
     history.clear()
+    db = SessionLocal()
+    try:
+        try:
+            db.query(ActiveTrade).delete()
+            db.commit()
+        except Exception:
+            db.rollback()
+    finally:
+        db.close()
 
 
 def test_demo_trade_execution_and_active_api():
@@ -349,3 +369,148 @@ def test_demo_trade_history_mode_not_mislabeled_live(monkeypatch):
     assert live_history.status_code == 200
     live_trades = live_history.json().get("trades", [])
     assert all(t.get("symbol") != symbol for t in live_trades)
+
+
+def test_active_trades_endpoint_shows_live_and_demo_modes(monkeypatch):
+    active_trades.clear()
+    history.clear()
+    state["is_demo_mode"] = True
+    state["live_armed"] = False
+
+    # Keep this unit test DB-independent: bypass DB sync and seed in-memory rows.
+    monkeypatch.setattr("app.routes.auto_trading_simple._sync_active_trades_from_db", lambda: None)
+    active_trades.extend(
+        [
+            {
+                "id": 1001,
+                "symbol": "DEMO_ACTIVE_MODE_CHECK",
+                "side": "BUY",
+                "price": 100.0,
+                "entry_price": 100.0,
+                "current_price": 101.0,
+                "quantity": 1,
+                "status": "OPEN",
+                "trade_mode": "DEMO",
+            },
+            {
+                "id": 1002,
+                "symbol": "LIVE_ACTIVE_MODE_CHECK",
+                "side": "BUY",
+                "price": 200.0,
+                "entry_price": 200.0,
+                "current_price": 201.0,
+                "quantity": 1,
+                "status": "OPEN",
+                "trade_mode": "LIVE",
+            },
+        ]
+    )
+
+    app = FastAPI()
+    from app.routes.auto_trading_simple import router as at_router
+    app.include_router(at_router, prefix="/autotrade")
+    client = TestClient(app)
+
+    resp = client.get("/autotrade/trades/active")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body.get("count") == 2
+
+    modes = {str(t.get("trade_mode", "")).upper() for t in body.get("trades", [])}
+    assert "DEMO" in modes
+    assert "LIVE" in modes
+
+
+def test_trade_history_mode_filters_live_and_demo_end_to_end(monkeypatch):
+    active_trades.clear()
+    history.clear()
+    state["symbol_cooldowns"] = {}
+    state["recent_exit_contexts"] = {}
+
+    app = FastAPI()
+    from app.routes.auto_trading_simple import router as at_router
+    app.include_router(at_router, prefix="/autotrade")
+    client = TestClient(app)
+
+    demo_symbol = "DEMO_HISTORY_FILTER_CHECK"
+    live_symbol = "LIVE_HISTORY_FILTER_CHECK"
+
+    # 1) Create and close a DEMO trade.
+    state["is_demo_mode"] = True
+    state["live_armed"] = False
+    demo_create = client.post(
+        "/autotrade/execute",
+        json={
+            "symbol": demo_symbol,
+            "price": 120.0,
+            "balance": 0,
+            "quantity": 1,
+            "side": "BUY",
+            "stop_loss": 115.0,
+            "target": 130.0,
+            "force_demo": True,
+        },
+    )
+    assert demo_create.status_code == 200
+    assert demo_create.json().get("is_demo_mode") is True
+
+    demo_close = client.post("/autotrade/trades/price", params={"symbol": demo_symbol, "price": 114.0})
+    assert demo_close.status_code == 200
+
+    # 2) Create and close a LIVE trade.
+    state["is_demo_mode"] = False
+    state["live_armed"] = True
+    monkeypatch.setattr("app.routes.auto_trading_simple._within_trade_window", lambda: True)
+    monkeypatch.setattr("app.routes.auto_trading_simple._require_multi_tick_confirmation", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        "app.routes.auto_trading_simple.place_zerodha_order",
+        lambda **kwargs: {"success": True, "order_id": "LIVE-HISTORY-1"},
+    )
+
+    live_create = client.post(
+        "/autotrade/execute",
+        json={
+            "symbol": live_symbol,
+            "price": 300.0,
+            "balance": 50000,
+            "quantity": 1,
+            "side": "BUY",
+            "stop_loss": 295.0,
+            "target": 310.0,
+            "broker_id": 1,
+            "quality_score": 90,
+            "confirmation_score": 90,
+            "ai_edge_score": 70,
+            "momentum_score": 70,
+            "breakout_score": 70,
+            "market_bias": "STRONG_ONE_SIDE",
+            "market_regime": "TRENDING",
+            "breakout_confirmed": True,
+            "momentum_confirmed": True,
+            "breakout_hold_confirmed": True,
+            "timing_risk": "NORMAL",
+            "sudden_news_risk": 5,
+            "liquidity_spike_risk": 5,
+            "premium_distortion_risk": 5,
+            "fake_breakout_by_candle": False,
+            "close_back_in_range": False,
+        },
+    )
+    assert live_create.status_code == 200
+    assert live_create.json().get("is_demo_mode") is False
+
+    live_close = client.post("/autotrade/trades/price", params={"symbol": live_symbol, "price": 294.0})
+    assert live_close.status_code == 200
+
+    # 3) Verify mode-filtered history.
+    demo_history = client.get("/autotrade/trades/history", params={"mode": "DEMO", "limit": 300})
+    assert demo_history.status_code == 200
+    demo_trades = demo_history.json().get("trades", [])
+    assert any(t.get("symbol") == demo_symbol for t in demo_trades)
+    assert all(t.get("symbol") != live_symbol for t in demo_trades)
+
+    live_history = client.get("/autotrade/trades/history", params={"mode": "LIVE", "limit": 300})
+    assert live_history.status_code == 200
+    live_trades = live_history.json().get("trades", [])
+    assert any(t.get("symbol") == live_symbol for t in live_trades)
+    assert all(t.get("symbol") != demo_symbol for t in live_trades)

@@ -123,7 +123,7 @@ export const useTokenRefresh = () => {
           tokenBackoffUntilRef.current = Date.now() + 20000;
           return;
         }
-        const results = data.results || [];
+        const results = Array.isArray(data?.brokers) ? data.brokers : [];
         
         // Check if any broker tokens need re-authentication
         const needsReauth = results.some(r => r.status === 'requires_reauth');

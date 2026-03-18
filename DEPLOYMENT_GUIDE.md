@@ -239,7 +239,9 @@ ls -l traefik/acme.json  # Should be 600
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| DATABASE_URL | PostgreSQL connection string | `postgresql://user:pass@host:5432/db` |
+| DATABASE_URL | PostgreSQL connection string (must be persistent in production) | `postgresql://user:pass@host:5432/db` |
+| ENVIRONMENT | Runtime environment (`production` enforces non-SQLite DB) | `production` |
+| SQLITE_BOOTSTRAP_PATH | Optional one-time SQLite source for bootstrapping old trade data into PostgreSQL | `/app/backend/local.db` |
 | SECRET_KEY | JWT signing key | Random 64-char string |
 | ENCRYPTION_KEY | Data encryption key | Random 32-char string |
 | CORS_ORIGINS | Allowed origins | `https://yourdomain.com` |

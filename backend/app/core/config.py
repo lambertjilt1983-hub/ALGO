@@ -1,6 +1,25 @@
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 import os
+from pathlib import Path
+
+
+_BACKEND_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _resolve_env_file() -> str:
+    env_file = os.environ.get("ENV_FILE", ".env")
+    if env_file == "env.qa":
+        env_file = ".env.qa"
+    elif env_file == "env.local":
+        env_file = ".env.local"
+
+    env_path = Path(env_file)
+    if not env_path.is_absolute():
+        candidate = (_BACKEND_ROOT / env_file).resolve()
+        if candidate.exists():
+            return str(candidate)
+    return str(env_path)
 
 class Settings(BaseSettings):
     """Application settings with environment variable support"""
@@ -52,13 +71,7 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: str = "http://localhost:3000"
     
     class Config:
-        env_file = os.environ.get("ENV_FILE", ".env")
-        if env_file == "env.qa":
-            env_file = ".env.qa"
-        elif env_file == "env.local":
-            env_file = ".env.local"
-        else:
-            env_file = ".env"
+        env_file = _resolve_env_file()
         case_sensitive = True
         extra = "ignore"  # Allow extra fields in .env file
 
