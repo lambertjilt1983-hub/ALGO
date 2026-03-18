@@ -303,3 +303,49 @@ def test_live_execute_rejects_missing_ai_context(monkeypatch):
     assert isinstance(detail, dict)
     assert "missing ai context" in str(detail.get("message", "")).lower()
     assert "required_fields" in detail
+
+
+def test_demo_trade_history_mode_not_mislabeled_live(monkeypatch):
+    state["is_demo_mode"] = True
+    state["live_armed"] = False
+    active_trades.clear()
+    history.clear()
+
+    app = FastAPI()
+    from app.routes.auto_trading_simple import router as at_router
+    app.include_router(at_router, prefix="/autotrade")
+    client = TestClient(app)
+
+    symbol = "DEMO_MODE_HISTORY_CHECK"
+
+    create_resp = client.post(
+        "/autotrade/execute",
+        json={
+            "symbol": symbol,
+            "price": 100.0,
+            "balance": 0,
+            "quantity": 1,
+            "side": "BUY",
+            "stop_loss": 95.0,
+            "target": 110.0,
+            "force_demo": True,
+        },
+    )
+    assert create_resp.status_code == 200
+    assert create_resp.json().get("is_demo_mode") is True
+
+    # Force close by moving below SL.
+    close_resp = client.post("/autotrade/trades/price", params={"symbol": symbol, "price": 94.0})
+    assert close_resp.status_code == 200
+
+    demo_history = client.get("/autotrade/trades/history", params={"mode": "DEMO", "limit": 200})
+    assert demo_history.status_code == 200
+    demo_trades = demo_history.json().get("trades", [])
+    matching_demo = [t for t in demo_trades if t.get("symbol") == symbol]
+    assert matching_demo, "Expected demo trade to appear in DEMO history"
+    assert all(str(t.get("trade_mode")).upper() == "DEMO" for t in matching_demo)
+
+    live_history = client.get("/autotrade/trades/history", params={"mode": "LIVE", "limit": 200})
+    assert live_history.status_code == 200
+    live_trades = live_history.json().get("trades", [])
+    assert all(t.get("symbol") != symbol for t in live_trades)
