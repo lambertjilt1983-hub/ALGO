@@ -1,4 +1,5 @@
 import os
+import re
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -97,6 +98,20 @@ def _build_allowed_origin_regex(settings, allowed_origins: list[str]) -> str | N
         return r"^https://algo(?:-[a-z0-9-]+)?\.vercel\.app$"
 
     return None
+
+
+def _is_origin_allowed(origin: str | None, allowed_origins: list[str], allowed_origin_regex: str | None) -> bool:
+    normalized = _normalize_origin(origin)
+    if not normalized:
+        return False
+    if normalized in allowed_origins:
+        return True
+    if allowed_origin_regex:
+        try:
+            return re.match(allowed_origin_regex, normalized) is not None
+        except re.error:
+            return False
+    return False
 
 def _check_required_dependencies(logger: logging.Logger) -> None:
     requirements_path = Path(__file__).resolve().parent.parent / "requirements.txt"
@@ -215,7 +230,7 @@ async def log_cors_request(request, call_next):
         )
 
     origin = _normalize_origin(request.headers.get("origin"))
-    if origin and origin in allowed_origins:
+    if _is_origin_allowed(origin, allowed_origins, allowed_origin_regex):
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Vary"] = "Origin"

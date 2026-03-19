@@ -1851,6 +1851,17 @@ const AutoTradingDashboard = () => {
     const fetchSeq = ++dataFetchSeqRef.current;
 
     try {
+      const apiBackoff = config.getApiBackoffInfo?.();
+      if (apiBackoff?.active) {
+        warnDeduped(
+          'fetch:data:backoff',
+          `⚠️ Data refresh paused during API backoff (${Math.ceil((apiBackoff.remainingMs || 0) / 1000)}s)`,
+          { burstWindowMs: 120000, flushDelayMs: 1200, emitFirst: false },
+        );
+        setIsUsingStaleData(true);
+        return;
+      }
+
       const timeoutPromise = (promise, ms) => Promise.race([
         promise,
         new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), ms))

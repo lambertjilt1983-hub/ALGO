@@ -231,6 +231,41 @@ def test_main_origin_normalization_strips_trailing_slash():
     assert "https://algo-theta-nine.vercel.app/" not in allowed
 
 
+def test_main_origin_allowed_supports_regex_and_never_throws_on_bad_regex():
+    from app.main import _is_origin_allowed
+
+    allowed_origins = ["https://algo-theta-nine.vercel.app"]
+    regex = r"^https://algo(?:-[a-z0-9-]+)?\.vercel\.app$"
+
+    assert _is_origin_allowed("https://algo-theta-nine.vercel.app", allowed_origins, regex) is True
+    assert _is_origin_allowed("https://algo-preview-123.vercel.app", allowed_origins, regex) is True
+    assert _is_origin_allowed("https://evil.example.com", allowed_origins, regex) is False
+
+    # Invalid regex should fail closed instead of raising.
+    assert _is_origin_allowed("https://algo-preview-123.vercel.app", allowed_origins, "[") is False
+
+
+def test_log_cors_request_adds_origin_header_for_regex_origin_on_500(monkeypatch):
+    from app import main as main_mod
+
+    # Simulate production regex-only allow-list path.
+    monkeypatch.setattr(main_mod, "allowed_origins", [])
+    monkeypatch.setattr(main_mod, "allowed_origin_regex", r"^https://algo(?:-[a-z0-9-]+)?\.vercel\.app$")
+
+    app = FastAPI()
+    app.middleware("http")(main_mod.log_cors_request)
+
+    @app.get("/boom")
+    async def boom():
+        raise RuntimeError("boom")
+
+    client = TestClient(app)
+    resp = client.get("/boom", headers={"Origin": "https://algo-theta-nine.vercel.app"})
+
+    assert resp.status_code == 500
+    assert resp.headers.get("access-control-allow-origin") == "https://algo-theta-nine.vercel.app"
+
+
 def test_live_execute_uses_stock_thresholds_and_ignores_stale_start_trade_flags(monkeypatch):
     active_trades.clear()
     history.clear()

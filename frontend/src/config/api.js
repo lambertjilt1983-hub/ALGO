@@ -16,6 +16,12 @@ const normalizeEndpoint = (endpoint) => {
   return value.startsWith('/') ? value : `/${value}`;
 };
 
+const hasHeader = (headers, headerName) => {
+  if (!headers || typeof headers !== 'object') return false;
+  const target = String(headerName || '').toLowerCase();
+  return Object.keys(headers).some((key) => String(key || '').toLowerCase() === target);
+};
+
 const getWebSocketUrl = () => {
   const baseUrl = getApiBaseUrl();
   return baseUrl.replace('http', 'ws').replace('https', 'wss');
@@ -168,16 +174,23 @@ export const config = {
 
     const { includeAuth = true, retryTransportOnce = false, ...restOptions } = options;
 
+    const method = String(restOptions.method || 'GET').toUpperCase();
+    const shouldSetJsonContentType = (
+      method !== 'GET'
+      && method !== 'HEAD'
+      && typeof restOptions.body !== 'undefined'
+      && !hasHeader(restOptions.headers, 'content-type')
+    );
+
     const requestOptions = {
       ...restOptions,
       headers: {
-        'Content-Type': 'application/json',
+        ...(shouldSetJsonContentType ? { 'Content-Type': 'application/json' } : {}),
         ...(includeAuth ? config.getAuthHeaders() : {}),
         ...restOptions.headers,
       },
     };
 
-    const method = String(requestOptions.method || 'GET').toUpperCase();
     const canRetry = method === 'GET' || retryTransportOnce;
 
     if (isBackoffActive()) {
@@ -186,7 +199,13 @@ export const config = {
 
     try {
       const response = await fetch(url, requestOptions);
-      markTransportSuccess();
+      const statusCode = Number(response?.status || 0);
+      const shouldBackoff = statusCode <= 0 || statusCode === 429 || statusCode >= 500;
+      if (shouldBackoff) {
+        markTransportFailure(url, new Error(`HTTP ${statusCode || 'network'}`));
+      } else {
+        markTransportSuccess();
+      }
       return response;
     } catch (error) {
       if (!canRetry) {
