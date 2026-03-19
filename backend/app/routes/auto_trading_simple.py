@@ -377,20 +377,45 @@ def _normalize_trade_mode(value: Any, default: str = "DEMO") -> str:
     return str(default).strip().upper()
 
 
+def _strict_live_history_mode() -> bool:
+    raw = str(os.getenv("STRICT_LIVE_HISTORY_MODE") or "1").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _resolve_report_trade_mode(meta: Optional[Dict[str, Any]], default: str = "DEMO") -> str:
     payload = dict(meta or {})
     explicit = _normalize_trade_mode(payload.get("trade_mode"), default=default)
-    if explicit in {"LIVE", "DEMO"}:
-        return explicit
+    strict_live_mode = _strict_live_history_mode()
 
     broker_response = payload.get("broker_response")
+    broker_order_id = payload.get("broker_order_id")
+    response_order_id = None
+    response_simulated = None
+    if isinstance(broker_response, dict):
+        response_order_id = broker_response.get("order_id") or broker_response.get("broker_order_id")
+        response_simulated = broker_response.get("simulated")
+
+    # LIVE must have concrete execution evidence.
+    # This avoids legacy/synthetic rows being misclassified as LIVE when only mode tags drift.
+    if explicit == "LIVE":
+        if not strict_live_mode:
+            return "LIVE"
+        if broker_order_id or response_order_id:
+            return "LIVE"
+        if response_simulated is False:
+            return "LIVE"
+        return "DEMO"
+
+    if explicit == "DEMO":
+        return "DEMO"
+
     if isinstance(broker_response, dict):
         if broker_response.get("simulated") is True:
             return "DEMO"
-        if broker_response.get("order_id") or broker_response.get("broker_order_id"):
+        if response_order_id or broker_response.get("simulated") is False:
             return "LIVE"
 
-    if payload.get("broker_order_id"):
+    if broker_order_id:
         return "LIVE"
     if payload.get("force_demo") is True:
         return "DEMO"

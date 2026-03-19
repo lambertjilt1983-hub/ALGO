@@ -25,6 +25,9 @@ export const useTokenRefresh = () => {
       if (typeof document !== 'undefined' && document.hidden) {
         return false;
       }
+      if (config.isApiBackoffActive?.()) {
+        return false;
+      }
       if (Date.now() < Number(tokenBackoffUntilRef.current || 0)) {
         return false;
       }
@@ -67,10 +70,15 @@ export const useTokenRefresh = () => {
         try {
           errorData = await response.json();
         } catch {}
+        const failureDetail =
+          errorData?.detail
+          || errorData?.message
+          || response?.statusText
+          || `HTTP ${response?.status || 'unknown'}`;
         errorDeduped('token:refresh_failed', '[TokenRefresh] ✗ Token refresh failed', {
           burstWindowMs: 60000,
           flushDelayMs: 1000,
-        }, errorData.detail);
+        }, failureDetail);
         
         // If refresh token is invalid, clear storage and force re-login
         if (response.status === 401 || response.status === 403) {
@@ -94,6 +102,9 @@ export const useTokenRefresh = () => {
   const validateBrokerToken = async () => {
     try {
       if (typeof document !== 'undefined' && document.hidden) {
+        return;
+      }
+      if (config.isApiBackoffActive?.()) {
         return;
       }
       if (Date.now() < Number(tokenBackoffUntilRef.current || 0)) {

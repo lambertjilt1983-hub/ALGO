@@ -28,6 +28,47 @@ const getAltLoopbackUrl = (url) => {
   return null;
 };
 
+const TRANSPORT_BACKOFF_BASE_MS = 15000;
+const TRANSPORT_BACKOFF_MAX_MS = 180000;
+
+const transportHealth = {
+  consecutiveFailures: 0,
+  backoffUntil: 0,
+  lastError: '',
+  lastUrl: '',
+};
+
+const isBackoffActive = () => Date.now() < Number(transportHealth.backoffUntil || 0);
+
+const markTransportFailure = (url, error) => {
+  transportHealth.consecutiveFailures += 1;
+  const multiplier = Math.pow(2, Math.max(0, transportHealth.consecutiveFailures - 1));
+  const delayMs = Math.min(TRANSPORT_BACKOFF_BASE_MS * multiplier, TRANSPORT_BACKOFF_MAX_MS);
+  transportHealth.backoffUntil = Date.now() + delayMs;
+  transportHealth.lastUrl = String(url || '');
+  transportHealth.lastError = error instanceof Error
+    ? (error.message || 'Transport Error')
+    : String(error || 'Transport Error');
+};
+
+const markTransportSuccess = () => {
+  transportHealth.consecutiveFailures = 0;
+  transportHealth.backoffUntil = 0;
+  transportHealth.lastError = '';
+  transportHealth.lastUrl = '';
+};
+
+const buildTransportErrorResponse = () => {
+  const remainingMs = Math.max(0, Number(transportHealth.backoffUntil || 0) - Date.now());
+  const retryAfterSec = Math.max(1, Math.ceil(remainingMs / 1000));
+  const headers = new Headers({
+    'x-algo-transport-error': '1',
+    'x-algo-backoff-until': String(transportHealth.backoffUntil || 0),
+    'retry-after': String(retryAfterSec),
+  });
+  return new Response(null, { status: 503, statusText: 'Transport Error', headers });
+};
+
 // Export centralized configuration
 export const config = {
   API_BASE_URL: getApiBaseUrl(),
@@ -139,35 +180,62 @@ export const config = {
     const method = String(requestOptions.method || 'GET').toUpperCase();
     const canRetry = method === 'GET' || retryTransportOnce;
 
+    if (isBackoffActive()) {
+      return buildTransportErrorResponse();
+    }
+
     try {
-      return await fetch(url, requestOptions);
+      const response = await fetch(url, requestOptions);
+      markTransportSuccess();
+      return response;
     } catch (error) {
-      if (!canRetry) throw error;
+      if (!canRetry) {
+        markTransportFailure(url, error);
+        return buildTransportErrorResponse();
+      }
 
       // Retry once for intermittent transport/decode issues seen in dev (e.g. content-length mismatch).
       // Wrap the retry in its own try/catch so a double-failure still returns a failed-response
       // object instead of re-throwing (avoids redundant browser console stack traces).
       await new Promise((resolve) => setTimeout(resolve, 200));
       try {
-        return await fetch(url, {
+        const retryResponse = await fetch(url, {
           ...requestOptions,
           cache: 'no-store',
         });
+        markTransportSuccess();
+        return retryResponse;
       } catch {
         const altUrl = getAltLoopbackUrl(url);
         if (altUrl) {
           try {
-            return await fetch(altUrl, {
+            const altResponse = await fetch(altUrl, {
               ...requestOptions,
               cache: 'no-store',
             });
+            markTransportSuccess();
+            return altResponse;
           } catch {}
         }
         // Return a synthetic failed response so callers get ok:false without a thrown exception.
-        // NOTE: status 0 is not a valid HTTP status code; use 503 to avoid RangeError in Response constructor.
-        return new Response(null, { status: 503, statusText: 'Transport Error' });
+        markTransportFailure(url, error);
+        return buildTransportErrorResponse();
       }
     }
+  },
+
+  isApiBackoffActive: () => isBackoffActive(),
+
+  getApiBackoffInfo: () => ({
+    active: isBackoffActive(),
+    remainingMs: Math.max(0, Number(transportHealth.backoffUntil || 0) - Date.now()),
+    consecutiveFailures: Number(transportHealth.consecutiveFailures || 0),
+    lastError: transportHealth.lastError || '',
+    lastUrl: transportHealth.lastUrl || '',
+  }),
+
+  clearApiBackoff: () => {
+    markTransportSuccess();
   },
 };
 

@@ -1357,10 +1357,19 @@ const AutoTradingDashboard = () => {
     const safeMinQuality = Number.isFinite(parsedMinQuality) ? parsedMinQuality : Number(scannerMinQuality);
     const nowMs = Date.now();
 
-    if (typeof document !== 'undefined' && document.hidden && !autoTradingActive) {
+    if (typeof document !== 'undefined' && document.hidden) {
       return;
     }
     const lastSnapshot = scannerSnapshotRef.current;
+    const apiBackoff = config.getApiBackoffInfo?.();
+    if (apiBackoff?.active) {
+      if (Array.isArray(lastSnapshot?.trades) && lastSnapshot.trades.length > 0) {
+        setQualityTrades(lastSnapshot.trades);
+        setTotalSignalsScanned(lastSnapshot.total || 0);
+      }
+      setScannerLastError(`API temporarily unavailable. Retrying in ${Math.ceil((apiBackoff.remainingMs || 0) / 1000)}s.`);
+      return;
+    }
     
     // Skip cache checks when bypassCache=true (e.g., when auto-trading needs real-time updates)
     if (!bypassCache) {
@@ -1464,16 +1473,17 @@ const AutoTradingDashboard = () => {
       }
 
       // Public endpoint fallback when auth wrapper has transient issues.
+      // Keep using authFetch so transport backoff/circuit-breaker applies consistently.
       if (!allSignals.length) {
         for (const url of requestsToTry) {
           try {
-            const res = await fetch(url);
+            const res = await config.authFetch(url, { retryTransportOnce: true, cache: 'no-store', includeAuth: false });
             if (!res.ok) continue;
             let data;
             try {
               data = await res.json();
             } catch {
-              const retryRes = await fetch(url, { cache: 'no-store' });
+              const retryRes = await config.authFetch(url, { retryTransportOnce: true, cache: 'no-store', includeAuth: false });
               if (!retryRes.ok) continue;
               data = await retryRes.json();
             }
@@ -1785,7 +1795,12 @@ const AutoTradingDashboard = () => {
         setProfessionalSignal(null);
       }
     } catch (err) {
-      console.error('❌ Market scan failed:', err);
+      warnDeduped(
+        'dashboard:scanner_failed',
+        '⚠️ Market scan failed; preserving last stable snapshot',
+        { burstWindowMs: 120000, flushDelayMs: 1500 },
+        err?.message || err,
+      );
       setScannerLastError(err?.message || 'Scanner request failed');
       // Keep previous scanner results visible when backend fails.
       setProfessionalSignal(null);
@@ -4360,7 +4375,20 @@ const AutoTradingDashboard = () => {
     // Keep-alive heartbeat: Ping backend health every 30 seconds
     const healthCheckInterval = setInterval(async () => {
       try {
-        await config.authFetch(`${config.API_BASE_URL}/health`);
+        const backoff = config.getApiBackoffInfo?.();
+        if (backoff?.active) {
+          warnDeduped(
+            'dashboard:health_backoff',
+            `⚠️ Health check paused during API backoff (${Math.ceil((backoff.remainingMs || 0) / 1000)}s)`,
+            { burstWindowMs: 120000, flushDelayMs: 1200, emitFirst: false },
+          );
+          return;
+        }
+
+        const healthRes = await config.authFetch(`${config.API_BASE_URL}/health`, { retryTransportOnce: true, cache: 'no-store' });
+        if (!healthRes?.ok) {
+          throw new Error(`Health endpoint unavailable (${healthRes?.status || 'network'})`);
+        }
         logDeduped('dashboard:health_ok', '💓 Health check passed - connection alive', {
           burstWindowMs: 120000,
           flushDelayMs: 1200,
@@ -4372,7 +4400,7 @@ const AutoTradingDashboard = () => {
         warnDeduped('dashboard:health_failed', '⚠️ Health check failed', {
           burstWindowMs: 60000,
           flushDelayMs: 1200,
-        }, e.message);
+        }, e?.message || e);
       }
     }, 30000); // Every 30 seconds
 

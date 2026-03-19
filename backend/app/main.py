@@ -72,6 +72,32 @@ def _build_allowed_origins(settings) -> list[str]:
 
     return allowed_origins
 
+
+def _build_allowed_origin_regex(settings, allowed_origins: list[str]) -> str | None:
+    # Explicit regex wins when configured via env.
+    explicit_regex = _normalize_origin(os.getenv("ALLOWED_ORIGIN_REGEX"))
+    if explicit_regex:
+        return explicit_regex
+
+    # Production-safe default: do not enable wildcard regex unless explicitly opted in.
+    allow_fallback = str(os.getenv("ALLOW_CORS_REGEX_FALLBACK") or "").strip().lower() in {"1", "true", "yes", "on"}
+    if not allow_fallback:
+        return None
+
+    # Safety fallback for Vercel preview/prod domains when explicit origin list drifts.
+    # Keeps scope limited to this project naming convention.
+    if any("vercel.app" in origin for origin in allowed_origins):
+        return r"^https://algo(?:-[a-z0-9-]+)?\.vercel\.app$"
+
+    frontend_values = [
+        _normalize_origin(getattr(settings, "FRONTEND_URL", "")),
+        _normalize_origin(getattr(settings, "FRONTEND_ALT_URL", "")),
+    ]
+    if any("vercel.app" in origin for origin in frontend_values):
+        return r"^https://algo(?:-[a-z0-9-]+)?\.vercel\.app$"
+
+    return None
+
 def _check_required_dependencies(logger: logging.Logger) -> None:
     requirements_path = Path(__file__).resolve().parent.parent / "requirements.txt"
     if not requirements_path.exists():
@@ -149,12 +175,16 @@ app = FastAPI(
 # CORS middleware
 settings = get_settings()
 allowed_origins = _build_allowed_origins(settings)
+allowed_origin_regex = _build_allowed_origin_regex(settings, allowed_origins)
 
 print(f"[STARTUP] CORS allowed origins: {allowed_origins}")
+if allowed_origin_regex:
+    print(f"[STARTUP] CORS allow_origin_regex: {allowed_origin_regex}")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
+    allow_origin_regex=allowed_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
