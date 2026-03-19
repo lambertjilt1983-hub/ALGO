@@ -96,8 +96,8 @@ const LOSS_CLUSTER_WINDOW_SHORT_MS = 10 * 60 * 1000;
 const LOSS_CLUSTER_WINDOW_LONG_MS = 15 * 60 * 1000;
 const LOSS_CLUSTER_SHORT_TRIGGER = 2; // 2 losses in 10 min
 const LOSS_CLUSTER_LONG_TRIGGER = 3;  // 3 losses in 15 min
-const LOSS_CLUSTER_SHORT_PAUSE_MS = 15 * 60 * 1000;
-const LOSS_CLUSTER_LONG_PAUSE_MS = 30 * 60 * 1000;
+const LOSS_CLUSTER_SHORT_PAUSE_MS = 10 * 60 * 1000;
+const LOSS_CLUSTER_LONG_PAUSE_MS = 5 * 60 * 1000;
 const DRAW_DOWN_QTY_REDUCE_2_LOSS = 0.5;
 const DRAW_DOWN_QTY_REDUCE_3_LOSS = 0.25;
 
@@ -2097,7 +2097,8 @@ const AutoTradingDashboard = () => {
     setActiveTrades(resolvedActiveTrades);
     setTradeHistory(resolvedHistory);
     setReportSummary(perfData);
-    setHasActiveTrade(resolvedActiveTrades.length > 0);
+    const openResolvedActiveTrades = resolvedActiveTrades.filter((t) => String(t?.status || 'OPEN').toUpperCase() === 'OPEN');
+    setHasActiveTrade(openResolvedActiveTrades.length > 0);
 
     // Compute daily P&L from closed trades
     const todayLabel = new Date().toDateString();
@@ -4781,12 +4782,15 @@ const AutoTradingDashboard = () => {
     || (trade?.broker_order_id ? 'LIVE' : 'DEMO')
   ).toUpperCase();
 
+  const isOpenTrade = (trade) => String(trade?.status || 'OPEN').toUpperCase() === 'OPEN';
+  const openActiveTrades = (activeTrades || []).filter(isOpenTrade);
+
   const currentUiTradeMode = isLiveMode ? 'LIVE' : 'DEMO';
-  const activeTradesForCurrentMode = (activeTrades || []).filter((trade) => {
+  const activeTradesForCurrentMode = openActiveTrades.filter((trade) => {
     const mode = resolveTradeMode(trade);
     return currentUiTradeMode === 'LIVE' ? mode === 'LIVE' : (mode === 'DEMO' || mode === 'PAPER');
   });
-  const filteredActiveTrades = (activeTrades || []).filter((trade) => {
+  const filteredActiveTrades = openActiveTrades.filter((trade) => {
     const mode = resolveTradeMode(trade);
     if (activeModeFilter === 'ALL') return true;
     if (activeModeFilter === 'DEMO') return mode === 'DEMO' || mode === 'PAPER';
@@ -4916,7 +4920,7 @@ const AutoTradingDashboard = () => {
             fontSize: '14px'
           }}>
             {(() => {
-              const activeCount = Number(stats?.active_trades_count ?? activeTrades.length ?? 0);
+              const activeCount = Number(openActiveTrades.length ?? 0);
               if (activeCount > 0) {
                 return (
                   <>
