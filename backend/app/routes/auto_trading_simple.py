@@ -39,7 +39,7 @@ import re
 import uuid
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime, timedelta, time as dt_time, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -4470,21 +4470,22 @@ async def get_trade_history(
         if selected_mode in {"LIVE", "DEMO"} and row_mode != selected_mode:
             continue
         
-        # Convert naive datetimes to IST with timezone info
+        # Normalize DB datetimes: naive values are stored as UTC.
+        # Attach UTC explicitly so frontend can render IST correctly.
         entry_time_str = None
         if row.entry_time:
             et = row.entry_time
-            # If naive (no timezone), assume it's already in IST from database
+            # If naive (no timezone), treat as UTC.
             if et.tzinfo is None:
-                et = et.replace(tzinfo=_market_tz())
+                et = et.replace(tzinfo=timezone.utc)
             entry_time_str = et.isoformat()
         
         exit_time_str = None
         if row.exit_time:
             xt = row.exit_time
-            # If naive (no timezone), assume it's already in IST from database
+            # If naive (no timezone), treat as UTC.
             if xt.tzinfo is None:
-                xt = xt.replace(tzinfo=_market_tz())
+                xt = xt.replace(tzinfo=timezone.utc)
             exit_time_str = xt.isoformat()
         
         normalized_rows.append(

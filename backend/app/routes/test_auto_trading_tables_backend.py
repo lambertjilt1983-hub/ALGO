@@ -125,6 +125,58 @@ def test_trade_history_marks_profit_pullback_as_profit_trail():
         ats.state["recent_exit_contexts"] = {}
 
 
+def test_trade_history_normalizes_naive_db_timestamps_as_utc(monkeypatch):
+    class _FakeRow:
+        def __init__(self):
+            self.id = 99
+            self.symbol = "NIFTY2632423200PE"
+            self.side = "BUY"
+            self.quantity = 1
+            self.entry_price = 100.0
+            self.exit_price = 101.0
+            self.pnl = 1.0
+            self.pnl_percentage = 1.0
+            self.strategy = "TEST"
+            self.status = "TARGET_HIT"
+            self.entry_time = datetime(2026, 3, 19, 3, 45, 43)
+            self.exit_time = datetime(2026, 3, 19, 3, 50, 0)
+            self.meta = {}
+
+    class _FakeQuery:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def order_by(self, *args, **kwargs):
+            return self
+
+        def limit(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return self._rows
+
+    class _FakeSession:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def query(self, *args, **kwargs):
+            return _FakeQuery(self._rows)
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(ats, "SessionLocal", lambda: _FakeSession([_FakeRow()]))
+
+    hist = asyncio.run(ats.get_trade_history(limit=10, mode="ALL"))
+    assert hist["trades"], "Expected at least one row in history"
+
+    row = hist["trades"][0]
+    assert row["symbol"] == "NIFTY2632423200PE"
+    assert row["entry_time"].endswith("+00:00")
+    assert row["exit_time"].endswith("+00:00")
+    assert row["entry_time"].startswith("2026-03-19T03:45:43")
+
+
 def test_same_move_reentry_requires_stronger_signal():
     ats.state["recent_exit_contexts"] = {}
     try:
