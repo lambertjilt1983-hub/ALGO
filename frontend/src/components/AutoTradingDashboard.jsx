@@ -81,8 +81,8 @@ const MAX_CONCURRENT_TRADES = 3;
 const MAX_DEMO_CONCURRENT_TRADES = 2;
 
 // === DEMO SL PROTECTION SYSTEM ===
-// After a demo SL hit, block re-entry on same symbol for 5 minutes.
-const POST_SL_SYMBOL_COOLDOWN_MS = 5 * 60 * 1000;
+// After a demo SL hit, block re-entry on same symbol for 4 minutes.
+const POST_SL_SYMBOL_COOLDOWN_MS = 4 * 60 * 1000;
 // After 2+ consecutive SL hits on the same underlying root, block that root.
 // Each additional strike doubles the penalty (capped at 3×).
 const POST_SL_ROOT_STREAK_COOLDOWN_MS = 10 * 60 * 1000;

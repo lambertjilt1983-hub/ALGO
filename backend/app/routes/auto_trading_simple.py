@@ -210,7 +210,7 @@ risk_config = {
     "max_position_pct": 0.10,        # 10% max per position
     "max_portfolio_pct": 0.10,       # 10% total exposure
     "cooldown_minutes": 0,           # NO COOLDOWN - trade immediately if conditions met
-    "symbol_cooldown_minutes": 5,    # Cooldown after SL on same symbol/root (5 min to allow fresh signals)
+    "symbol_cooldown_minutes": 4,    # Cooldown after SL on same symbol/root (4 min to allow fresh signals)
     "apply_symbol_cooldown_demo": True,  # Enforce SL cooldown for demo too (prevents rapid paper churn)
     "min_momentum_pct": 0.5,         # Very strong momentum (0.5%) - avoid weak entries
     "min_trend_strength": 0.8,       # HIGH trend strength (80%) required - quality only
@@ -998,12 +998,23 @@ def _lane_overtrade_info(symbol: str | None, side: str | None, mode: str) -> Tup
     cutoff = datetime.utcnow() - timedelta(minutes=lookback_minutes)
     norm_side = (side or "BUY").upper()
 
+    guard_statuses = {
+        str(s or "").strip().upper()
+        for s in (risk_config.get("overtrade_guard_statuses") or ["SL_HIT"])
+        if str(s or "").strip()
+    }
+    if not guard_statuses:
+        guard_statuses = {"SL_HIT"}
+
     recent_exit_times: List[datetime] = []
     for trade in history:
         if not _include_trade_in_runtime(trade):
             continue
         trade_mode = _normalize_trade_mode(trade.get("trade_mode"), default="DEMO")
         if trade_mode != mode_upper:
+            continue
+        trade_status = str(trade.get("status") or "").upper()
+        if trade_status not in guard_statuses:
             continue
         trade_root = _symbol_root(trade.get("symbol") or trade.get("index"))
         trade_side = (trade.get("side") or "BUY").upper()
