@@ -53,6 +53,41 @@ describe('config.authFetch transport handling', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('applies long backoff window on 502 outage responses', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 502, statusText: 'Bad Gateway' }));
+    globalThis.fetch = fetchMock;
+
+    const first = await config.authFetch('/autotrade/status', { includeAuth: false });
+    expect(first.status).toBe(502);
+
+    const info = config.getApiBackoffInfo();
+    expect(info.active).toBe(true);
+    // Hard failures should jump to a long cooldown to avoid request storms.
+    expect(Number(info.remainingMs || 0)).toBeGreaterThan(100000);
+  });
+
+  it('does not trigger global backoff for POST 429 business-rule errors', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 429, statusText: 'Too Many Requests' }));
+    globalThis.fetch = fetchMock;
+
+    const first = await config.authFetch('/autotrade/execute', {
+      includeAuth: false,
+      method: 'POST',
+      body: JSON.stringify({ symbol: 'TEST' }),
+    });
+    expect(first.status).toBe(429);
+    expect(config.isApiBackoffActive()).toBe(false);
+
+    const second = await config.authFetch('/autotrade/execute', {
+      includeAuth: false,
+      method: 'POST',
+      body: JSON.stringify({ symbol: 'TEST2' }),
+    });
+    expect(second.status).toBe(429);
+    // Both calls should hit fetch because no global circuit-breaker is opened for POST 429.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it('suppresses repeated polling calls while backoff is active', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 503, statusText: 'Service Unavailable' }));
     globalThis.fetch = fetchMock;

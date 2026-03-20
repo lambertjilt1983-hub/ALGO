@@ -36,6 +36,7 @@ const getAltLoopbackUrl = (url) => {
 
 const TRANSPORT_BACKOFF_BASE_MS = 15000;
 const TRANSPORT_BACKOFF_MAX_MS = 180000;
+const TRANSPORT_BACKOFF_HARD_FAILURE_MS = 180000;
 
 const transportHealth = {
   consecutiveFailures: 0,
@@ -46,11 +47,28 @@ const transportHealth = {
 
 const isBackoffActive = () => Date.now() < Number(transportHealth.backoffUntil || 0);
 
-const markTransportFailure = (url, error) => {
-  transportHealth.consecutiveFailures += 1;
-  const multiplier = Math.pow(2, Math.max(0, transportHealth.consecutiveFailures - 1));
-  const delayMs = Math.min(TRANSPORT_BACKOFF_BASE_MS * multiplier, TRANSPORT_BACKOFF_MAX_MS);
-  transportHealth.backoffUntil = Date.now() + delayMs;
+const markTransportFailure = (url, error, options = {}) => {
+  const statusCode = Number(options?.statusCode || 0);
+  const isHardFailure = Boolean(options?.hard)
+    || statusCode === 0
+    || statusCode === 502
+    || statusCode === 503
+    || statusCode === 504;
+
+  if (isHardFailure) {
+    // Jump directly to a longer cooldown to prevent tight request storms during outages.
+    transportHealth.consecutiveFailures = Math.max(transportHealth.consecutiveFailures + 1, 5);
+    transportHealth.backoffUntil = Math.max(
+      Number(transportHealth.backoffUntil || 0),
+      Date.now() + TRANSPORT_BACKOFF_HARD_FAILURE_MS,
+    );
+  } else {
+    transportHealth.consecutiveFailures += 1;
+    const multiplier = Math.pow(2, Math.max(0, transportHealth.consecutiveFailures - 1));
+    const delayMs = Math.min(TRANSPORT_BACKOFF_BASE_MS * multiplier, TRANSPORT_BACKOFF_MAX_MS);
+    transportHealth.backoffUntil = Date.now() + delayMs;
+  }
+
   transportHealth.lastUrl = String(url || '');
   transportHealth.lastError = error instanceof Error
     ? (error.message || 'Transport Error')
@@ -200,16 +218,18 @@ export const config = {
     try {
       const response = await fetch(url, requestOptions);
       const statusCode = Number(response?.status || 0);
-      const shouldBackoff = statusCode <= 0 || statusCode === 429 || statusCode >= 500;
+      // 429 from write APIs can be a business-rule guard (e.g. SL cooldown), so avoid
+      // tripping global transport backoff for non-GET methods.
+      const shouldBackoff = statusCode <= 0 || statusCode >= 500 || (statusCode === 429 && method === 'GET');
       if (shouldBackoff) {
-        markTransportFailure(url, new Error(`HTTP ${statusCode || 'network'}`));
+        markTransportFailure(url, new Error(`HTTP ${statusCode || 'network'}`), { statusCode });
       } else {
         markTransportSuccess();
       }
       return response;
     } catch (error) {
       if (!canRetry) {
-        markTransportFailure(url, error);
+        markTransportFailure(url, error, { hard: true, statusCode: 0 });
         return buildTransportErrorResponse();
       }
 
@@ -237,7 +257,7 @@ export const config = {
           } catch {}
         }
         // Return a synthetic failed response so callers get ok:false without a thrown exception.
-        markTransportFailure(url, error);
+        markTransportFailure(url, error, { hard: true, statusCode: 0 });
         return buildTransportErrorResponse();
       }
     }

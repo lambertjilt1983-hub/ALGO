@@ -60,6 +60,15 @@ def _build_allowed_origins(settings) -> list[str]:
             if normalized
         ]
 
+    # Always merge explicit frontend URLs as a safety net, even when ALLOWED_ORIGINS is set.
+    # This prevents accidental CORS outages when ALLOWED_ORIGINS drifts from deployment domains.
+    for frontend_host in (
+        _normalize_origin(getattr(settings, "FRONTEND_URL", "")),
+        _normalize_origin(getattr(settings, "FRONTEND_ALT_URL", "")),
+    ):
+        if frontend_host and frontend_host not in allowed_origins:
+            allowed_origins.append(frontend_host)
+
     if any(h in _normalize_origin(settings.FRONTEND_URL) for h in ("localhost", "127.0.0.1")) or os.getenv("ENV_FILE") == "env.local":
         for host in ("http://localhost:3000", "http://localhost:8000"):
             normalized_host = _normalize_origin(host)
@@ -80,8 +89,8 @@ def _build_allowed_origin_regex(settings, allowed_origins: list[str]) -> str | N
     if explicit_regex:
         return explicit_regex
 
-    # Production-safe default: do not enable wildcard regex unless explicitly opted in.
-    allow_fallback = str(os.getenv("ALLOW_CORS_REGEX_FALLBACK") or "").strip().lower() in {"1", "true", "yes", "on"}
+    # Allow explicit opt-out, otherwise keep Vercel safety fallback enabled by default.
+    allow_fallback = str(os.getenv("ALLOW_CORS_REGEX_FALLBACK") or "1").strip().lower() in {"1", "true", "yes", "on"}
     if not allow_fallback:
         return None
 

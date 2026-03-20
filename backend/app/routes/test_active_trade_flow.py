@@ -20,7 +20,10 @@ stub_mod.ai_model = object()
 sys.modules["app.strategies.ai_model"] = stub_mod
 
 @pytest.fixture(autouse=True)
-def reset_state():
+def reset_state(monkeypatch):
+    # This suite intentionally uses synthetic symbols (TEST*, *_CHECK).
+    # Keep runtime filters disabled so endpoint behavior can be verified deterministically.
+    monkeypatch.setenv("ALLOW_SYNTHETIC_TRADES", "1")
     # clear trades and history before each test
     active_trades.clear()
     history.clear()
@@ -229,6 +232,36 @@ def test_main_origin_normalization_strips_trailing_slash():
     assert _normalize_origin("https://algo-theta-nine.vercel.app/") == "https://algo-theta-nine.vercel.app"
     assert "https://algo-theta-nine.vercel.app" in allowed
     assert "https://algo-theta-nine.vercel.app/" not in allowed
+
+
+def test_main_allowed_origins_always_include_frontend_urls_even_when_env_list_is_stale():
+    from app.main import _build_allowed_origins
+
+    class DummySettings:
+        # Simulate stale/partial ALLOWED_ORIGINS in deployed env.
+        ALLOWED_ORIGINS = "https://old-frontend.example.com"
+        FRONTEND_URL = "https://algo-theta-nine.vercel.app/"
+        FRONTEND_ALT_URL = "https://algo-theta-nine.vercel.app/"
+
+    allowed = _build_allowed_origins(DummySettings())
+
+    assert "https://old-frontend.example.com" in allowed
+    assert "https://algo-theta-nine.vercel.app" in allowed
+
+
+def test_main_origin_regex_enables_vercel_fallback_by_default(monkeypatch):
+    from app.main import _build_allowed_origin_regex
+
+    class DummySettings:
+        FRONTEND_URL = "https://algo-theta-nine.vercel.app"
+        FRONTEND_ALT_URL = ""
+
+    # Ensure no explicit env override is set.
+    monkeypatch.delenv("ALLOWED_ORIGIN_REGEX", raising=False)
+    monkeypatch.delenv("ALLOW_CORS_REGEX_FALLBACK", raising=False)
+
+    regex = _build_allowed_origin_regex(DummySettings(), ["https://algo-theta-nine.vercel.app"])
+    assert regex == r"^https://algo(?:-[a-z0-9-]+)?\.vercel\.app$"
 
 
 def test_main_origin_allowed_supports_regex_and_never_throws_on_bad_regex():

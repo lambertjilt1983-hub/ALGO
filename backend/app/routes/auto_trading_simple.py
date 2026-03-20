@@ -2120,7 +2120,35 @@ def _close_trade(trade: Dict[str, Any], exit_price: float) -> None:
         print(f"  Daily Loss: ₹{state['daily_loss']:.2f} / ₹{risk_config['max_daily_loss']}")
         print(f"  Daily Profit: ₹{state['daily_profit']:.2f} / ₹{risk_config['max_daily_profit']}")
 
-        # Persist closed trade to database for reporting
+        # Persist closed trade to database for reporting.
+        report_meta = _ensure_json_serializable({
+            "support": trade.get("support"),
+            "resistance": trade.get("resistance"),
+            "exit_reason": trade.get("exit_reason") or trade.get("status"),
+            "entry_price": trade.get("price") or trade.get("entry_price"),
+            "target": trade.get("target"),
+            "stop_loss": trade.get("stop_loss"),
+            "quality_score": trade.get("quality_score"),
+            "confirmation_score": trade.get("confirmation_score") or trade.get("confidence"),
+            "ai_edge_score": trade.get("ai_edge_score"),
+            "momentum_score": trade.get("momentum_score"),
+            "breakout_score": trade.get("breakout_score"),
+            "breakout_confirmed": trade.get("breakout_confirmed"),
+            "momentum_confirmed": trade.get("momentum_confirmed"),
+            "breakout_hold_confirmed": trade.get("breakout_hold_confirmed"),
+            "timing_risk": trade.get("timing_risk"),
+            "market_bias": trade.get("market_bias") or trade.get("trend_direction"),
+            "market_regime": trade.get("market_regime"),
+            "fake_move_risk": trade.get("fake_move_risk"),
+            "news_risk": trade.get("news_risk") or trade.get("sudden_news_risk"),
+            "liquidity_spike_risk": trade.get("liquidity_spike_risk"),
+            "premium_distortion": trade.get("premium_distortion") or trade.get("premium_distortion_risk"),
+            "profit_lock_applied": trade.get("profit_lock_applied"),
+            "trade_mode": trade_mode,
+            "broker_order_id": trade.get("broker_order_id"),
+            "broker_response": trade.get("broker_response"),
+        })
+
         try:
             db = SessionLocal()
             entry_dt = datetime.fromisoformat(trade.get("entry_time")) if isinstance(trade.get("entry_time"), str) else datetime.utcnow()
@@ -2137,44 +2165,25 @@ def _close_trade(trade: Dict[str, Any], exit_price: float) -> None:
                 entry_time=entry_dt,
                 exit_time=exit_dt,
                 trading_date=exit_dt.date(),
-                meta={
-                    "support": trade.get("support"),
-                    "resistance": trade.get("resistance"),
-                    "exit_reason": trade.get("exit_reason") or trade.get("status"),
-                    "entry_price": trade.get("price") or trade.get("entry_price"),
-                    "target": trade.get("target"),
-                    "stop_loss": trade.get("stop_loss"),
-                    "quality_score": trade.get("quality_score"),
-                    "confirmation_score": trade.get("confirmation_score") or trade.get("confidence"),
-                    "ai_edge_score": trade.get("ai_edge_score"),
-                    "momentum_score": trade.get("momentum_score"),
-                    "breakout_score": trade.get("breakout_score"),
-                    "breakout_confirmed": trade.get("breakout_confirmed"),
-                    "momentum_confirmed": trade.get("momentum_confirmed"),
-                    "breakout_hold_confirmed": trade.get("breakout_hold_confirmed"),
-                    "timing_risk": trade.get("timing_risk"),
-                    "market_bias": trade.get("market_bias") or trade.get("trend_direction"),
-                    "market_regime": trade.get("market_regime"),
-                    "fake_move_risk": trade.get("fake_move_risk"),
-                    "news_risk": trade.get("news_risk") or trade.get("sudden_news_risk"),
-                    "liquidity_spike_risk": trade.get("liquidity_spike_risk"),
-                    "premium_distortion": trade.get("premium_distortion") or trade.get("premium_distortion_risk"),
-                    "profit_lock_applied": trade.get("profit_lock_applied"),
-                    "trade_mode": trade_mode,
-                    "broker_order_id": trade.get("broker_order_id"),
-                    "broker_response": trade.get("broker_response"),
-                },
+                meta=report_meta,
             )
             db.add(report)
             db.commit()
-            _delete_active_trade_record(trade)
         except Exception as e:
+            try:
+                db.rollback()
+            except Exception:
+                pass
             print(f"Warning: failed to persist trade report: {e}")
         finally:
             try:
                 db.close()
             except Exception:
                 pass
+
+        # Always remove closed-trade snapshot from active table to prevent stale OPEN rows
+        # from reappearing on restart or poll refresh, even if report insert fails.
+        _delete_active_trade_record(trade)
     except Exception as e:
         print(f"[CLOSE TRADE ERROR] {e}")
 
@@ -2182,7 +2191,8 @@ def _close_trade(trade: Dict[str, Any], exit_price: float) -> None:
 def _maybe_place_exit_order(trade: Dict[str, any], exit_price: float) -> None:
     """Attempt to place a market exit order for live trades (no-op in demo)."""
     try:
-        if state.get("is_demo_mode", False):
+        trade_mode = _normalize_trade_mode(trade.get("trade_mode"), default="DEMO")
+        if trade_mode != "LIVE":
             return
         symbol = trade.get("symbol")
         qty = int(trade.get("quantity") or 0)
@@ -3898,6 +3908,8 @@ async def execute(
             derived_target = round(trade.price * (1 - pct * (TARGET_PCT / STOP_PCT)), 2)
 
     async with execute_lock:
+        # Keep in-memory state aligned with persistent snapshots before gating new entries.
+        _sync_active_trades_from_db()
         existing_open = [t for t in active_trades if t.get("status") == "OPEN"]
         existing_live_open = [t for t in existing_open if str(t.get("trade_mode") or "LIVE").upper() == "LIVE"]
 
@@ -4190,6 +4202,7 @@ async def get_active_trades(authorization: Optional[str] = Header(None)):
 @router.post("/trades/update-prices")
 async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
     try:
+        _sync_active_trades_from_db()
         open_trades = [t for t in active_trades if t.get("status") == "OPEN"]
         if not open_trades:
             return {
@@ -4298,6 +4311,7 @@ async def update_live_trade_prices(authorization: Optional[str] = Header(None)):
 
 @router.post("/trades/close")
 async def close_live_trade(payload: CloseTradeRequest, authorization: Optional[str] = Header(None)):
+    _sync_active_trades_from_db()
     target_trade = None
 
     if payload.trade_id is not None:
