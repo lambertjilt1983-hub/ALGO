@@ -152,6 +152,17 @@ def _ensure_json_serializable(value):
     return str(value)
 
 
+def _is_true_sl_hit(status: Any, pnl: Any) -> bool:
+    """Return True only for stop-loss exits that are actually losing trades."""
+    if str(status or "").upper() != "SL_HIT":
+        return False
+    try:
+        return float(pnl) < 0
+    except Exception:
+        # If pnl is unavailable, keep conservative SL behavior.
+        return True
+
+
 # Option Chain Endpoint (must be after router is defined)
 @router.get("/option_chain")
 async def option_chain(
@@ -1041,6 +1052,8 @@ def _lane_overtrade_info(symbol: str | None, side: str | None, mode: str) -> Tup
         trade_status = str(trade.get("status") or "").upper()
         if trade_status not in guard_statuses:
             continue
+        if trade_status == "SL_HIT" and not _is_true_sl_hit(trade_status, trade.get("pnl", trade.get("profit_loss", 0))):
+            continue
         trade_root = _symbol_root(trade.get("symbol") or trade.get("index"))
         trade_side = (trade.get("side") or "BUY").upper()
         if trade_root != root or trade_side != norm_side:
@@ -1365,7 +1378,9 @@ def _count_consecutive_sl_hits(db_session=None) -> int:
         )
         consecutive = 0
         for trade in closed_today:
-            if str(getattr(trade, "status", "")).upper() == "SL_HIT":
+            status = str(getattr(trade, "status", "")).upper()
+            pnl_value = getattr(trade, "profit_loss", None)
+            if _is_true_sl_hit(status, pnl_value):
                 consecutive += 1
             else:
                 break
@@ -1393,7 +1408,7 @@ def _count_consecutive_sl_hits(db_session=None) -> int:
     # Count consecutive SL_HIT from the end
     consecutive = 0
     for trade in today_trades:
-        if str(trade.get("status", "")).upper() == "SL_HIT":
+        if _is_true_sl_hit(trade.get("status"), trade.get("pnl", trade.get("profit_loss", 0))):
             consecutive += 1
         else:
             break
@@ -2092,6 +2107,12 @@ def _close_trade(trade: Dict[str, Any], exit_price: float) -> None:
         trade["status"] = trade.get("status") or "CLOSED"
         trade["pnl"] = round(pnl, 2)
         trade["pnl_percentage"] = round(pnl_percentage, 2)
+
+        # A trailing/breakeven stop can close with positive P&L; do not treat it as a true SL loss.
+        if str(trade.get("status") or "").upper() == "SL_HIT" and pnl > 0:
+            trade["status"] = "PROFIT_TRAIL"
+            trade["exit_reason"] = trade.get("exit_reason") or "PROFIT_TRAIL"
+
         trade_mode = _normalize_trade_mode(
             trade.get("trade_mode"),
             default="DEMO" if isinstance(trade.get("broker_response"), dict) and trade.get("broker_response", {}).get("simulated") else "LIVE",
@@ -2100,7 +2121,7 @@ def _close_trade(trade: Dict[str, Any], exit_price: float) -> None:
 
         # Record exit context and only apply SL cooldown to true stop-loss exits.
         exit_dt = datetime.fromisoformat(trade.get("exit_time")) if isinstance(trade.get("exit_time"), str) else datetime.utcnow()
-        if trade.get("status") == "SL_HIT":
+        if _is_true_sl_hit(trade.get("status"), trade.get("pnl", 0)):
             _record_sl_cooldown(trade.get("symbol") or trade.get("index"), side, exit_dt)
         _record_recent_exit_context(trade, exit_dt)
         history.append(trade.copy())

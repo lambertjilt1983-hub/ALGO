@@ -714,7 +714,7 @@ const AutoTradingDashboard = () => {
         const ts = tsRaw ? new Date(tsRaw).getTime() : 0;
         const status = String(trade?.status || '').toUpperCase();
         const pnl = Number(trade?.profit_loss ?? trade?.pnl ?? 0);
-        const isLoss = status === 'SL_HIT' || pnl <= 0;
+        const isLoss = Number.isFinite(pnl) ? pnl < 0 : (status === 'SL_HIT');
         return { trade, ts, status, pnl, isLoss };
       })
       .filter((row) => Number.isFinite(row.ts) && row.ts > 0)

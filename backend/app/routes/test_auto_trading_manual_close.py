@@ -234,3 +234,30 @@ def test_close_trade_always_cleans_active_snapshot_even_if_report_fails(monkeypa
     ats._close_trade(trade, 98.0)
 
     assert cleaned["called"] is True
+
+
+def test_close_trade_converts_profitable_sl_hit_to_profit_trail(monkeypatch):
+    ats.active_trades.clear()
+    ats.history.clear()
+
+    trade = _open_trade(
+        id=601,
+        symbol="SIM:PROFIT-SL-NORM",
+        status="SL_HIT",
+        exit_reason="SL_HIT",
+        trade_mode="DEMO",
+    )
+
+    cooldown_called = {"called": False}
+
+    monkeypatch.setattr(
+        ats,
+        "_record_sl_cooldown",
+        lambda *_args, **_kwargs: cooldown_called.__setitem__("called", True),
+    )
+
+    ats._close_trade(trade, 105.0)
+
+    assert ats.history[-1]["status"] == "PROFIT_TRAIL"
+    assert ats.history[-1]["pnl"] > 0
+    assert cooldown_called["called"] is False
