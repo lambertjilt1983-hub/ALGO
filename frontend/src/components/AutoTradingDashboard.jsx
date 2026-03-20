@@ -4836,15 +4836,160 @@ const AutoTradingDashboard = () => {
   // --- Professional Signal Integration ---
   // ...existing code...
 
-
-
-  // ...component render logic...
-  // (no-op for test export)
-  return null;
-};
-
-// Export for unit testing
-export { getEntryReadiness };
+  return (
+    <div style={{ minHeight: '100vh', background: '#f3f4f6', padding: '24px' }}>
+      <div style={{
+        textAlign: 'center',
+        fontSize: '2.2rem',
+        fontWeight: 700,
+        color: '#b0b7c3',
+        letterSpacing: '2px',
+        margin: '0 0 18px 0',
+        fontFamily: 'inherit',
+      }}>
+        ALGORITHM BASED AUTO TRADING
+      </div>
+      <div style={{ maxWidth: '1400px', margin: '24px auto 0' }}>
+        <div style={{
+          background: 'rgba(255, 255, 255, 0.95)',
+          borderRadius: '16px',
+          padding: '32px',
+          marginBottom: '32px',
+          boxShadow: '0 8px 32px rgba(0, 0, 0, 0.1)'
+        }}>
+      {!isMarketOpen && (
+        <div style={{
+          marginBottom: '16px',
+          padding: '12px 16px',
+          borderRadius: '8px',
+          background: '#fff5f5',
+          border: '1px solid #fed7d7',
+          color: '#742a2a',
+          fontSize: '13px',
+          fontWeight: '600'
+        }}>
+          🚫 Market Closed{marketClosedReason ? ` (${marketClosedReason})` : ''}. Trading allowed only during market hours (9:15 AM – 3:30 PM IST).
+        </div>
+      )}
+      <style>{`
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.7; }
+        }
+      `}</style>
+      {/* Header with Toggle */}
+      
+      <div style={{
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        marginBottom: '32px',
+        paddingBottom: '20px',
+        borderBottom: '2px solid #e2e8f0'
+      }}>
+        <div>
+          <h3 style={{
+            margin: '0 0 8px 0',
+            color: '#2d3748',
+            fontSize: '24px',
+            fontWeight: 'bold',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '12px'
+          }}>
+            🤖 Auto Trading Engine
+            <span style={{
+              fontSize: '14px',
+              padding: '4px 12px',
+              borderRadius: '20px',
+              background: autoTradingActive ? '#48bb78' : enabled ? '#ed8936' : '#cbd5e0',
+              color: 'white',
+              fontWeight: '600'
+            }}>
+              {autoTradingActive ? 'ACTIVE' : enabled ? '⏸️ STANDBY' : 'DISABLED'}
+            </span>
+            <span style={{
+              fontSize: '14px',
+              padding: '4px 12px',
+              borderRadius: '20px',
+              background: isLiveMode ? '#22c55e' : '#f59e0b',
+              color: 'white',
+              fontWeight: '600'
+            }}>
+              {isLiveMode ? '🔴 LIVE TRADES' : '⚪ DEMO MODE'}
+            </span>
+            <span style={{
+              fontSize: '14px',
+              padding: '4px 12px',
+              borderRadius: '20px',
+              background: wakeLockActive ? '#48bb78' : '#ed8936',
+              color: 'white',
+              fontWeight: '600',
+              animation: wakeLockActive ? 'pulse 2s infinite' : 'none'
+            }}>
+              {wakeLockActive ? '😴 AWAKE' : '⚠️ SLEEP MODE'}
+            </span>
+            {cooldownRemainingMs > 0 && (
+              <span style={{
+                fontSize: '14px',
+                padding: '4px 12px',
+                borderRadius: '20px',
+                background: '#ef4444',
+                color: 'white',
+                fontWeight: '700'
+              }}>
+                ⏳ Cooldown {formatCooldownLabel(cooldownRemainingMs)}
+              </span>
+            )}
+          </h3>
+          <p style={{
+            margin: 0,
+            color: '#718096',
+            fontSize: '14px'
+          }}>
+            {(() => {
+              const activeCount = Number(openActiveTrades.length ?? 0);
+              if (activeCount > 0) {
+                return (
+                  <>
+                    <span style={{ color: '#c53030', fontWeight: '700' }}>🟢 ACTIVE TRADES: {activeCount}</span>
+                    <span> • Monitoring live positions</span>
+                    {activeBrokerName && (
+                      <span> • Broker: {activeBrokerName}{Number.isFinite(Number(activeBrokerId)) ? ` (#${Number(activeBrokerId)})` : ''}</span>
+                    )}
+                    {Number.isFinite(Number(liveAccountBalance)) && Number(liveAccountBalance) > 0 && (
+                      <span> • Live Balance: ₹{Number(liveAccountBalance).toLocaleString()}</span>
+                    )}
+                  </>
+                );
+              }
+              return (
+                <>
+                  <span>⚪ NO ACTIVE TRADES</span>
+                  {activeBrokerName && (
+                    <span> • Broker: {activeBrokerName}{Number.isFinite(Number(activeBrokerId)) ? ` (#${Number(activeBrokerId)})` : ''}</span>
+                  )}
+                  {Number.isFinite(Number(liveAccountBalance)) && Number(liveAccountBalance) > 0 && (
+                    <span> • Live Balance: ₹{Number(liveAccountBalance).toLocaleString()}</span>
+                  )}
+                </>
+              );
+            })()}
+          </p>
+        </div>
+        <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+          <div style={{
+            padding: '20px',
+            background: 'linear-gradient(135deg, #ed8936 0%, #dd6b20 100%)',
+            borderRadius: '12px',
+            color: 'white',
+            textAlign: 'center'
+          }}>
+            <div style={{ fontSize: '13px', opacity: 0.9, marginBottom: '8px' }}>Active Trades</div>
+            <div style={{ fontSize: '32px', fontWeight: 'bold' }}>
+              {(stats?.active_trades_count ?? 0)}
+            </div>
+          </div>
           <div style={{
             padding: '20px',
             background: 'linear-gradient(135deg, #939BA3 0%, #7a8289 100%)',
@@ -4938,7 +5083,98 @@ export { getEntryReadiness };
               ✓ {stats?.today_wins ?? 0} | ✗ {stats?.today_losses ?? 0}
             </div>
           </div>
-export { getEntryReadiness };
+
+          <div style={{
+            padding: '16px',
+            background: 'linear-gradient(135deg, #48bb78 0%, #38a169 100%)',
+            borderRadius: '12px',
+            color: 'white',
+            textAlign: 'center'
+          }}>
+            <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '6px' }}>Win Rate</div>
+            <div style={{ fontSize: '28px', fontWeight: 'bold' }}>{(stats?.win_rate ?? 0).toFixed(1)}%</div>
+            <div style={{ fontSize: '11px', marginTop: '6px', opacity: 0.8 }}>
+              ({stats?.win_sample ?? 0} recent)
+            </div>
+          </div>
+
+          <div style={{
+            padding: '16px',
+            background: 'linear-gradient(135deg, #f6ad55 0%, #ed8936 100%)',
+            borderRadius: '12px',
+            color: 'white',
+            textAlign: 'center'
+          }}>
+            <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '6px' }}>Daily P&L</div>
+            <div style={{
+              fontSize: '28px',
+              fontWeight: 'bold',
+              color: (stats?.daily_pnl ?? 0) >= 0 ? '#c6f6d5' : '#fed7d7'
+            }}>
+              ₹{(stats?.daily_pnl ?? 0).toLocaleString()}
+            </div>
+          </div>
+
+          {stats?.trading_paused && (
+            <div style={{
+              padding: '16px',
+              background: 'linear-gradient(135deg, #f56565 0%, #e53e3e 100%)',
+              borderRadius: '12px',
+              color: 'white',
+              textAlign: 'center'
+            }}>
+              <div style={{ fontSize: '12px', opacity: 0.9, marginBottom: '6px' }}>⏸️ PAUSED</div>
+              <div style={{ fontSize: '11px', marginTop: '6px', lineHeight: '1.4' }}>
+                {stats?.pause_reason || 'Trading paused'}
+              </div>
+            </div>
+          )}
+        </div>
+    </div>
+
+      {/* Market Quality Scanner */}
+      <div style={{
+        padding: '24px',
+        background: 'linear-gradient(135deg, #fef3c7 0%, #fde68a 100%)',
+        borderRadius: '12px',
+        border: '2px solid #f59e0b',
+        marginBottom: '24px'
+      }}>
+        <div style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginBottom: '16px'
+        }}>
+          <h4 style={{
+            margin: 0,
+            color: '#92400e',
+            fontSize: '18px',
+            fontWeight: 'bold'
+          }}>
+            {autoScanActive ? '🔄 Scanning...' : '🎯 All Quality Signals from Market'} ({scannerMinQuality}%+ Quality across indices and stocks)
+          </h4>
+          <div style={{ fontSize: '12px', color: '#92400e', opacity: 0.9 }}>
+            {scannerLastRunAt ? `Last scan: ${scannerLastRunAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}` : ''}
+          </div>
+          <button
+            onClick={() => {
+              // Toggle scanner pause/resume explicitly.
+              setScannerUserOverride((prev) => {
+                const next = !prev;
+                if (!next) {
+                  // Resuming: trigger an immediate fresh scan.
+                  scanMarketForQualityTrades(scannerMinQuality, true).catch(() => {});
+                }
+                return next;
+              });
+            }}
+            disabled={scannerLoading}
+            style={{
+              padding: '10px 20px',
+              background: scannerLoading ? '#cbd5e0' : (scannerUserOverride ? '#64748b' : '#f59e0b'),
+              color: 'white',
+              border: 'none',
               borderRadius: '6px',
               fontSize: '14px',
               fontWeight: '600',
