@@ -1220,6 +1220,11 @@ def _ai_entry_validation(
         "ai_edge_min": round(ai_edge_min, 2),
         "rr_min": round(rr_min, 2),
     }
+    # Enforce resistance/support presence for entry
+    if signal.get("resistance") is None or signal.get("support") is None:
+        reasons.append("missing_resistance_or_support")
+    elif not _safe_metric(signal.get("resistance")) or not _safe_metric(signal.get("support")):
+        reasons.append("invalid_resistance_or_support")
     final_entry_valid = len(reasons) == 0
     advanced["entry_valid"] = final_entry_valid
     advanced["entry_reasons"] = list(reasons)

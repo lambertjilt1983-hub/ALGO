@@ -261,3 +261,28 @@ def test_close_trade_converts_profitable_sl_hit_to_profit_trail(monkeypatch):
     assert ats.history[-1]["status"] == "PROFIT_TRAIL"
     assert ats.history[-1]["pnl"] > 0
     assert cooldown_called["called"] is False
+
+
+def test_ai_entry_validation_rejects_missing_resistance_support():
+    from app.routes import auto_trading_simple as ats
+    signal = {
+        "quality_score": 95,
+        "confirmation_score": 90,
+        "ai_edge_score": 60,
+        "breakout_score": 80,
+        "momentum_score": 80,
+        "entry_price": 100,
+        "target": 110,
+        "stop_loss": 95,
+        "breakout_confirmed": True,
+        "momentum_confirmed": True,
+        # Missing resistance/support
+    }
+    valid, reasons, advanced = ats._ai_entry_validation(signal)
+    assert not valid
+    assert "missing_resistance_or_support" in reasons
+
+    signal["resistance"] = 120
+    signal["support"] = 90
+    valid, reasons, advanced = ats._ai_entry_validation(signal)
+    assert valid
